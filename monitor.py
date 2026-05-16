@@ -245,10 +245,6 @@ def account_health_badge(account: dict[str, Any]) -> str:
     schedulable = account.get("schedulable")
     temp_until = _parse_time(account.get("temp_unschedulable_until") or account.get("cooldown_until"))
 
-    if any(word in error_message for word in ("quota", "exceed", "insufficient", "limit")):
-        return "\u9650\u989d"
-    if any(word in error_message for word in ("429", "rate")):
-        return "\u9650\u6d41"
     if account.get("quota_exceeded") is True or status in {"quota_exceeded", "quota-exceeded", "quota"}:
         return "\u9650\u989d"
     if temp_until and temp_until > datetime.now(timezone.utc):
@@ -257,7 +253,11 @@ def account_health_badge(account: dict[str, Any]) -> str:
         return "\u4e0d\u53ef\u7528"
     if status in {"disabled", "inactive", "suspended", "banned", "unavailable"}:
         return "\u505c\u7528"
-    if status in {"error", "failed"} or error_message:
+    if any(word in error_message for word in ("quota", "exceed", "insufficient", "limit")):
+        return "\u66fe\u9650"
+    if any(word in error_message for word in ("429", "rate")):
+        return "\u66fe\u9650\u6d41"
+    if status in {"error", "failed"}:
         return "\u9519\u8bef"
     return ""
 
