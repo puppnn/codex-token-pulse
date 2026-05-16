@@ -253,10 +253,6 @@ def account_health_badge(account: dict[str, Any]) -> str:
         return "\u4e0d\u53ef\u7528"
     if status in {"disabled", "inactive", "suspended", "banned", "unavailable"}:
         return "\u505c\u7528"
-    if any(word in error_message for word in ("quota", "exceed", "insufficient", "limit")):
-        return "\u66fe\u9650"
-    if any(word in error_message for word in ("429", "rate")):
-        return "\u66fe\u9650\u6d41"
     if status in {"error", "failed"}:
         return "\u9519\u8bef"
     return ""
