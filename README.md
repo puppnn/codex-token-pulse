@@ -9,6 +9,8 @@ It can run in two useful ways:
 - `auto`: read Sub2API admin metrics when available, then fall back to local client logs.
 - `local-codex`: read local Codex/Claude JSONL logs only. This mode does not need Sub2API or any API key.
 
+When Sub2API is connected, the monitor shows Sub2API server-side stats by default. Local client logs are not merged into the total unless `SUB2API_INCLUDE_LOCAL_USAGE=true`, because Codex still writes local token logs even when requests go through Sub2API.
+
 ## Features
 
 - Always-on-top resizable desktop floating window.
@@ -79,9 +81,12 @@ Useful settings:
 SUB2API_MONITOR_MODE=local-codex
 CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
+SUB2API_INCLUDE_LOCAL_USAGE=false
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` is a guardrail for abnormal single events.
+
+Set `SUB2API_INCLUDE_LOCAL_USAGE=true` only when you intentionally want Sub2API server stats and local client logs shown together. This is useful for comparing sources, but it can double count requests that already passed through Sub2API.
 
 ## Forked Codex Sessions
 

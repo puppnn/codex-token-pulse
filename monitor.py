@@ -48,6 +48,15 @@ def read_env_files(paths: list[Path]) -> dict[str, str]:
     return values
 
 
+def env_bool(values: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = values.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def compact_number(value: float | int | None) -> str:
     number = float(value or 0)
     sign = "-" if number < 0 else ""
@@ -233,6 +242,7 @@ class Sub2APIClient:
         self.email = os.environ.get("SUB2API_ADMIN_EMAIL") or env.get("ADMIN_EMAIL") or "admin@sub2api.local"
         self.password = os.environ.get("SUB2API_ADMIN_PASSWORD") or env.get("ADMIN_PASSWORD") or ""
         self.mode = (os.environ.get("SUB2API_MONITOR_MODE") or env.get("SUB2API_MONITOR_MODE") or "auto").strip().lower()
+        self.include_local_usage = env_bool(env, "SUB2API_INCLUDE_LOCAL_USAGE", False)
         self.token: str | None = None
 
     def _request(
@@ -391,11 +401,11 @@ class Sub2APIClient:
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
-        client_usage = load_client_usage()
+        client_usage = load_client_usage() if self.include_local_usage else None
         if client_usage and (client_usage["tokens"] or client_usage["requests"] or client_usage["cost"]):
             top_accounts.append(
                 {
-                    "name": "Client local / 未过 sub2api",
+                    "name": "Client local / 本地客户端日志",
                     "tokens": client_usage["tokens"],
                     "requests": client_usage["requests"],
                     "cost": client_usage["cost"],
