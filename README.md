@@ -19,6 +19,7 @@ In `auto` usage-source mode, the monitor checks the current Codex endpoint. If C
 - Current active Sub2API accounts and concurrency.
 - Today's request count, token count, and estimated cost.
 - Account ranking with token, cost, request count, and simple health badges.
+- Local daily cost history in `usage_history.json`, with today/yesterday/7-day trend.
 - Local Codex/Claude token import for conversations that did not pass through Sub2API.
 - Codex fork replay de-duplication to avoid inflated token totals after branching a session.
 - UTC+8 footer clock.
@@ -77,6 +78,8 @@ Local mode scans:
 
 It writes a generated `client_usage_today.json` next to the scripts. This file is ignored by Git.
 
+The monitor also keeps a local `usage_history.json` ledger for daily request, token, and cost snapshots. It is ignored by Git and can be moved with `SUB2API_USAGE_HISTORY_JSON`.
+
 Useful settings:
 
 ```env
@@ -85,6 +88,7 @@ CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
 SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
+SUB2API_USAGE_HISTORY_JSON=
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` is a guardrail for abnormal single events.

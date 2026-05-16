@@ -26,6 +26,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 REFRESH_SECONDS = 3
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 CLIENT_USAGE_JSON = Path(os.environ.get("CLIENT_USAGE_JSON") or APP_DIR / "client_usage_today.json")
+USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
 CN_TZ = timezone(timedelta(hours=8), "CST")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
@@ -203,6 +204,95 @@ def money(value: float | int | None) -> str:
     return f"${number:.2f}"
 
 
+def today_key() -> str:
+    return datetime.now(CN_TZ).date().isoformat()
+
+
+def date_key(days_ago: int) -> str:
+    return (datetime.now(CN_TZ).date() - timedelta(days=days_ago)).isoformat()
+
+
+def load_usage_history() -> dict[str, Any]:
+    if not USAGE_HISTORY_JSON.exists():
+        return {"schema": 1, "days": {}}
+    try:
+        data = json.loads(USAGE_HISTORY_JSON.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {"schema": 1, "days": {}}
+    if not isinstance(data, dict):
+        return {"schema": 1, "days": {}}
+    days = data.get("days")
+    if not isinstance(days, dict):
+        data["days"] = {}
+    data["schema"] = int(data.get("schema") or 1)
+    return data
+
+
+def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
+    days = history.get("days") if isinstance(history, dict) else {}
+    if not isinstance(days, dict):
+        days = {}
+    series: list[dict[str, Any]] = []
+    for offset in range(6, -1, -1):
+        key = date_key(offset)
+        row = days.get(key) if isinstance(days.get(key), dict) else {}
+        series.append(
+            {
+                "date": key,
+                "cost": float(row.get("cost") or 0),
+                "tokens": int(row.get("tokens") or 0),
+                "requests": int(row.get("requests") or 0),
+            }
+        )
+    today = series[-1]
+    yesterday = series[-2] if len(series) >= 2 else {"cost": 0.0, "tokens": 0, "requests": 0}
+    return {
+        "today_cost": today["cost"],
+        "yesterday_cost": yesterday["cost"],
+        "seven_day_cost": sum(item["cost"] for item in series),
+        "seven_day_tokens": sum(item["tokens"] for item in series),
+        "seven_day_requests": sum(item["requests"] for item in series),
+        "series": series,
+    }
+
+
+def update_usage_history(state: "MonitorState") -> dict[str, Any]:
+    history = load_usage_history()
+    days = history.setdefault("days", {})
+    if not isinstance(days, dict):
+        days = {}
+        history["days"] = days
+
+    key = today_key()
+    existing = days.get(key) if isinstance(days.get(key), dict) else {}
+    new_cost = float(state.today_account_cost or 0)
+    new_tokens = int(state.today_tokens or 0)
+    new_requests = int(state.today_requests or 0)
+    existing_cost = float(existing.get("cost") or 0)
+    existing_tokens = int(existing.get("tokens") or 0)
+    existing_requests = int(existing.get("requests") or 0)
+
+    # A temporary dashboard read failure can produce zeros. Keep the last
+    # non-zero snapshot for the day instead of flattening the history.
+    if new_cost == 0 and new_tokens == 0 and new_requests == 0 and (existing_cost or existing_tokens or existing_requests):
+        return summarize_usage_history(history)
+
+    days[key] = {
+        "date": key,
+        "source": state.usage_source,
+        "requests": new_requests,
+        "tokens": new_tokens,
+        "cost": round(new_cost, 6),
+        "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
+    }
+    try:
+        USAGE_HISTORY_JSON.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_HISTORY_JSON.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return summarize_usage_history(history)
+
+
 def relative_time(value: str | None) -> str:
     if not value:
         return "-"
@@ -305,6 +395,7 @@ class MonitorState:
     today_requests: int = 0
     today_tokens: int = 0
     today_account_cost: float = 0.0
+    cost_history: dict[str, Any] | None = None
     top_accounts: list[dict[str, Any]] | None = None
     client_usage: dict[str, Any] | None = None
 
@@ -672,9 +763,9 @@ class FloatingMonitorApp:
     """Borderless always-on-top floating monitor built entirely on tk.Canvas."""
 
     WIDTH = 390
-    HEIGHT = 680
+    HEIGHT = 760
     MIN_WIDTH = 360
-    MIN_HEIGHT = 560
+    MIN_HEIGHT = 640
     WINDOW_ALPHA = 0.92
 
     def __init__(self) -> None:
@@ -1024,6 +1115,45 @@ class FloatingMonitorApp:
         y += 50
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
+        y += 10
+        c.create_text(COL_L, y, anchor="nw", text="\u82b1\u8d39\u8d8b\u52bf",
+                       font=self._fonts["font_section"], fill=Theme.amber)
+        history = (self.state.cost_history if self.state else None) or summarize_usage_history(load_usage_history())
+        c.create_text(COL_R, y + 1, anchor="ne",
+                       text=f"7\u65e5 {money(history.get('seven_day_cost', 0))}",
+                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
+        y += 22
+        cost_stats = [
+            ("\u4eca\u65e5", money(history.get("today_cost", 0)), Theme.amber_bright),
+            ("\u6628\u65e5", money(history.get("yesterday_cost", 0)), Theme.cyan),
+            ("\u65e5\u5747", money(float(history.get("seven_day_cost") or 0) / 7), Theme.violet),
+        ]
+        for i, (lbl, val, color) in enumerate(cost_stats):
+            cx = COL_L + col_w * i + col_w // 2
+            c.create_text(cx, y, anchor="n", text=val,
+                           font=self._fonts["font_value_sm"], fill=color)
+            c.create_text(cx, y + 21, anchor="n", text=lbl,
+                           font=self._fonts["font_micro"], fill=Theme.text_secondary)
+        series = history.get("series") if isinstance(history, dict) else []
+        if isinstance(series, list) and series:
+            bar_y = y + 42
+            bar_h = 22
+            gap = 5
+            bar_w = max(8, int((COL_R - COL_L - gap * 6) / 7))
+            max_cost = max([float(item.get("cost") or 0) for item in series if isinstance(item, dict)], default=0) or 1
+            for index, item in enumerate(series[:7]):
+                cost = float(item.get("cost") or 0) if isinstance(item, dict) else 0
+                x1 = COL_L + index * (bar_w + gap)
+                x2 = min(COL_R, x1 + bar_w)
+                fill_h = max(2, int(bar_h * min(1.0, cost / max_cost))) if cost > 0 else 2
+                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill=Theme.bg_dark, outline="")
+                color = Theme.amber if index == 6 else (Theme.cyan if cost >= max_cost else Theme.blue)
+                self._draw_rounded_rect(x1, bar_y + bar_h - fill_h, x2, bar_y + bar_h, r=3, fill=color, outline="")
+            y += 72
+        else:
+            y += 46
+        c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
+
         # ════════════════════════════════════════════════════════
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
@@ -1195,6 +1325,10 @@ class FloatingMonitorApp:
             pass
         self.error = error
         if result is not None:
+            try:
+                result.cost_history = update_usage_history(result)
+            except Exception:
+                result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
         self._draw()
 
