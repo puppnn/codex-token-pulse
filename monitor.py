@@ -787,6 +787,7 @@ class FloatingMonitorApp:
         self._resizing = False
         self._hover_btn: str | None = None
         self._btn_rects: dict[str, tuple[int, int, int, int]] = {}
+        self._topmost_repair_scheduled = False
 
         # ── root window ──
         self.root = tk.Tk()
@@ -872,6 +873,32 @@ class FloatingMonitorApp:
 
     def _text_width(self, text: str, font_key: str) -> int:
         return self._fonts[font_key].measure(text)
+
+    def _ensure_topmost(self, force: bool = False) -> None:
+        if not self._pinned and not force:
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after_idle(lambda: self.root.attributes("-topmost", True))
+            self.root.after(250, lambda: self.root.attributes("-topmost", True))
+        except tk.TclError:
+            pass
+
+    def _schedule_topmost_repair(self) -> None:
+        if self.closed or self._topmost_repair_scheduled:
+            return
+        self._topmost_repair_scheduled = True
+
+        def _repair() -> None:
+            self._topmost_repair_scheduled = False
+            if self.closed or not self._pinned:
+                return
+            self._ensure_topmost()
+            self._schedule_topmost_repair()
+
+        self.root.after(4000, _repair)
 
     def _truncate(self, text: str, font_key: str, max_w: int) -> str:
         f = self._fonts[font_key]
@@ -1298,6 +1325,12 @@ class FloatingMonitorApp:
             self._hover_btn = None
             self._draw()
 
+    def _on_focus_in(self, _event: tk.Event) -> None:
+        self._ensure_topmost()
+
+    def _on_visibility(self, _event: tk.Event) -> None:
+        self._ensure_topmost()
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  DATA REFRESH
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1334,6 +1367,8 @@ class FloatingMonitorApp:
             except Exception:
                 result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
+        self._ensure_topmost()
+        self._schedule_topmost_repair()
         self._draw()
 
     def _schedule_auto_refresh(self) -> None:
