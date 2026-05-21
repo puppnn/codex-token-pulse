@@ -2,6 +2,8 @@
 
 A small Windows desktop floating monitor for Sub2API and local Codex/Claude usage logs.
 
+![Sub2API Floating Monitor preview](assets/monitor-preview.png)
+
 一个轻量的 Windows 桌面悬浮窗，用来查看 Sub2API 当前活跃账号、并发、今日 token、成本统计，也可以在没有 Sub2API 的情况下读取本机 Codex/Claude 日志。适合多账号中转、本地 Codex 使用量观察，以及排查“请求到底走了哪个通道”。
 
 It can run in two useful ways:
