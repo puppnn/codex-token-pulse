@@ -1,62 +1,58 @@
-# Sub2API Floating Monitor
+# Sub2API 桌面悬浮监控
 
-A small Windows desktop floating monitor for Sub2API and local Codex/Claude usage logs.
+一个轻量的 Windows 桌面悬浮窗，用来查看 Sub2API 当前活跃账号、并发、今日 token、成本统计，也可以在没有 Sub2API 的情况下读取本机 Codex/Claude 使用日志。
 
-![Sub2API Floating Monitor preview](assets/monitor-preview.png)
+![Sub2API 桌面悬浮监控预览](assets/monitor-preview.png)
 
-一个轻量的 Windows 桌面悬浮窗，用来查看 Sub2API 当前活跃账号、并发、今日 token、成本统计，也可以在没有 Sub2API 的情况下读取本机 Codex/Claude 日志。适合多账号中转、本地 Codex 使用量观察，以及排查“请求到底走了哪个通道”。
+适合这些场景：
 
-It can run in two useful ways:
+- 多个中转账号、OAuth 账号混合使用时，快速查看当前走的是哪个账号。
+- 观察今日请求量、token、成本和账号排行。
+- 排查 Codex 请求到底有没有经过 Sub2API。
+- 没有 Sub2API 时，单独统计本机 Codex/Claude 日志。
 
-- `auto`: read Sub2API admin metrics when available, then fall back to local client logs.
-- `local-codex`: read local Codex/Claude JSONL logs only. This mode does not need Sub2API or any API key.
+## 功能
 
-When Sub2API is connected, the monitor shows Sub2API server-side stats by default. Local client logs are not merged into the total unless `SUB2API_INCLUDE_LOCAL_USAGE=true`, because Codex still writes local token logs even when requests go through Sub2API.
+- Windows 桌面悬浮窗，支持置顶和拖动。
+- 显示当前活跃账号、并发数量和最近请求。
+- 显示今日请求数、token 数和估算成本。
+- 显示账号排行，包括 token、成本、请求数和简单状态标记。
+- 记录本地每日用量历史，用于查看今日、昨日和 7 日趋势。
+- 支持读取本机 Codex/Claude JSONL 日志。
+- 对 Codex 分叉会话做去重，减少重复上下文导致的统计膨胀。
+- 底部显示 UTC+8 时间。
 
-In `auto` usage-source mode, the monitor checks the current Codex endpoint. If Codex points to your Sub2API URL, totals come from Sub2API only. If Codex points somewhere else, totals come from local client logs.
-
-## Features
-
-- Always-on-top resizable desktop floating window.
-- Current active Sub2API accounts and concurrency.
-- Today's request count, token count, and estimated cost.
-- Account ranking with token, cost, request count, and simple health badges.
-- Local daily cost history in `usage_history.json`, with today/yesterday/7-day trend.
-- Local Codex/Claude token import for conversations that did not pass through Sub2API.
-- Codex fork replay de-duplication to avoid inflated token totals after branching a session.
-- UTC+8 footer clock.
-
-## Requirements
+## 运行要求
 
 - Windows
 - Python 3.10+
-- Tkinter, included in the standard Python installer on Windows
+- Tkinter，Windows 官方 Python 通常自带
 
-No Python packages are required.
+不需要安装额外 Python 包。
 
-## Quick Start
+## 快速开始
 
-Local-only mode:
-
-```powershell
-.\start-local-codex.ps1
-```
-
-Auto mode:
+自动模式，优先读取 Sub2API，失败时回退到本地日志：
 
 ```powershell
 .\start-monitor.ps1
 ```
 
-Or run directly:
+只读取本机 Codex/Claude 日志：
+
+```powershell
+.\start-local-codex.ps1
+```
+
+也可以直接运行：
 
 ```powershell
 python .\monitor.py
 ```
 
-## Sub2API Mode
+## Sub2API 模式
 
-Copy `.env.example` to `.env`, then fill in your local admin settings:
+复制 `.env.example` 为 `.env`，然后填写你的本地 Sub2API 管理端配置：
 
 ```env
 SUB2API_MONITOR_MODE=auto
@@ -65,24 +61,34 @@ SUB2API_ADMIN_EMAIL=admin@sub2api.local
 SUB2API_ADMIN_PASSWORD=your-password
 ```
 
-Use strict Sub2API mode if you do not want fallback:
+如果你希望必须连接 Sub2API，不允许回退到本地日志，可以设置：
 
 ```env
 SUB2API_MONITOR_MODE=sub2api
 ```
 
-## Local Codex Mode
+如果你的 Sub2API 有多个本地访问地址，可以设置匹配地址：
 
-Local mode scans:
+```env
+SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
+```
+
+## 本地 Codex 模式
+
+本地模式会扫描：
 
 - `%USERPROFILE%\.codex\sessions`
 - `%USERPROFILE%\.claude\projects`
 
-It writes a generated `client_usage_today.json` next to the scripts. This file is ignored by Git.
+脚本会生成 `client_usage_today.json`，用于保存当天本地客户端统计。这个文件默认不提交到 Git。
 
-The monitor also keeps a local `usage_history.json` ledger for daily request, token, and cost snapshots. It is ignored by Git and can be moved with `SUB2API_USAGE_HISTORY_JSON`.
+悬浮窗还会生成 `usage_history.json`，用于保存每日请求、token 和成本快照。这个文件也默认不提交到 Git。如果想换位置，可以设置：
 
-Useful settings:
+```env
+SUB2API_USAGE_HISTORY_JSON=
+```
+
+常用配置：
 
 ```env
 SUB2API_MONITOR_MODE=local-codex
@@ -90,41 +96,40 @@ CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
 SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
-SUB2API_USAGE_HISTORY_JSON=
 ```
 
-`CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` is a guardrail for abnormal single events.
+`CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
 
-Set `SUB2API_INCLUDE_LOCAL_USAGE=true` only when you intentionally want Sub2API server stats and local client logs shown together. This is useful for comparing sources, but it can double count requests that already passed through Sub2API.
+## 统计来源
 
-`SUB2API_MONITOR_USAGE_SOURCE` can be:
+`SUB2API_MONITOR_USAGE_SOURCE` 支持：
 
-- `auto`: detect the current Codex endpoint.
-- `sub2api`: always use Sub2API server-side stats.
-- `local`: always use local Codex/Claude logs.
-- `both`: show Sub2API stats plus local logs together.
+- `auto`：自动检测当前 Codex endpoint。
+- `sub2api`：只使用 Sub2API 服务端统计。
+- `local`：只使用本地 Codex/Claude 日志。
+- `both`：同时展示 Sub2API 服务端统计和本地日志，适合对账，但可能重复计算。
 
-If your Sub2API is reachable through more than one local URL or port, set:
+默认建议使用 `auto`。
 
-```env
-SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
-```
+当 Codex 指向你的 Sub2API 地址时，主统计来自 Sub2API。因为 Codex 即使走 Sub2API 也会写本地 token 日志，所以默认不会把本地日志直接合并到总量，避免重复计算。
 
-## Forked Codex Sessions
+## 分叉会话去重
 
-Codex can replay previous context into a forked session. If a usage importer treats those replayed totals as new work, daily token counts can jump dramatically.
+Codex 分叉会话时，可能会把之前的上下文重新带入新会话。如果统计器把这些 replay 也算成新请求，今日 token 会明显膨胀。
 
-This version detects `session_meta.payload.forked_from_id`, skips the initial replay window, de-duplicates repeated total counters, and prefers `last_token_usage` when present.
+本工具会检测 `session_meta.payload.forked_from_id`，跳过初始 replay 窗口，并对重复的 token total 做去重。
 
-## Files
+## 文件说明
 
-- `monitor.py`: floating window and Sub2API/local data source.
-- `client_usage_export.py`: local Codex/Claude JSONL usage scanner.
-- `start-monitor.ps1`: normal auto-mode launcher.
-- `start-local-codex.ps1`: local-only launcher.
-- `run-monitor.cmd`: CMD launcher.
-- `run-client-usage-export.cmd`: export local usage JSON once.
+- `monitor.py`：悬浮窗 UI 和 Sub2API/本地数据源读取逻辑。
+- `client_usage_export.py`：本机 Codex/Claude JSONL 用量扫描器。
+- `start-monitor.ps1`：自动模式启动脚本。
+- `start-local-codex.ps1`：本地日志模式启动脚本。
+- `run-monitor.cmd`：CMD 启动脚本。
+- `run-client-usage-export.cmd`：单独导出本地用量 JSON。
 
-## Privacy
+## 隐私说明
 
-Local mode reads only local usage logs and does not send them anywhere. Sub2API mode talks only to the `SUB2API_BASE_URL` you configure.
+本地模式只读取你电脑上的本地日志，不会上传到任何地方。
+
+Sub2API 模式只请求你配置的 `SUB2API_BASE_URL`。README 中的预览图是用假账号和假数据生成的，不包含真实账号、邮箱、API key 或使用记录。
