@@ -632,7 +632,10 @@ class Sub2APIClient:
             return self.fetch_sub2api_state()
         except Exception as exc:
             if self.mode in {"", "auto"}:
-                return build_sub2api_error_state(str(exc), usage_note)
+                return build_local_monitor_state(
+                    str(exc),
+                    f"{usage_note} / Sub2API 不可用，已切到本地日志",
+                )
             raise
 
     def fetch_sub2api_state(self) -> MonitorState:
