@@ -276,10 +276,16 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     existing_tokens = int(existing.get("tokens") or 0)
     existing_requests = int(existing.get("requests") or 0)
 
-    # A temporary dashboard read failure can produce zeros. Keep the last
-    # non-zero snapshot for the day instead of flattening the history.
-    if new_cost == 0 and new_tokens == 0 and new_requests == 0 and (existing_cost or existing_tokens or existing_requests):
-        return summarize_usage_history(history)
+    # The local clients expose usage as reconstructed snapshots, not an
+    # append-only ledger. Session cleanup, recovery, or a temporary dashboard
+    # read can make a later snapshot smaller, so keep the daily high-water mark.
+    if existing_cost or existing_tokens or existing_requests:
+        new_cost = max(new_cost, existing_cost)
+        new_tokens = max(new_tokens, existing_tokens)
+        new_requests = max(new_requests, existing_requests)
+        state.today_account_cost = new_cost
+        state.today_tokens = new_tokens
+        state.today_requests = new_requests
 
     days[key] = {
         "date": key,
