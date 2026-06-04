@@ -992,7 +992,7 @@ class Sub2APIClient:
             loading=False,
             updated_at=time.time(),
             mode="sub2api",
-            source_label="LOCAL + SUB",
+            source_label="LOCAL MONITOR",
             usage_source=ledger_source,
             usage_note=ledger_note,
             active_accounts=active_accounts[:4],
