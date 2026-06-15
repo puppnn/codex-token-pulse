@@ -426,6 +426,9 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         USAGE_HISTORY_JSON.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
+    state.today_requests = new_requests
+    state.today_tokens = new_tokens
+    state.today_account_cost = new_cost
     return summarize_usage_history(history)
 
 
