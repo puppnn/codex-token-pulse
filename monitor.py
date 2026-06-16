@@ -41,6 +41,9 @@ if not CLIENT_USAGE_JSON.exists():
         CLIENT_USAGE_JSON = fallback_json
 CLIENT_USAGE_PYTHON = os.environ.get("SUB2API_CLIENT_USAGE_PYTHON") or sys.executable
 USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
+CLIENT_USAGE_ROUTE_LABELS_JSON = Path(
+    os.environ.get("CLIENT_USAGE_ROUTE_LABELS_JSON") or APP_DIR / "client_usage_route_labels.json"
+)
 CN_TZ = timezone(timedelta(hours=8), "CST")
 DISPLAY_TIMEZONE = "Asia/Shanghai"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
@@ -705,9 +708,93 @@ def is_local_api_key_provider_name(name: str) -> bool:
     return name.strip().lower().startswith("codex local - api-key-")
 
 
+def load_client_route_labels() -> dict[str, set[str]]:
+    empty = {"sub2api_mirrored": set(), "direct": set()}
+    try:
+        data = json.loads(CLIENT_USAGE_ROUTE_LABELS_JSON.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    result: dict[str, set[str]] = {}
+    for key in empty:
+        values = data.get(key)
+        if isinstance(values, list):
+            result[key] = {str(value) for value in values if str(value).strip()}
+        else:
+            result[key] = set()
+    return result
+
+
+def write_client_route_labels(labels: dict[str, set[str]]) -> None:
+    payload = {
+        "schema": 1,
+        "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
+        "sub2api_mirrored": sorted(labels.get("sub2api_mirrored", set())),
+        "direct": sorted(labels.get("direct", set())),
+    }
+    try:
+        CLIENT_USAGE_ROUTE_LABELS_JSON.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def update_client_route_label(provider_name: str, points_to_sub2api: bool | None) -> dict[str, set[str]]:
+    labels = load_client_route_labels()
+    if not is_local_api_key_provider_name(provider_name):
+        return labels
+    if points_to_sub2api is True:
+        if provider_name not in labels["direct"]:
+            labels["sub2api_mirrored"].add(provider_name)
+            write_client_route_labels(labels)
+    elif points_to_sub2api is False:
+        labels["direct"].add(provider_name)
+        labels["sub2api_mirrored"].discard(provider_name)
+        write_client_route_labels(labels)
+    return labels
+
+
+def backfill_sub2api_mirrored_api_key_labels(
+    client_usage: dict[str, Any] | None,
+    server_tokens: int,
+    current_provider_name: str,
+    points_to_sub2api: bool | None,
+    labels: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    if not isinstance(client_usage, dict) or server_tokens <= 0:
+        return labels
+    providers = client_usage.get("providers")
+    if not isinstance(providers, list):
+        return labels
+
+    changed = False
+    token_ceiling = max(1, int(server_tokens * 1.25))
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        name = str(provider.get("name") or "")
+        tokens = int(provider.get("tokens") or 0)
+        if not is_local_api_key_provider_name(name) or tokens <= 0:
+            continue
+        if name in labels["direct"] or name in labels["sub2api_mirrored"]:
+            continue
+        if points_to_sub2api is False and name == current_provider_name:
+            continue
+        if tokens <= token_ceiling:
+            labels["sub2api_mirrored"].add(name)
+            changed = True
+    if changed:
+        write_client_route_labels(labels)
+    return labels
+
+
 def subtract_sub2api_mirrored_api_key_usage(
     client_usage: dict[str, Any] | None,
     server_tokens: int,
+    route_labels: dict[str, set[str]] | None = None,
 ) -> dict[str, Any] | None:
     """Remove local API-key rows that mirror already-counted Sub2API traffic."""
     if not isinstance(client_usage, dict) or server_tokens <= 0:
@@ -717,13 +804,13 @@ def subtract_sub2api_mirrored_api_key_usage(
         return client_usage
 
     result = client_usage
-    token_ceiling = max(1, int(server_tokens * 1.25))
+    mirrored = (route_labels or {}).get("sub2api_mirrored", set())
     for provider in providers:
         if not isinstance(provider, dict):
             continue
         name = str(provider.get("name") or "")
         tokens = int(provider.get("tokens") or 0)
-        if is_local_api_key_provider_name(name) and 0 < tokens <= token_ceiling:
+        if is_local_api_key_provider_name(name) and name in mirrored and tokens > 0:
             result = subtract_provider_from_client_usage(result, name)
     return result
 
@@ -1255,13 +1342,32 @@ class Sub2APIClient:
         show_local_activity = include_client_usage and points_to_sub2api is not True
         raw_client_usage = self._load_client_usage_cached() if include_client_usage else None
         client_usage = subtract_sub2api_routed_client_usage(raw_client_usage)
-        client_usage = subtract_sub2api_mirrored_api_key_usage(client_usage, realtime_today_tokens)
+        route_labels = load_client_route_labels()
+        raw_latest = raw_client_usage.get("latest_request") if isinstance(raw_client_usage, dict) else {}
+        latest_provider_name = (
+            str(raw_latest.get("provider") or "")
+            if isinstance(raw_latest, dict)
+            else ""
+        )
+        if latest_provider_name:
+            route_labels = update_client_route_label(latest_provider_name, points_to_sub2api)
+        route_labels = backfill_sub2api_mirrored_api_key_labels(
+            client_usage,
+            realtime_today_tokens,
+            latest_provider_name,
+            points_to_sub2api,
+            route_labels,
+        )
+        client_usage = subtract_sub2api_mirrored_api_key_usage(
+            client_usage,
+            realtime_today_tokens,
+            route_labels,
+        )
         if (
             points_to_sub2api is True
             and isinstance(raw_client_usage, dict)
             and client_usage is raw_client_usage
         ):
-            raw_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
             routed_provider = (
                 str(raw_latest.get("provider") or "")
                 if isinstance(raw_latest, dict)

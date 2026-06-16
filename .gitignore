@@ -6,6 +6,7 @@ client_usage_speed_history.json
 client_usage_today.json
 client_usage_account_timeline.json
 client_usage_attribution_ledger.json
+client_usage_route_labels.json
 usage_history.json
 .venv/
 venv/
