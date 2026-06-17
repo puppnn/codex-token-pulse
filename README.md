@@ -1,26 +1,40 @@
-# Sub2API 桌面悬浮监控
+# Token Floating Monitor
 
-一个轻量的 Windows 桌面悬浮窗，用来查看 Sub2API 当前活跃账号、并发、今日 token、成本统计，也可以在没有 Sub2API 的情况下读取本机 Codex/Claude 使用日志。
+一个轻量级 Windows Token 悬浮窗，用 Python/Tk 写成，不需要额外 Python 依赖。它可以在桌面上显示当前活跃账号、并发、今日请求量、Token、成本、账号额度窗口，以及更细的用量统计面板。
 
-![Sub2API 桌面悬浮监控预览](assets/monitor-preview.png)
+> 截图使用脱敏演示数据生成，仅用于展示界面结构和功能。
 
-适合这些场景：
+## 界面预览
 
-- 多个中转账号、OAuth 账号混合使用时，快速查看当前走的是哪个账号。
-- 观察今日请求量、token、成本和账号排行。
-- 排查 Codex 请求到底有没有经过 Sub2API。
-- 没有 Sub2API 时，单独统计本机 Codex/Claude 日志。
+### 账号
 
-## 功能
+显示当前活跃账号、最近请求、今日统计、Token 趋势和账号用量排行。支持 `今日 / 近5小时 / 近7天 / 周期` 切换。
 
-- Windows 桌面悬浮窗，支持置顶和拖动。
-- 显示当前活跃账号、并发数量和最近请求。
-- 显示今日请求数、token 数和估算成本。
-- 显示账号排行，包括 token、成本、请求数和简单状态标记。
-- 记录本地每日用量历史，用于查看今日、昨日和 7 日趋势。
-- 支持读取本机 Codex/Claude JSONL 日志。
-- 对 Codex 分叉会话做去重，减少重复上下文导致的统计膨胀。
-- 底部显示 UTC+8 时间。
+![账号页](assets/screenshots/accounts.png)
+
+### Token 预算
+
+展示 5h、7d、cycle 等额度窗口的剩余比例、已用比例、重置时间、待刷新状态和低余额压力。
+
+![Token 预算页](assets/screenshots/budget.png)
+
+### 用量统计
+
+提供 `24h / 7d / 30d / All` 视图，包含 Token Chips、缓存命中率、Activity 热力图、Top Models 和 Provider 成本排行。
+
+![用量统计页](assets/screenshots/usage-stats.png)
+
+## 主要功能
+
+- 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
+- 三个中文页签：`账号`、`Token 预算`、`用量统计`。
+- 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
+- 账号排行：按今日、近 5 小时、近 7 天、周期窗口查看账号用量。
+- 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
+- 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、Top Models 和 Provider 成本。
+- Activity 热力图：支持 24h、7d、30d、All time，不同强度颜色表示用量高低，鼠标悬停可查看具体值。
+- 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
+- 去重逻辑：保留 Codex fork replay 去重、Sub2API mirror 扣除、成本估算等原有统计规则。
 
 ## 运行要求
 
@@ -28,17 +42,17 @@
 - Python 3.10+
 - Tkinter，Windows 官方 Python 通常自带
 
-不需要安装额外 Python 包。
+项目不需要安装额外 Python 包。
 
 ## 快速开始
 
-自动模式，优先读取 Sub2API，失败时回退到本地日志：
+自动模式会优先读取 Sub2API，失败时回退到本地客户端日志：
 
 ```powershell
 .\start-monitor.ps1
 ```
 
-只读取本机 Codex/Claude 日志：
+只读取本地客户端日志：
 
 ```powershell
 .\start-local-codex.ps1
@@ -50,9 +64,9 @@
 python .\monitor.py
 ```
 
-## Sub2API 模式
+## Sub2API 配置
 
-复制 `.env.example` 为 `.env`，然后填写你的本地 Sub2API 管理端配置：
+复制 `.env.example` 为 `.env`，填写你的本地 Sub2API 管理端配置：
 
 ```env
 SUB2API_MONITOR_MODE=auto
@@ -61,32 +75,24 @@ SUB2API_ADMIN_EMAIL=admin@sub2api.local
 SUB2API_ADMIN_PASSWORD=your-password
 ```
 
-如果你希望必须连接 Sub2API，不允许回退到本地日志，可以设置：
+如果希望必须连接 Sub2API，不允许回退到本地日志：
 
 ```env
 SUB2API_MONITOR_MODE=sub2api
 ```
 
-如果你的 Sub2API 有多个本地访问地址，可以设置匹配地址：
+如果你的 Sub2API 有多个本地访问地址，可以配置匹配地址：
 
 ```env
 SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
 ```
 
-## 本地 Codex 模式
+## 本地客户端日志模式
 
-本地模式会扫描：
+本地模式会扫描本机客户端日志并生成 `client_usage_today.json` 作为当天统计缓存。默认扫描路径包括：
 
 - `%USERPROFILE%\.codex\sessions`
 - `%USERPROFILE%\.claude\projects`
-
-脚本会生成 `client_usage_today.json`，用于保存当天本地客户端统计。这个文件默认不提交到 Git。
-
-悬浮窗还会生成 `usage_history.json`，用于保存每日请求、token 和成本快照。这个文件也默认不提交到 Git。如果想换位置，可以设置：
-
-```env
-SUB2API_USAGE_HISTORY_JSON=
-```
 
 常用配置：
 
@@ -106,30 +112,30 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 
 - `auto`：自动检测当前 Codex endpoint。
 - `sub2api`：只使用 Sub2API 服务端统计。
-- `local`：只使用本地 Codex/Claude 日志。
+- `local`：只使用本地客户端日志。
 - `both`：同时展示 Sub2API 服务端统计和本地日志，适合对账，但可能重复计算。
 
-默认建议使用 `auto`。
+默认建议使用 `auto`。当 Codex 指向你的 Sub2API 地址时，主统计优先来自 Sub2API；因为客户端本身也会写本地 token 日志，默认不会把本地日志直接合并进总量，避免重复计算。
 
-当 Codex 指向你的 Sub2API 地址时，主统计来自 Sub2API。因为 Codex 即使走 Sub2API 也会写本地 token 日志，所以默认不会把本地日志直接合并到总量，避免重复计算。
+## 隐私说明
 
-## 分叉会话去重
-
-Codex 分叉会话时，可能会把之前的上下文重新带入新会话。如果统计器把这些 replay 也算成新请求，今日 token 会明显膨胀。
-
-本工具会检测 `session_meta.payload.forked_from_id`，跳过初始 replay 窗口，并对重复的 token total 做去重。
+- `.env`、本地配置、当天统计缓存、历史统计缓存和归因 ledger 默认都在 `.gitignore` 中，不会提交到 Git。
+- 本地模式只读取你电脑上的日志文件，不会主动上传到第三方。
+- Sub2API 模式只请求你配置的 `SUB2API_BASE_URL`。
+- 仓库中的截图使用脱敏演示数据，不包含真实账号或真实用量。
 
 ## 文件说明
 
-- `monitor.py`：悬浮窗 UI 和 Sub2API/本地数据源读取逻辑。
-- `client_usage_export.py`：本机 Codex/Claude JSONL 用量扫描器。
+- `monitor.py`：悬浮窗 UI、Sub2API 读取、本地统计整合和页面绘制。
+- `client_usage_export.py`：本地客户端 JSONL 用量扫描器。
 - `start-monitor.ps1`：自动模式启动脚本。
 - `start-local-codex.ps1`：本地日志模式启动脚本。
 - `run-monitor.cmd`：CMD 启动脚本。
 - `run-client-usage-export.cmd`：单独导出本地用量 JSON。
 
-## 隐私说明
+## 验证
 
-本地模式只读取你电脑上的本地日志，不会上传到任何地方。
-
-Sub2API 模式只请求你配置的 `SUB2API_BASE_URL`。
+```powershell
+python -m py_compile monitor.py client_usage_export.py
+python client_usage_export.py --output client_usage_today.json
+```

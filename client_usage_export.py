@@ -29,6 +29,7 @@ CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 CODEX_CURRENT_ACCOUNT_RECENT_SECONDS = int(os.environ.get("CLIENT_USAGE_CURRENT_ACCOUNT_RECENT_SECONDS", "1800"))
+CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "300"))
 UNASSIGNED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_UNASSIGNED_CODEX_LABEL", "Unassigned local")
 CODEX_FAST_COST_MULTIPLIER = env_float("CLIENT_USAGE_CODEX_FAST_COST_MULTIPLIER", 2.0)
 CODEX_FORCE_SPEED = os.environ.get("CLIENT_USAGE_CODEX_FORCE_SPEED", "").strip().lower()
@@ -1999,6 +2000,82 @@ def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
     return bucket
 
 
+def scan_claude_hourly(root: Path, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    buckets = [
+        {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+        for hour in range(24)
+    ]
+    for path in iter_recent_jsonl(root, start):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_dt(row.get("timestamp"))
+            if ts is None or ts < start or ts >= end:
+                continue
+            message = row.get("message") or {}
+            if message.get("role") != "assistant":
+                continue
+            usage = message.get("usage") or {}
+            if not usage:
+                continue
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            total = input_tokens + output_tokens + cache_creation + cache_read
+            if total <= 0:
+                continue
+            model = str(message.get("model") or row.get("model") or "claude")
+            bucket = buckets[max(0, min(23, ts.hour))]
+            bucket["requests"] += 1
+            bucket["tokens"] += total
+            bucket["cost"] += estimate_cost(model, input_tokens + cache_creation, cache_read, output_tokens)
+    for bucket in buckets:
+        bucket["cost"] = round(float(bucket["cost"] or 0), 6)
+    return buckets
+
+
+def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
+    buckets = [
+        {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+        for hour in range(24)
+    ]
+    for event in events:
+        hour = max(0, min(23, event.when.hour))
+        bucket = buckets[hour]
+        bucket["requests"] += 1
+        bucket["tokens"] += event.total_tokens
+        multiplier = event.cost_multiplier if event.cost_multiplier is not None else 1.0
+        bucket["cost"] += estimate_cost(event.model, event.input_tokens, event.cached_tokens, event.output_tokens) * max(1.0, float(multiplier or 1.0))
+    for bucket in buckets:
+        bucket["cost"] = round(float(bucket["cost"] or 0), 6)
+    return buckets
+
+
+def merge_hourly_buckets(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = [
+        {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+        for hour in range(24)
+    ]
+    for source in sources:
+        for row in source:
+            if not isinstance(row, dict):
+                continue
+            hour = max(0, min(23, int(row.get("hour") or 0)))
+            merged[hour]["requests"] += int(row.get("requests") or 0)
+            merged[hour]["tokens"] += int(row.get("tokens") or 0)
+            merged[hour]["cost"] += float(row.get("cost") or 0)
+    for bucket in merged:
+        bucket["cost"] = round(float(bucket["cost"] or 0), 6)
+    return merged
+
+
 def latest_at_text(bucket: UsageBucket) -> str:
     if bucket.latest_at is None:
         return ""
@@ -2263,7 +2340,12 @@ def main() -> int:
         key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
     )
 
-    claude = scan_claude(home / ".claude" / "projects", start, end)
+    claude_root = home / ".claude" / "projects"
+    claude = scan_claude(claude_root, start, end)
+    hourly_today = merge_hourly_buckets(
+        codex_hourly_from_events(codex_events),
+        scan_claude_hourly(claude_root, start, end),
+    )
     window_stats_by_account: dict[str, dict[str, dict[str, Any]]] = {}
     if day == now.date():
         window_stats_by_account = build_codex_window_stats(
@@ -2275,9 +2357,22 @@ def main() -> int:
         )
     save_attribution_ledger(attribution_ledger, now)
 
+    recent_cutoff = now - timedelta(seconds=max(1, CLIENT_USAGE_ACTIVE_WINDOW_SECONDS))
+    recent_active_by_label: dict[str, int] = {}
+    recent_events_by_label = attribute_codex_events_by_account(
+        codex_events,
+        markers,
+        attribution_ledger,
+        current_label,
+        now,
+    )
+    for label, account_events in recent_events_by_label.items():
+        recent_active_by_label[label] = sum(1 for event in account_events if event.when >= recent_cutoff)
+
     codex_providers = []
     for name, bucket in codex_provider_buckets:
         provider = bucket_to_dict(name, bucket, show_zero=True)
+        provider["recent_active"] = int(recent_active_by_label.get(name) or 0)
         for key, value in speed_by_account.get(name, {}).items():
             if key not in provider or provider.get(key) in {"", None}:
                 provider[key] = value
@@ -2322,6 +2417,9 @@ def main() -> int:
             "model": latest_model,
             "created_at": latest_at,
             "kind": "success" if latest_at else "",
+        },
+        "dashboard": {
+            "hourly_today": hourly_today,
         },
     }
 

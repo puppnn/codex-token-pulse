@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -316,6 +316,27 @@ def load_usage_history() -> dict[str, Any]:
     return data
 
 
+def token_mix_from_client_usage(client_usage: dict[str, Any] | None) -> dict[str, int]:
+    mix = {
+        "input": 0,
+        "cached": 0,
+        "cache_create": 0,
+        "output": 0,
+    }
+    if not isinstance(client_usage, dict):
+        return mix
+    providers = client_usage.get("providers")
+    rows = providers if isinstance(providers, list) else [client_usage]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mix["input"] += int(row.get("input_tokens") or 0)
+        mix["cached"] += int(row.get("cached_input_tokens") or 0)
+        mix["cache_create"] += int(row.get("cache_creation_input_tokens") or 0)
+        mix["output"] += int(row.get("output_tokens") or 0)
+    return mix
+
+
 def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
     days = history.get("days") if isinstance(history, dict) else {}
     if not isinstance(days, dict):
@@ -405,6 +426,7 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     if isinstance(state.client_usage, dict):
         source_date = str(state.client_usage.get("date") or "").strip()
     existing_source_date = str(existing.get("source_date") or "").strip()
+    mix = token_mix_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
 
     # Same-day local usage is reconstructed from client logs, so a temporary
     # scan failure can make a later snapshot smaller. Sub2API/both mode is
@@ -422,6 +444,10 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         "source": state.usage_source,
         "requests": new_requests,
         "tokens": new_tokens,
+        "input_tokens": mix["input"],
+        "cached_input_tokens": mix["cached"],
+        "cache_creation_input_tokens": mix["cache_create"],
+        "output_tokens": mix["output"],
         "cost": round(new_cost, 6),
         "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
         "source_date": source_date,
@@ -489,14 +515,38 @@ def local_active_accounts_from_client_usage(
         return []
     if not isinstance(client_usage, dict):
         return []
+    providers = client_usage.get("providers")
+    providers = providers if isinstance(providers, list) else []
+    active: list[dict[str, Any]] = []
+    for index, provider in enumerate(providers):
+        if not isinstance(provider, dict):
+            continue
+        latest_at = str(provider.get("latest_at") or "")
+        if not is_recent_activity(latest_at):
+            continue
+        provider_name = str(provider.get("name") or "Local client")
+        recent_active = max(1, int(provider.get("recent_active") or 1))
+        active.append(
+            {
+                "id": f"local-{index}",
+                "name": f"LOCAL - {local_provider_display_name(provider_name)}",
+                "current": recent_active,
+                "max": recent_active,
+                "model": provider.get("latest_model") or "-",
+                "source": "LOCAL",
+                "speed_badge": provider.get("speed_badge") or "",
+                "latest_at": latest_at,
+            }
+        )
+    if active:
+        active.sort(key=lambda row: _parse_time(str(row.get("latest_at") or "")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return active
+
     client_latest = client_usage.get("latest_request")
     if not isinstance(client_latest, dict) or not client_latest.get("created_at"):
         return []
     if not is_recent_activity(str(client_latest.get("created_at") or "")):
         return []
-
-    providers = client_usage.get("providers")
-    providers = providers if isinstance(providers, list) else []
     provider_name = str(client_latest.get("provider") or "Local client")
     latest_provider = next(
         (provider for provider in providers if isinstance(provider, dict) and str(provider.get("name") or "") == provider_name),
@@ -504,7 +554,7 @@ def local_active_accounts_from_client_usage(
     )
     return [
         {
-            "id": "local",
+            "id": "local-latest",
             "name": f"LOCAL - {local_provider_display_name(provider_name)}",
             "current": 1,
             "max": 1,
@@ -603,6 +653,7 @@ def load_client_usage() -> dict[str, Any] | None:
             "cost": 0.0,
             "providers": [],
             "latest_request": {},
+            "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
             "updated_at": data.get("updated_at") or "",
             "date": data_date,
             "stale": True,
@@ -613,6 +664,7 @@ def load_client_usage() -> dict[str, Any] | None:
         "cost": float(today.get("cost") or 0),
         "providers": data.get("providers") or [],
         "latest_request": data.get("latest_request") or {},
+        "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
         "updated_at": data.get("updated_at") or "",
         "date": data_date,
         "stale": False,
@@ -912,7 +964,7 @@ class MonitorState:
     error: str | None = None
     updated_at: float | None = None
     mode: str = "sub2api"
-    source_label: str = "SUB2 监控"
+    source_label: str = "MONITOR"
     usage_source: str = "sub2api"
     usage_note: str = ""
     active_accounts: list[dict[str, Any]] | None = None
@@ -936,6 +988,8 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
         "updated_at": "",
     }
     providers = client_usage.get("providers") if isinstance(client_usage, dict) else []
+    client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
+    latest_provider_name = str(client_latest.get("provider") or "") if isinstance(client_latest, dict) else ""
     top_accounts: list[dict[str, Any]] = []
     if isinstance(providers, list):
         for provider in providers:
@@ -955,12 +1009,13 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
                     "window_5h": provider.get("window_5h") or {},
                     "window_7d": provider.get("window_7d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
+                    "active_now": False,
+                    "is_latest": str(provider.get("name") or "") == latest_provider_name,
                 }
             )
     top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
 
     updated_at = client_usage.get("updated_at") if isinstance(client_usage, dict) else ""
-    client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
     latest_request = None
     latest_account_name = "Local client logs"
     active_accounts: list[dict[str, Any]] = []
@@ -1036,7 +1091,7 @@ def build_sub2api_error_state(error_text: str, usage_note: str) -> MonitorState:
         error=error_text,
         updated_at=time.time(),
         mode="sub2api",
-        source_label="SUB2 监控",
+        source_label="MONITOR",
         usage_source="sub2api",
         usage_note=usage_note,
         active_accounts=[],
@@ -1291,17 +1346,38 @@ class Sub2APIClient:
 
         active_accounts = []
         for item in concurrency.values():
-            if int(item.get("current_in_use") or 0) <= 0:
+            current = int(item.get("current_in_use") or item.get("current_concurrency") or item.get("current") or item.get("in_use") or 0)
+            if current <= 0:
                 continue
             account_id = int(item.get("account_id") or 0)
+            account_info = account_map.get(account_id, {})
             active_accounts.append(
                 {
                     "id": account_id,
-                    "name": account_map.get(account_id, {}).get("name") or item.get("account_name") or f"账号 #{account_id}",
-                    "current": int(item.get("current_in_use") or 0),
-                    "max": int(item.get("max_capacity") or 0),
+                    "name": account_info.get("name") or item.get("account_name") or f"账号 #{account_id}",
+                    "current": current,
+                    "max": int(item.get("max_capacity") or item.get("concurrency") or account_info.get("concurrency") or current),
                 }
             )
+        active_by_id = {int(row.get("id") or 0): row for row in active_accounts if row.get("id") is not None}
+        for account in accounts:
+            account_id = int(account.get("id") or 0)
+            current = int(account.get("current_concurrency") or account.get("current_in_use") or 0)
+            if current <= 0:
+                continue
+            existing = active_by_id.get(account_id)
+            if existing:
+                existing["current"] = max(int(existing.get("current") or 0), current)
+                existing["max"] = max(int(existing.get("max") or 0), int(account.get("concurrency") or current))
+                continue
+            row = {
+                "id": account_id,
+                "name": account.get("name") or f"账号 #{account_id}",
+                "current": current,
+                "max": int(account.get("concurrency") or current),
+            }
+            active_accounts.append(row)
+            active_by_id[account_id] = row
         active_accounts.sort(key=lambda row: (-row["current"], row["id"]))
 
         latest_account_name = ""
@@ -1334,6 +1410,8 @@ class Sub2APIClient:
                     "window_5h": account_windows.get("window_5h") or {},
                     "window_7d": account_windows.get("window_7d") or {},
                     "window_cycle": account_windows.get("window_cycle") or {},
+                    "active_now": any(int(row.get("id") or 0) == account_id for row in active_accounts),
+                    "is_latest": bool(latest and int(latest.get("account_id") or 0) == account_id),
                 }
             )
         top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
@@ -1417,6 +1495,8 @@ class Sub2APIClient:
                         "window_5h": provider.get("window_5h") or {},
                         "window_7d": provider.get("window_7d") or {},
                         "window_cycle": provider.get("window_cycle") or {},
+                        "active_now": False,
+                        "is_latest": str(provider.get("name") or "") == latest_provider_name,
                     }
                 )
             top_accounts.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
@@ -1461,7 +1541,7 @@ class Sub2APIClient:
             source_label="MONITOR",
             usage_source=ledger_source,
             usage_note=ledger_note,
-            active_accounts=active_accounts[:4],
+            active_accounts=active_accounts,
             latest_request=display_latest,
             latest_account_name=display_latest_account_name,
             today_requests=today_requests,
@@ -1477,48 +1557,63 @@ class Sub2APIClient:
 class Theme:
     """Cockpit-inspired dark amber floating card palette."""
     # ── base surfaces ──
-    bg_dark = "#0B0D12"
-    bg_card = "#151820"
-    bg_section = "#1D222C"
-    bg_lift = "#232A36"
-    bg_hover = "#2A3140"
+    bg_dark = "#1E1E1E"
+    bg_card = "#1E1E1E"
+    bg_section = "#2A2D2E"
+    bg_lift = "#33373A"
+    bg_hover = "#33373A"
 
     # ── amber accent ramp ──
-    amber_dim = "#8A6522"
-    amber = "#E0A84B"
-    amber_bright = "#FFD37A"
-    amber_glow = "#FFD980"
+    amber_dim = "#264F78"
+    amber = "#3794FF"
+    amber_bright = "#FFFFFF"
+    amber_glow = "#6CB6FF"
 
     # ── secondary accents ──
-    cyan = "#6DD6E8"
-    cyan_dim = "#285A66"
+    cyan = "#4EC9B0"
+    cyan_dim = "#264F78"
     violet = "#A78BFA"
-    blue = "#7DB7FF"
+    blue = "#4F9CF7"
 
     # ── text ──
-    text_primary = "#F2EBDD"
-    text_secondary = "#C9BBA3"
-    text_muted = "#7B7161"
+    text_primary = "#CCCCCC"
+    text_secondary = "#C5C5C5"
+    text_muted = "#858585"
 
     # ── semantic ──
-    accent_cyan = "#66D9E8"
-    accent_red = "#F07178"
-    accent_green = "#8BD17C"
-    quota_red_bg = "#34131D"
-    quota_amber_bg = "#33240E"
-    quota_green_bg = "#10251A"
+    accent_cyan = "#4EC9B0"
+    accent_red = "#F48771"
+    accent_green = "#4EC9B0"
+    quota_red_bg = "#3A1F1B"
+    quota_amber_bg = "#332B12"
+    quota_green_bg = "#15352F"
+    ag_bg = "#1E1E1E"
+    ag_surface = "#2A2D2E"
+    ag_surface_hover = "#33373A"
+    ag_border = "#3C3C3C"
+    ag_divider = "#343434"
+    ag_accent = "#3794FF"
+    ag_bar = "#0E70C0"
+    ag_success = "#4EC9B0"
+    ag_warn = "#CCA700"
+    ag_crit = "#F48771"
+    ag_muted = "#858585"
+    ag_input = "#4F9CF7"
+    ag_cache = "#A78BFA"
+    ag_output = "#4ADE80"
+    ag_reason = "#F59E0B"
 
     # ── misc ──
-    border = "#2A2D35"
+    border = "#3C3C3C"
     shadow = "#000000"
     transparent = "#010203"
 
     # ── fonts (family, size, weight) ──
-    font_title = ("Segoe UI", 15, "bold")
+    font_title = ("Segoe UI", 14, "bold")
     font_section = ("Segoe UI", 11, "bold")
     font_label = ("Segoe UI", 10, "normal")
     font_label_bold = ("Segoe UI", 10, "bold")
-    font_value = ("Consolas", 17, "bold")
+    font_value = ("Consolas", 16, "bold")
     font_value_sm = ("Consolas", 13, "bold")
     font_tiny = ("Segoe UI", 9, "normal")
     font_micro = ("Segoe UI", 8, "normal")
@@ -1532,9 +1627,11 @@ class FloatingMonitorApp:
     HEIGHT = 760
     MIN_WIDTH = 360
     MIN_HEIGHT = 640
-    WINDOW_ALPHA = 0.92
+    WINDOW_ALPHA = 0.99
 
     def __init__(self) -> None:
+        self.WIDTH = int(type(self).WIDTH)
+        self.HEIGHT = int(type(self).HEIGHT)
         self.client = Sub2APIClient()
         self.state: MonitorState | None = None
         self.error: str | None = None
@@ -1549,14 +1646,22 @@ class FloatingMonitorApp:
         self._resizing = False
         self._hover_btn: str | None = None
         self._btn_rects: dict[str, tuple[int, int, int, int]] = {}
+        self._tooltip_rects: list[tuple[int, int, int, int, str]] = []
+        self._tooltip_text = ""
+        self._tooltip_pos = (0, 0)
+        self._main_tab = "accounts"
+        self._scroll_offsets = {"accounts": 0, "budget": 0, "stats": 0}
+        self._scroll_limits = {"accounts": 0, "budget": 0, "stats": 0}
+        self._usage_range = "24h"
         self._account_range = "today"
         self._account_range_user_selected = False
         self._account_range_auto_selected = False
         self._topmost_repair_scheduled = False
+        self._ignore_configure = False
 
         # ── root window ──
         self.root = tk.Tk()
-        self.root.title("Sub2 Monitor")
+        self.root.title("Token Monitor")
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+1120+70")
         self.root.attributes("-topmost", True)
@@ -1589,9 +1694,18 @@ class FloatingMonitorApp:
 
         # ── bindings ──
         self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_mousewheel)
+        self.canvas.bind("<Button-5>", self._on_mousewheel)
+        self.root.bind("<ButtonPress-1>", self._on_press)
+        self.root.bind("<ButtonRelease-1>", self._on_release)
+        self.root.bind("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<ButtonPress-1>", self._on_press)
 
         # ── initial draw & data ──
         self._draw()
@@ -1636,34 +1750,65 @@ class FloatingMonitorApp:
         pts = self._rounded_rect_points(x1, y1, x2, y2, r)
         return self.canvas.create_polygon(pts, smooth=True, **kw)
 
+    def _apply_window_size(self, width: int, height: int) -> None:
+        width = int(max(self.MIN_WIDTH, width))
+        height = int(max(self.MIN_HEIGHT, height))
+        self.WIDTH = width
+        self.HEIGHT = height
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self._ignore_configure = True
+        try:
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+            self.canvas.configure(width=width, height=height)
+        finally:
+            self.root.after_idle(self._clear_ignore_configure)
+
+    def _clear_ignore_configure(self) -> None:
+        self._ignore_configure = False
+
     def _text_width(self, text: str, font_key: str) -> int:
         return self._fonts[font_key].measure(text)
 
-    def _ensure_topmost(self, force: bool = False) -> None:
+    def _add_tooltip(self, x1: int, y1: int, x2: int, y2: int, text: str) -> None:
+        if text:
+            self._tooltip_rects.append((int(x1), int(y1), int(x2), int(y2), text))
+
+    def _hit_tooltip(self, x: int, y: int) -> str:
+        for x1, y1, x2, y2, text in reversed(self._tooltip_rects):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return text
+        return ""
+
+    def _draw_tooltip(self, W: int, H: int) -> None:
+        if not self._tooltip_text:
+            return
+        lines = self._tooltip_text.split("\n")[:3]
+        width = max(self._text_width(line, "font_micro") for line in lines) + 18
+        height = 18 * len(lines) + 8
+        x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
+        y = min(max(8, self._tooltip_pos[1] + 14), max(8, H - height - 8))
+        self._draw_rounded_rect(x, y, x + width, y + height, r=6,
+                                fill="#252526", outline=Theme.ag_accent, width=1)
+        for index, line in enumerate(lines):
+            self.canvas.create_text(x + 9, y + 7 + index * 18, anchor="nw",
+                                    text=line, font=self._fonts["font_micro"], fill=Theme.text_primary)
+
+    def _ensure_topmost(self, force: bool = False, raise_window: bool = False) -> None:
         if not self._pinned and not force:
             return
         try:
-            self.root.deiconify()
-            self.root.lift()
             self.root.attributes("-topmost", True)
-            self.root.after_idle(lambda: self.root.attributes("-topmost", True))
-            self.root.after(250, lambda: self.root.attributes("-topmost", True))
+            if raise_window:
+                self.root.deiconify()
+                self.root.lift()
         except tk.TclError:
             pass
 
     def _schedule_topmost_repair(self) -> None:
-        if self.closed or self._topmost_repair_scheduled:
-            return
-        self._topmost_repair_scheduled = True
-
-        def _repair() -> None:
-            self._topmost_repair_scheduled = False
-            if self.closed or not self._pinned:
-                return
-            self._ensure_topmost()
-            self._schedule_topmost_repair()
-
-        self.root.after(4000, _repair)
+        # Do not periodically lift/reassert topmost. Screenshot overlays are
+        # often topmost windows too; repeated reassertion can jump above them.
+        return
 
     def _truncate(self, text: str, font_key: str, max_w: int) -> str:
         f = self._fonts[font_key]
@@ -1716,12 +1861,871 @@ class FloatingMonitorApp:
         self.canvas.create_text(x + 7, y + 2, anchor="nw", text=label, font=self._fonts["font_micro"], fill=color)
         return width
 
+    def _draw_footer(self, W: int, H: int) -> None:
+        now_str = datetime.now(CN_TZ).strftime("%H:%M:%S UTC+8")
+        self.canvas.create_text(W // 2, H - 10, anchor="s", text=now_str,
+                                font=self._fonts["font_tiny"], fill=Theme.text_muted)
+        self.canvas.create_line(W - 18, H - 7, W - 7, H - 18, fill=Theme.border, width=1)
+        self.canvas.create_line(W - 13, H - 7, W - 7, H - 13, fill=Theme.text_muted, width=1)
+
+    def _draw_main_tabs(self, col_l: int, col_r: int, y: int) -> int:
+        tabs = [
+            ("main_accounts", "\u8d26\u53f7", "accounts"),
+            ("main_budget", "Token \u9884\u7b97", "budget"),
+            ("main_stats", "\u7528\u91cf\u7edf\u8ba1", "stats"),
+        ]
+        gap = 5
+        total_gap = gap * (len(tabs) - 1)
+        tab_w = max(62, (col_r - col_l - total_gap) // len(tabs))
+        tab_h = 25
+        for index, (button_name, label, value) in enumerate(tabs):
+            x1 = col_l + index * (tab_w + gap)
+            x2 = col_r if index == len(tabs) - 1 else x1 + tab_w
+            self._btn_rects[button_name] = (x1, y, x2, y + tab_h)
+            selected = self._main_tab == value
+            hovered = self._hover_btn == button_name
+            fill = Theme.ag_surface if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            outline = Theme.ag_accent if selected else Theme.ag_border
+            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
+            self._draw_rounded_rect(x1, y, x2, y + tab_h, r=7, fill=fill, outline=outline, width=1)
+            self.canvas.create_text((x1 + x2) // 2, y + 12, anchor="center", text=label,
+                                    font=self._fonts["font_label_bold"], fill=text_color)
+            if selected:
+                self.canvas.create_line(x1 + 8, y + tab_h - 2, x2 - 8, y + tab_h - 2,
+                                        fill=Theme.ag_accent, width=2)
+        return y + tab_h + 10
+
+    def _draw_ag_section(self, col_l: int, col_r: int, y: int, title: str, badge: str = "") -> int:
+        self.canvas.create_text(col_l, y, anchor="nw", text=title,
+                                font=self._fonts["font_section"], fill=Theme.text_primary)
+        if badge:
+            bw = self._text_width(badge, "font_micro") + 14
+            self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            self.canvas.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
+                                    font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        return y + 24
+
+    def _draw_donut(self, x: int, y: int, size: int, pct: float, color: str, label: str) -> None:
+        pct = max(0.0, min(100.0, float(pct or 0)))
+        pad = 5
+        self.canvas.create_oval(x + pad, y + pad, x + size - pad, y + size - pad,
+                                outline=Theme.ag_border, width=5)
+        if pct > 0:
+            self.canvas.create_arc(
+                x + pad,
+                y + pad,
+                x + size - pad,
+                y + size - pad,
+                start=90,
+                extent=-360 * pct / 100,
+                style="arc",
+                outline=color,
+                width=5,
+            )
+        self.canvas.create_text(x + size // 2, y + size // 2, anchor="center",
+                                text=label, font=self._fonts["font_label_bold"], fill=color)
+
+    def _draw_ag_chip(self, x: int, y: int, text: str, dot: str | None = None) -> int:
+        width = self._text_width(text, "font_micro") + (24 if dot else 14)
+        self._draw_rounded_rect(x, y, x + width, y + 20, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        tx = x + 7
+        if dot:
+            self.canvas.create_oval(x + 7, y + 7, x + 13, y + 13, fill=dot, outline="")
+            tx += 12
+        self.canvas.create_text(tx, y + 4, anchor="nw", text=text,
+                                font=self._fonts["font_micro"], fill=Theme.text_secondary)
+        return width
+
+    @staticmethod
+    def _ag_quota_color(utilization: float | int | None) -> str:
+        try:
+            value = float(utilization or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value >= 90:
+            return Theme.ag_crit
+        if value >= 60:
+            return Theme.ag_warn
+        return Theme.ag_success
+
+    @staticmethod
+    def _activity_color(intensity: float) -> str:
+        if intensity <= 0:
+            return "#262626"
+        if intensity < 0.18:
+            return "#0E4429"
+        if intensity < 0.38:
+            return "#006D32"
+        if intensity < 0.68:
+            return "#26A641"
+        if intensity < 0.9:
+            return "#39D353"
+        return "#79E36B"
+
+    def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
+        if is_today:
+            return Theme.ag_accent
+        return self._activity_color(intensity)
+
+    def _client_providers(self) -> list[dict[str, Any]]:
+        if not self.state or not isinstance(self.state.client_usage, dict):
+            return []
+        providers = self.state.client_usage.get("providers")
+        if not isinstance(providers, list):
+            return []
+        return [provider for provider in providers if isinstance(provider, dict)]
+
+    def _token_mix(self) -> dict[str, int]:
+        return token_mix_from_client_usage(self.state.client_usage if self.state else None)
+
+    def _summary_token_mix(self, summary: dict[str, Any]) -> dict[str, int]:
+        mix = {
+            "input": int(summary.get("input_tokens") or 0),
+            "cached": int(summary.get("cached_input_tokens") or 0),
+            "cache_create": int(summary.get("cache_creation_input_tokens") or 0),
+            "output": int(summary.get("output_tokens") or 0),
+        }
+        known = sum(mix.values())
+        mix["unknown"] = max(0, int(summary.get("tokens") or 0) - known)
+        return mix
+
+    def _top_models(self) -> list[tuple[str, int]]:
+        totals: dict[str, int] = {}
+        for provider in self._client_providers():
+            models = provider.get("models")
+            if not isinstance(models, dict):
+                continue
+            for model, tokens in models.items():
+                try:
+                    amount = int(tokens or 0)
+                except (TypeError, ValueError):
+                    amount = 0
+                if amount > 0:
+                    name = str(model or "unknown")
+                    totals[name] = totals.get(name, 0) + amount
+        return sorted(totals.items(), key=lambda item: item[1], reverse=True)[:6]
+
+    def _usage_range_summary(self, range_key: str) -> dict[str, Any]:
+        if range_key == "24h":
+            hourly: list[dict[str, Any]] = []
+            if self.state and isinstance(self.state.client_usage, dict):
+                dashboard = self.state.client_usage.get("dashboard")
+                if isinstance(dashboard, dict):
+                    raw_hourly = dashboard.get("hourly_today")
+                    if isinstance(raw_hourly, list):
+                        hourly = [row for row in raw_hourly if isinstance(row, dict)]
+            if not hourly:
+                hourly = [
+                    {
+                        "hour": hour,
+                        "requests": 0,
+                        "tokens": 0,
+                        "cost": 0.0,
+                    }
+                    for hour in range(24)
+                ]
+            mix = self._token_mix()
+            return {
+                "label": "24h",
+                "requests": int(self.state.today_requests if self.state else 0),
+                "tokens": int(self.state.today_tokens if self.state else 0),
+                "input_tokens": mix["input"],
+                "cached_input_tokens": mix["cached"],
+                "cache_creation_input_tokens": mix["cache_create"],
+                "output_tokens": mix["output"],
+                "cost": float(self.state.today_account_cost if self.state else 0),
+                "series": hourly,
+            }
+        history = load_usage_history()
+        days = history.get("days") if isinstance(history, dict) else {}
+        if not isinstance(days, dict):
+            days = {}
+        series: list[dict[str, Any]] = []
+        if range_key == "all":
+            parsed_dates = []
+            for key, row in days.items():
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    parsed_dates.append(datetime.fromisoformat(str(key)).date())
+                except ValueError:
+                    continue
+            if parsed_dates:
+                start_date = min(parsed_dates)
+                end_date = datetime.now(CN_TZ).date()
+                day_count = max(1, (end_date - start_date).days + 1)
+                keys = [(start_date + timedelta(days=offset)).isoformat() for offset in range(day_count)]
+            else:
+                keys = []
+        else:
+            days_count = 7 if range_key == "7d" else 30
+            keys = [date_key(offset) for offset in range(days_count - 1, -1, -1)]
+        for key in keys:
+            row = days.get(key) if isinstance(days.get(key), dict) else {}
+            series.append(
+                {
+                    "date": key,
+                    "requests": int(row.get("requests") or 0),
+                    "tokens": int(row.get("tokens") or 0),
+                    "input_tokens": int(row.get("input_tokens") or 0),
+                    "cached_input_tokens": int(row.get("cached_input_tokens") or 0),
+                    "cache_creation_input_tokens": int(row.get("cache_creation_input_tokens") or 0),
+                    "output_tokens": int(row.get("output_tokens") or 0),
+                    "cost": float(row.get("cost") or 0),
+                }
+            )
+        return {
+            "label": range_key,
+            "requests": sum(int(item.get("requests") or 0) for item in series),
+            "tokens": sum(int(item.get("tokens") or 0) for item in series),
+            "input_tokens": sum(int(item.get("input_tokens") or 0) for item in series),
+            "cached_input_tokens": sum(int(item.get("cached_input_tokens") or 0) for item in series),
+            "cache_creation_input_tokens": sum(int(item.get("cache_creation_input_tokens") or 0) for item in series),
+            "output_tokens": sum(int(item.get("output_tokens") or 0) for item in series),
+            "cost": sum(float(item.get("cost") or 0) for item in series),
+            "series": series,
+        }
+
+    def _budget_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for account in list(self.state.top_accounts or []) if self.state else []:
+            windows = []
+            account_tokens = int(account.get("tokens") or 0)
+            account_requests = int(account.get("requests") or 0)
+            pressure_active = bool(account.get("active_now") or account.get("is_latest") or account_tokens > 0 or account_requests > 0)
+            for key, label in (("window_5h", "5h"), ("window_7d", "7d"), ("window_cycle", "\u5468\u671f")):
+                window = account.get(key)
+                if not isinstance(window, dict) or not window:
+                    continue
+                quota_available = bool(window.get("quota_available", window.get("utilization") is not None))
+                try:
+                    utilization = float(window.get("utilization") or 0)
+                except (TypeError, ValueError):
+                    utilization = 0.0
+                remaining = window.get("remaining_percent")
+                if remaining is None and quota_available:
+                    remaining = max(0.0, min(100.0, 100.0 - utilization))
+                windows.append(
+                    {
+                        "label": label,
+                        "quota_available": quota_available,
+                        "quota_stale": bool(window.get("quota_stale")),
+                        "utilization": utilization,
+                        "remaining": remaining,
+                        "resets_at": str(window.get("resets_at") or ""),
+                        "tokens": int(window.get("tokens") or 0),
+                        "cost": float(window.get("cost") or 0),
+                        "pressure_active": pressure_active,
+                    }
+                )
+            if not windows:
+                continue
+            quota_windows = [item for item in windows if item["quota_available"]]
+            min_remaining = min(
+                [float(item["remaining"]) for item in quota_windows if item["remaining"] is not None],
+                default=999.0,
+            )
+            rows.append(
+                {
+                    "name": str(account.get("name") or "-"),
+                    "source_badge": str(account.get("source_badge") or ""),
+                    "health_badge": str(account.get("health_badge") or ""),
+                    "windows": windows,
+                    "has_quota": bool(quota_windows),
+                    "min_remaining": min_remaining,
+                    "pressure_active": pressure_active,
+                    "tokens": account_tokens,
+                    "requests": account_requests,
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                0 if row.get("pressure_active") else 1,
+                0 if row["has_quota"] else 1,
+                row["min_remaining"],
+                row["name"],
+            )
+        )
+        return rows
+
+    def _draw_activity_heatmap(self, col_l: int, col_r: int, y: int, summary: dict[str, Any], series: list[dict[str, Any]]) -> int:
+        c = self.canvas
+        c.create_text(col_l, y, anchor="nw", text="Activity",
+                      font=self._fonts["font_section"], fill=Theme.text_primary)
+        chip_x = col_l + self._text_width("Activity", "font_section") + 10
+        self._draw_rounded_rect(chip_x, y - 1, chip_x + 78, y + 18, r=6,
+                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        c.create_text(chip_x + 39, y + 8, anchor="center", text="Contribution",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        badge = f"{summary.get('label', '-') } heatmap"
+        bw = self._text_width(badge, "font_micro") + 14
+        self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
+                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        c.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        y += 28
+        if not series:
+            c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u8d8b\u52bf\u6570\u636e",
+                          font=self._fonts["font_label"], fill=Theme.ag_muted)
+            return y + 30
+
+        if self._usage_range == "24h":
+            visible = series[-24:]
+        elif self._usage_range == "7d":
+            visible = series[-7:]
+        elif self._usage_range == "30d":
+            visible = series[-30:]
+        else:
+            visible = series
+        max_tokens = max([float(item.get("tokens") or 0) for item in visible], default=0.0) or 1.0
+        peak = max(visible, key=lambda item: float(item.get("tokens") or 0))
+        if self._usage_range == "24h":
+            cols = 24
+            rows_count = 1
+            cell_gap = 3
+            cell = max(7, min(13, int((col_r - col_l - cell_gap * (cols - 1)) / cols)))
+            for label, col_index in (("00", 0), ("06", 6), ("12", 12), ("18", 18)):
+                c.create_text(col_l + col_index * (cell + cell_gap), y, anchor="nw", text=label,
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            grid_x = col_l
+            grid_y = y + 15
+            for index, item in enumerate(visible):
+                row = index // cols
+                col = index % cols
+                tokens = float(item.get("tokens") or 0)
+                intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                x1 = grid_x + col * (cell + cell_gap)
+                y1 = grid_y + row * (cell + cell_gap)
+                self._draw_rounded_rect(x1, y1, x1 + cell, y1 + cell, r=3,
+                                        fill=self._activity_color(intensity), outline=Theme.ag_border)
+                hour = int(item.get("hour") if item.get("hour") is not None else index)
+                self._add_tooltip(
+                    x1, y1, x1 + cell, y1 + cell,
+                    f"{hour:02d}:00-{(hour + 1) % 24:02d}:00\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                )
+            legend_y = grid_y + rows_count * (cell + cell_gap) + 8
+        elif self._usage_range == "7d":
+            cols = 7
+            cell_gap = 5
+            cell_w = max(28, int((col_r - col_l - cell_gap * (cols - 1)) / cols))
+            cell_h = 22
+            grid_x = col_l
+            grid_y = y + 15
+            for index, item in enumerate(visible):
+                day_text = str(item.get("date") or "")[-2:] or "-"
+                x1 = grid_x + index * (cell_w + cell_gap)
+                c.create_text(x1 + cell_w // 2, y, anchor="n", text=day_text,
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+                tokens = float(item.get("tokens") or 0)
+                intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                self._draw_rounded_rect(x1, grid_y, x1 + cell_w, grid_y + cell_h, r=5,
+                                        fill=self._activity_color(intensity), outline=Theme.ag_border)
+                if tokens > 0:
+                    shine_w = max(3, int(cell_w * min(1.0, intensity) * 0.18))
+                    self._draw_rounded_rect(x1 + 3, grid_y + 3, x1 + 3 + shine_w, grid_y + 6,
+                                            r=2, fill="#79E36B", outline="")
+                self._add_tooltip(
+                    x1,
+                    grid_y,
+                    x1 + cell_w,
+                    grid_y + cell_h,
+                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                )
+            legend_y = grid_y + cell_h + 9
+        elif self._usage_range == "30d":
+            cols = 30
+            rows_count = 1
+            cell_gap = 3
+            cell = max(7, min(12, int((col_r - col_l - cell_gap * (cols - 1)) / cols)))
+            grid_w = cols * cell + (cols - 1) * cell_gap
+            grid_x = col_l + max(0, (col_r - col_l - grid_w) // 2)
+            grid_y = y + 8
+            padded = visible[-30:]
+            while len(padded) < 30:
+                padded.insert(0, {"date": "-", "requests": 0, "tokens": 0, "cost": 0.0})
+            for index, item in enumerate(padded):
+                row = 0
+                col = index
+                tokens = float(item.get("tokens") or 0)
+                intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                x1 = grid_x + col * (cell + cell_gap)
+                y1 = grid_y + row * (cell + cell_gap)
+                self._draw_rounded_rect(x1, y1, x1 + cell, y1 + cell, r=4,
+                                        fill=self._activity_color(intensity), outline=Theme.ag_border)
+                self._add_tooltip(
+                    x1,
+                    y1,
+                    x1 + cell,
+                    y1 + cell,
+                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                )
+            axis_y = grid_y + cell + 3
+            c.create_text(grid_x, axis_y, anchor="nw", text="30d ago",
+                          font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            c.create_text(grid_x + grid_w, axis_y, anchor="ne", text="today",
+                          font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            legend_y = axis_y + 14
+        else:
+            label_w = 24
+            cell_gap = 4
+            rows_count = 7
+            dates = []
+            for item in visible:
+                try:
+                    dates.append(datetime.fromisoformat(str(item.get("date") or "")).date())
+                except ValueError:
+                    dates.append(None)
+            first_date = next((value for value in dates if value is not None), None)
+            last_date = next((value for value in reversed(dates) if value is not None), None)
+            if first_date and last_date:
+                grid_start = first_date - timedelta(days=first_date.weekday())
+                grid_end = last_date + timedelta(days=6 - last_date.weekday())
+            else:
+                grid_start = datetime.now(CN_TZ).date()
+                grid_end = grid_start
+            span_days = (grid_end - grid_start).days
+            cols = max(1, math.ceil((span_days + 1) / 7))
+            min_cell = 5 if self._usage_range == "all" else 9
+            max_cell = 10 if self._usage_range == "all" else 14
+            cell = max(min_cell, min(max_cell, int((col_r - col_l - label_w - cell_gap * max(0, cols - 1)) / max(1, cols))))
+            grid_x = col_l + label_w
+            month_seen: set[tuple[int, int]] = set()
+            data_by_date = {
+                item_date: item
+                for item, item_date in zip(visible, dates)
+                if item_date is not None
+            }
+            for offset in range(span_days + 1):
+                item_date = grid_start + timedelta(days=offset)
+                col = offset // 7
+                month_key = (item_date.year, item_date.month)
+                if month_key in month_seen:
+                    continue
+                month_seen.add(month_key)
+                c.create_text(grid_x + col * (cell + cell_gap), y, anchor="nw",
+                              text=item_date.strftime("%b"), font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            grid_y = y + 15
+            for label, row in (("Mon", 0), ("Wed", 2), ("Fri", 4)):
+                c.create_text(col_l, grid_y + row * (cell + cell_gap), anchor="nw",
+                              text=label, font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            for offset in range(span_days + 1):
+                item_date = grid_start + timedelta(days=offset)
+                item = data_by_date.get(item_date, {"date": item_date.isoformat(), "requests": 0, "tokens": 0, "cost": 0.0})
+                col = offset // rows_count
+                row = item_date.weekday()
+                tokens = float(item.get("tokens") or 0)
+                intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                x1 = grid_x + col * (cell + cell_gap)
+                y1 = grid_y + row * (cell + cell_gap)
+                self._draw_rounded_rect(x1, y1, x1 + cell, y1 + cell, r=3,
+                                        fill=self._activity_color(intensity), outline=Theme.ag_border)
+                self._add_tooltip(
+                    x1, y1, x1 + cell, y1 + cell,
+                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                )
+            legend_y = grid_y + rows_count * (cell + cell_gap) + 8
+
+        c.create_text(col_l, legend_y + 1, anchor="nw", text="Less",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        legend_x = col_l + 30
+        for idx, color in enumerate(["#262626", "#0E4429", "#006D32", "#26A641", "#79E36B"]):
+            self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
+                                    r=2, fill=color, outline=Theme.ag_border)
+        c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        peak_tokens = int(float(peak.get("tokens") or 0))
+        peak_label = f"{int(peak.get('hour')):02d}:00" if self._usage_range == "24h" and peak.get("hour") is not None else str(peak.get("date") or "-")
+        c.create_text(col_r, legend_y + 1, anchor="ne",
+                      text=f"Peak: {peak_label} ({compact_number(peak_tokens)})",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        return legend_y + 23
+
+    def _draw_token_budget_page(self, col_l: int, col_r: int, y: int, H: int) -> None:
+        c = self.canvas
+        rows = self._budget_rows()
+        quota_rows = [row for row in rows if row["has_quota"]]
+        stale_count = sum(
+            1
+            for row in rows
+            for window in row["windows"]
+            if window.get("quota_stale")
+        )
+        low_count = sum(1 for row in quota_rows if float(row.get("min_remaining") or 999) <= 20)
+        effective_windows = [
+            dict(window, account=row.get("name"))
+            for row in rows
+            for window in row["windows"]
+            if window.get("quota_available") and window.get("pressure_active") and not window.get("quota_stale")
+        ]
+        inactive_low_count = sum(
+            1
+            for row in quota_rows
+            if not row.get("pressure_active") and float(row.get("min_remaining") or 999) <= 20
+        )
+        pressure_window: dict[str, Any] | None = None
+        for window in effective_windows:
+            if pressure_window is None or float(window.get("utilization") or 0) > float(pressure_window.get("utilization") or 0):
+                pressure_window = window
+        worst_used = float(pressure_window.get("utilization") or 0) if pressure_window else 0.0
+        try:
+            worst_remaining = float(pressure_window.get("remaining")) if pressure_window else None
+        except (TypeError, ValueError):
+            worst_remaining = None
+        pressure_label = str(pressure_window.get("label") or "") if pressure_window else ""
+        donut_color = Theme.ag_crit if worst_used >= 80 else (Theme.ag_warn if worst_used >= 50 else Theme.ag_success)
+
+        self._draw_rounded_rect(col_l, y, col_r, y + 92, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_donut(col_l + 10, y + 14, 64, worst_used, donut_color, f"{worst_used:.0f}%")
+        c.create_text(col_l + 88, y + 14, anchor="nw", text="\u989d\u5ea6\u538b\u529b",
+                      font=self._fonts["font_label_bold"], fill=Theme.text_primary)
+        remaining_label = f"\u6700\u4f4e\u5269\u4f59 {worst_remaining:.0f}%" if worst_remaining is not None else "\u6682\u65e0\u5269\u4f59\u6570\u636e"
+        detail = f"{remaining_label}  \u00b7  {pressure_label or '-'}  \u00b7  {len(effective_windows)} \u4e2a\u6d3b\u8dc3\u7a97\u53e3"
+        c.create_text(col_l + 88, y + 36, anchor="nw", text=detail,
+                      font=self._fonts["font_label"], fill=Theme.text_secondary)
+        warning = "\u6d3b\u8dc3\u8d26\u53f7\u53ef\u80fd\u5373\u5c06\u9650\u989d" if pressure_window and worst_used >= 80 else "\u6d3b\u8dc3\u989d\u5ea6\u72b6\u6001\u6b63\u5e38"
+        if not effective_windows:
+            warning = "\u6682\u65e0\u6d3b\u8dc3\u989d\u5ea6\u538b\u529b"
+        if stale_count:
+            warning = f"{stale_count} \u4e2a\u7a97\u53e3\u5f85\u5237\u65b0"
+        c.create_text(col_l + 88, y + 57, anchor="nw", text=warning,
+                      font=self._fonts["font_tiny"], fill=Theme.ag_warn if stale_count or worst_used >= 80 else Theme.ag_success)
+        x = col_l + 88
+        y_chip = y + 70
+        low_text = f"\u4f4e\u4f59\u989d {low_count}" if worst_remaining is None else f"\u6700\u4f4e {worst_remaining:.0f}%"
+        x += self._draw_ag_chip(x, y_chip, low_text, Theme.ag_crit if worst_used >= 80 else Theme.ag_success) + 5
+        x += self._draw_ag_chip(x, y_chip, f"\u975e\u6d3b\u8dc3\u4f4e\u989d {inactive_low_count}", Theme.ag_muted) + 5
+        self._draw_ag_chip(x, y_chip, f"\u5f85\u5237\u65b0 {stale_count}", Theme.ag_warn)
+        y += 106
+
+        cats: list[dict[str, Any]] = []
+        for key, label in (("5h", "5h"), ("7d", "7d"), ("cycle", "\u5468\u671f")):
+            all_windows = [
+                window
+                for row in rows
+                for window in row["windows"]
+                if window.get("label") == label
+            ]
+            quota_windows = [window for window in all_windows if window.get("quota_available")]
+            pressure_windows = [
+                window
+                for window in quota_windows
+                if window.get("pressure_active") and not window.get("quota_stale")
+            ]
+            avg_used = (
+                sum(float(window.get("utilization") or 0) for window in pressure_windows) / len(pressure_windows)
+                if pressure_windows
+                else 0.0
+            )
+            cats.append(
+                {
+                    "name": label,
+                    "count": len(all_windows),
+                    "quota_count": len(quota_windows),
+                    "active_count": len(pressure_windows),
+                    "tokens": sum(int(window.get("tokens") or 0) for window in all_windows),
+                    "cost": sum(float(window.get("cost") or 0) for window in all_windows),
+                    "used": avg_used,
+                    "stale": sum(1 for window in all_windows if window.get("quota_stale")),
+                }
+            )
+        cats.sort(key=lambda item: item["used"], reverse=True)
+        y = self._draw_ag_section(col_l, col_r, y, "Category Breakdown", "\u771f\u5b9e\u989d\u5ea6")
+        for cat in cats:
+            color = Theme.ag_crit if cat["used"] >= 80 else (Theme.ag_warn if cat["used"] >= 50 else Theme.ag_success)
+            self._draw_rounded_rect(col_l, y, col_r, y + 38, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            c.create_text(col_l + 10, y + 10, anchor="nw", text=str(cat["name"]),
+                          font=self._fonts["font_label_bold"], fill=Theme.text_primary)
+            c.create_text(col_l + 52, y + 10, anchor="nw", text=f"{compact_number(cat['tokens'])} tok",
+                          font=self._fonts["font_micro"], fill=Theme.text_secondary)
+            if cat["active_count"] <= 0 and cat["quota_count"] > 0:
+                c.create_text(col_l + 52, y + 23, anchor="nw", text="\u6682\u65e0\u6d3b\u8dc3\u538b\u529b",
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            c.create_text(col_r - 62, y + 10, anchor="ne", text=money(cat["cost"]),
+                          font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            pct_text = f"{cat['used']:.0f}%"
+            self._draw_rounded_rect(col_r - 54, y + 8, col_r - 10, y + 27, r=6,
+                                    fill=Theme.ag_bg, outline=color)
+            c.create_text(col_r - 32, y + 17, anchor="center", text=pct_text,
+                          font=self._fonts["font_micro"], fill=color)
+            y += 44
+
+        y = self._draw_ag_section(col_l, col_r, y + 4, "\u989d\u5ea6\u7a97\u53e3", "\u5269\u4f59\u4ece\u4f4e\u5230\u9ad8")
+
+        list_top = y
+        list_bottom = H - 38
+        row_h = 84
+        max_scroll = max(0, len(rows) * row_h - max(1, list_bottom - list_top))
+        self._scroll_limits["budget"] = max_scroll
+        self._scroll_offsets["budget"] = max(0, min(self._scroll_offsets.get("budget", 0), max_scroll))
+        offset = self._scroll_offsets.get("budget", 0)
+        if not rows:
+            c.create_text(col_l + 8, y, anchor="nw", text="\u6682\u65e0\u989d\u5ea6\u7a97\u53e3\u6570\u636e",
+                          font=self._fonts["font_label"], fill=Theme.text_muted)
+            return
+        for index, row in enumerate(rows):
+            row_y = list_top + index * row_h - offset
+            if row_y < list_top or row_y > list_bottom:
+                continue
+            name = self._truncate(ranking_account_display_name(row["name"]), "font_label_bold", col_r - col_l - 88)
+            self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 8, r=10,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            c.create_text(col_l + 10, row_y + 8, anchor="nw", text=name,
+                          font=self._fonts["font_label_bold"], fill=Theme.text_primary)
+            badge = "\u672c\u5730" if row["source_badge"] == "LOCAL" else ("SUB2" if row["source_badge"] == "SUB" else row["source_badge"])
+            if badge:
+                badge_w = self._text_width(badge, "font_micro") + 14
+                self._draw_rounded_rect(col_r - badge_w - 10, row_y + 7, col_r - 10, row_y + 25, r=6,
+                                        fill=Theme.ag_bg, outline=Theme.ag_border)
+                c.create_text(col_r - badge_w - 3, row_y + 10, anchor="nw", text=badge,
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            for win_index, window in enumerate(row["windows"][:3]):
+                x1 = col_l + 10 + win_index * ((col_r - col_l - 28) // 3)
+                x2 = col_l + 10 + (win_index + 1) * ((col_r - col_l - 28) // 3) - 5
+                wy = row_y + 35
+                label = str(window["label"])
+                if window["quota_available"]:
+                    utilization = float(window.get("utilization") or 0)
+                    color = self._ag_quota_color(utilization)
+                    remaining = window.get("remaining")
+                    try:
+                        detail = f"\u5269\u4f59 {float(remaining):.0f}%"
+                    except (TypeError, ValueError):
+                        detail = "\u5269\u4f59 --"
+                    reset = quota_reset_text(window.get("resets_at")) or "\u91cd\u7f6e -"
+                    if window.get("quota_stale"):
+                        detail = "\u5f85\u5237\u65b0"
+                        color = Theme.ag_warn
+                else:
+                    utilization = 0.0
+                    color = Theme.ag_muted
+                    detail = "\u672a\u914d\u7f6e"
+                    reset = "\u65e0\u989d\u5ea6"
+                c.create_text(x1, wy, anchor="nw", text=label,
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+                c.create_text(x1 + 24, wy, anchor="nw", text=self._truncate(detail, "font_micro", max(30, x2 - x1 - 24)),
+                              font=self._fonts["font_micro"], fill=color)
+                bar_y = wy + 20
+                self._draw_rounded_rect(x1, bar_y, x2, bar_y + 5, r=2, fill=Theme.ag_bg, outline="")
+                if window["quota_available"]:
+                    fill_w = int((x2 - x1) * max(0.02, min(1.0, utilization / 100.0)))
+                    self._draw_rounded_rect(x1, bar_y, x1 + fill_w, bar_y + 5, r=2, fill=color, outline="")
+                c.create_text(x1, bar_y + 9, anchor="nw", text=self._truncate(reset, "font_micro", max(40, x2 - x1)),
+                              font=self._fonts["font_micro"], fill=Theme.ag_muted)
+
+    def _draw_usage_stats_page(self, col_l: int, col_r: int, y: int, H: int) -> None:
+        c = self.canvas
+        summary = self._usage_range_summary(self._usage_range)
+        c.create_text(col_l, y, anchor="nw", text="Usage Dashboard",
+                      font=self._fonts["font_section"], fill=Theme.text_primary)
+        range_buttons = [("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("All", "all")]
+        btn_w = 39
+        gap = 4
+        x = col_r - (btn_w * len(range_buttons) + gap * (len(range_buttons) - 1))
+        for label, value in range_buttons:
+            name = f"usage_range_{value}"
+            selected = self._usage_range == value
+            self._btn_rects[name] = (x - 3, y - 4, x + btn_w + 3, y + 24)
+            fill = Theme.ag_accent if selected else Theme.ag_surface
+            outline = Theme.ag_accent if selected else Theme.ag_border
+            text_color = "#FFFFFF" if selected else Theme.ag_muted
+            self._draw_rounded_rect(x, y - 1, x + btn_w, y + 21, r=6, fill=fill, outline=outline)
+            c.create_text(x + btn_w // 2, y + 10, anchor="center", text=label,
+                          font=self._fonts["font_micro"], fill=text_color)
+            x += btn_w + gap
+        y += 28
+
+        hero_h = 78
+        self._draw_rounded_rect(col_l, y, col_r, y + hero_h, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        c.create_text(col_l + 12, y + 10, anchor="nw", text="Total Tokens",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        c.create_text(col_l + 12, y + 29, anchor="nw", text=compact_number(summary["tokens"]),
+                      font=self._fonts["font_value"], fill=Theme.ag_accent)
+        c.create_text(col_l + 12, y + 56, anchor="nw", text=f"{compact_number(summary['requests'])} calls",
+                      font=self._fonts["font_micro"], fill=Theme.text_secondary)
+        mid = col_l + (col_r - col_l) // 2
+        c.create_line(mid, y + 12, mid, y + hero_h - 12, fill=Theme.ag_divider, width=1)
+        c.create_text(mid + 14, y + 10, anchor="nw", text="Estimated Cost",
+                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        c.create_text(mid + 14, y + 29, anchor="nw", text=money(summary["cost"]),
+                      font=self._fonts["font_value"], fill=Theme.ag_success)
+        c.create_text(mid + 14, y + 56, anchor="nw", text=f"{summary['label']} window",
+                      font=self._fonts["font_micro"], fill=Theme.text_secondary)
+        y += hero_h + 12
+
+        mix = self._summary_token_mix(summary)
+        token_items = [
+            ("Input", mix["input"], Theme.ag_input),
+            ("Cache Read", mix["cached"], Theme.ag_cache),
+            ("Cache Write", mix["cache_create"], Theme.ag_reason),
+            ("Output", mix["output"], Theme.ag_output),
+        ]
+        cache_base = mix["input"] + mix["cached"] + mix["cache_create"]
+        cache_hit_text = f"{mix['cached'] * 100 / cache_base:.1f}%" if cache_base > 0 else "-"
+        chip_items = [
+            ("Input", compact_number(mix["input"]), Theme.ag_input),
+            ("Cache Read", compact_number(mix["cached"]), Theme.ag_cache),
+            ("Cache Hit", cache_hit_text, Theme.ag_success),
+            ("Cache Write", compact_number(mix["cache_create"]), Theme.ag_reason),
+            ("Output", compact_number(mix["output"]), Theme.ag_output),
+        ]
+        if mix.get("unknown", 0) > 0:
+            token_items.append(("Untracked", mix["unknown"], Theme.ag_muted))
+            chip_items.append(("Untracked", compact_number(mix["unknown"]), Theme.ag_muted))
+        mix_total = sum(value for _label, value, _color in token_items)
+        chip_badge = f"{summary['label']} mix"
+        if mix.get("unknown", 0) > 0:
+            chip_badge = f"{summary['label']} partial"
+        y = self._draw_ag_section(col_l, col_r, y, "Token Chips", chip_badge)
+        chip_w = (col_r - col_l - 8) // 2
+        for index, (label, value_text, color) in enumerate(chip_items):
+            cx = col_l + (index % 2) * (chip_w + 8)
+            cy = y + (index // 2) * 34
+            self._draw_rounded_rect(cx, cy, cx + chip_w, cy + 27, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            c.create_oval(cx + 8, cy + 10, cx + 15, cy + 17, fill=color, outline="")
+            c.create_text(cx + 22, cy + 6, anchor="nw", text=label,
+                          font=self._fonts["font_micro"], fill=Theme.text_secondary)
+            c.create_text(cx + chip_w - 8, cy + 6, anchor="ne", text=value_text,
+                          font=self._fonts["font_micro"], fill=Theme.text_primary)
+        y += max(72, math.ceil(len(chip_items) / 2) * 34 + 4)
+        bar_x = col_l
+        bar_w = col_r - col_l
+        self._draw_rounded_rect(bar_x, y, bar_x + bar_w, y + 8, r=3, fill=Theme.ag_bg, outline="")
+        cursor = bar_x
+        for _label, value, color in token_items:
+            if mix_total <= 0 or value <= 0:
+                continue
+            seg_w = int(bar_w * value / mix_total)
+            c.create_rectangle(cursor, y, min(bar_x + bar_w, cursor + seg_w), y + 8, fill=color, outline="")
+            cursor += seg_w
+        y += 22
+
+        series = summary.get("series") if isinstance(summary, dict) else []
+        series = [item for item in series if isinstance(item, dict)]
+        y = self._draw_activity_heatmap(col_l, col_r, y, summary, series)
+        if False and series:
+            if self._usage_range == "24h":
+                visible = series[-24:]
+            else:
+                visible = series[-30:] if self._usage_range == "30d" else series[-7:]
+            max_tokens = max([float(item.get("tokens") or 0) for item in visible], default=0.0) or 1.0
+            cols = 12 if self._usage_range == "24h" else (15 if self._usage_range == "30d" else 7)
+            cell_gap = 4
+            cell = max(8, min(18, int((col_r - col_l - cell_gap * (cols - 1)) / cols)))
+            for index, item in enumerate(visible):
+                row = index // cols
+                col = index % cols
+                tokens = float(item.get("tokens") or 0)
+                intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                color = Theme.ag_bg
+                if intensity > 0.66:
+                    color = Theme.ag_accent
+                elif intensity > 0.33:
+                    color = Theme.ag_bar
+                elif intensity > 0:
+                    color = "#1F6FEB"
+                x1 = col_l + col * (cell + cell_gap)
+                y1 = y + row * (cell + cell_gap)
+                self._draw_rounded_rect(x1, y1, x1 + cell, y1 + cell, r=3, fill=color, outline=Theme.ag_border)
+                if self._usage_range == "24h":
+                    hour = int(item.get("hour") if item.get("hour") is not None else index)
+                    next_hour = (hour + 1) % 24
+                    tip_title = f"{hour:02d}:00-{next_hour:02d}:00"
+                else:
+                    tip_title = str(item.get("date") or "-")
+                self._add_tooltip(
+                    x1,
+                    y1,
+                    x1 + cell,
+                    y1 + cell,
+                    f"{tip_title}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
+                )
+            heatmap_rows = max(1, math.ceil(len(visible) / cols))
+            if self._usage_range == "24h":
+                label_y = y + heatmap_rows * (cell + cell_gap) + 1
+                for label, col_index in (("00", 0), ("06", 3), ("12", 6), ("18", 9)):
+                    lx = col_l + col_index * (cell + cell_gap)
+                    c.create_text(lx, label_y, anchor="nw", text=label,
+                                  font=self._fonts["font_micro"], fill=Theme.ag_muted)
+                y += 12
+            y += heatmap_rows * (cell + cell_gap) + 10
+        elif False:
+            c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u8d8b\u52bf\u6570\u636e",
+                          font=self._fonts["font_label"], fill=Theme.ag_muted)
+            y += 30
+
+        models = self._top_models()
+        y = self._draw_ag_section(col_l, col_r, y, "Top Models", f"{len(models)} models")
+        if not models:
+            c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u6a21\u578b\u7edf\u8ba1",
+                          font=self._fonts["font_label"], fill=Theme.ag_muted)
+            y += 28
+        else:
+            max_model_tokens = max(tokens for _model, tokens in models) or 1
+            for model, tokens in models[:5]:
+                self._draw_rounded_rect(col_l, y, col_r, y + 29, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+                c.create_text(col_l + 9, y + 7, anchor="nw",
+                              text=self._truncate(model, "font_micro", max(90, col_r - col_l - 124)),
+                              font=self._fonts["font_micro"], fill=Theme.text_primary)
+                pct = int(tokens * 100 / max_model_tokens)
+                c.create_text(col_r - 9, y + 7, anchor="ne", text=f"{compact_number(tokens)} tok",
+                              font=self._fonts["font_micro"], fill=Theme.text_secondary)
+                self._draw_rounded_rect(col_l + 9, y + 22, col_r - 9, y + 25, r=1, fill=Theme.ag_bg, outline="")
+                fill_w = int((col_r - col_l - 18) * pct / 100)
+                self._draw_rounded_rect(col_l + 9, y + 22, col_l + 9 + fill_w, y + 25, r=1,
+                                        fill=Theme.ag_accent, outline="")
+                y += 34
+
+        providers = sorted(
+            self._client_providers(),
+            key=lambda row: (-float(row.get("cost") or 0), -int(row.get("tokens") or 0), str(row.get("name") or "")),
+        )
+        y = self._draw_ag_section(col_l, col_r, y, "Provider Cost Breakdown", f"{len(providers)} providers")
+        list_top = y
+        list_bottom = H - 38
+        row_h = 48
+        max_scroll = max(0, len(providers) * row_h - max(1, list_bottom - list_top))
+        self._scroll_limits["stats"] = max_scroll
+        self._scroll_offsets["stats"] = max(0, min(self._scroll_offsets.get("stats", 0), max_scroll))
+        offset = self._scroll_offsets.get("stats", 0)
+        if not providers:
+            c.create_text(col_l + 8, y, anchor="nw", text="\u6682\u65e0 provider \u6570\u636e",
+                          font=self._fonts["font_label"], fill=Theme.ag_muted)
+            return
+        max_provider_cost = max([float(row.get("cost") or 0) for row in providers], default=0.0) or 1.0
+        for index, provider in enumerate(providers):
+            row_y = list_top + index * row_h - offset
+            if row_y < list_top or row_y > list_bottom:
+                continue
+            self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 7, r=6,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            name = self._truncate(local_provider_display_name(str(provider.get("name") or "-")),
+                                  "font_label", max(90, col_r - col_l - 132))
+            tokens = compact_number(provider.get("tokens", 0))
+            cost_value = float(provider.get("cost") or 0)
+            requests_count = compact_number(provider.get("requests", 0))
+            c.create_text(col_l + 9, row_y + 6, anchor="nw", text=name,
+                          font=self._fonts["font_label"], fill=Theme.text_primary)
+            c.create_text(col_r - 9, row_y + 6, anchor="ne", text=money(cost_value),
+                          font=self._fonts["font_label_bold"], fill=Theme.ag_success)
+            c.create_text(col_l + 9, row_y + 24, anchor="nw", text=f"{tokens} tok  \u00b7  {requests_count} calls",
+                          font=self._fonts["font_micro"], fill=Theme.ag_muted)
+            bar_w = int((col_r - col_l - 18) * min(1.0, cost_value / max_provider_cost))
+            if bar_w > 0:
+                c.create_rectangle(col_l + 9, row_y + 38, col_l + 9 + bar_w, row_y + 40,
+                                   fill=Theme.ag_bar, outline="")
+
     def _draw(self) -> None:
         if self.closed:
             return
         c = self.canvas
         c.delete("all")
+        self._tooltip_rects = []
         W, H = self.WIDTH, self.HEIGHT
+        actual_w = self.root.winfo_width()
+        actual_h = self.root.winfo_height()
+        if actual_w > 50 and actual_h > 50 and (actual_w != W or actual_h != H):
+            self._apply_window_size(W, H)
         PAD = 14
         COL_L = PAD
         COL_R = W - PAD
@@ -1738,7 +2742,7 @@ class FloatingMonitorApp:
         #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
         y = 16
-        title_text = self.state.source_label if self.state else "SUB2 \u76d1\u63a7"
+        title_text = self.state.source_label if self.state else "MONITOR"
         c.create_text(COL_L, y, anchor="nw", text=title_text,
                        font=self._fonts["font_title"], fill=Theme.amber_bright)
 
@@ -1781,23 +2785,36 @@ class FloatingMonitorApp:
 
         y = 52
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
+        y += 10
+        y = self._draw_main_tabs(COL_L, COL_R, y)
+        if self._main_tab == "budget":
+            self._draw_token_budget_page(COL_L, COL_R, y, H)
+            self._draw_footer(W, H)
+            self._draw_tooltip(W, H)
+            return
+        if self._main_tab == "stats":
+            self._draw_usage_stats_page(COL_L, COL_R, y, H)
+            self._draw_footer(W, H)
+            self._draw_tooltip(W, H)
+            return
 
         # ════════════════════════════════════════════════════════
         #  CURRENT CHANNEL HERO
         # ════════════════════════════════════════════════════════
         y += 12
         self._draw_rounded_rect(COL_L, y, COL_R, y + 72, r=13, fill=Theme.bg_section, outline=Theme.border)
-        accounts = (self.state.active_accounts if self.state else [])[:5]
+        all_active_accounts = list(self.state.active_accounts or []) if self.state else []
+        accounts = all_active_accounts[:5]
         latest_name = self.state.latest_account_name if self.state else ""
         if accounts:
             hero_name = accounts[0].get("name", latest_name or "-")
-            total_current = sum(int(account.get("current") or 0) for account in accounts)
-            hero_sub = f"{len(accounts)} \u4e2a\u8d26\u53f7\u6d3b\u8dc3 / \u603b\u5e76\u53d1 {total_current}"
+            total_current = sum(int(account.get("current") or 0) for account in all_active_accounts)
+            hero_sub = f"{len(all_active_accounts)} \u4e2a\u8d26\u53f7\u6d3b\u8dc3 / \u603b\u5e76\u53d1 {total_current}"
             hero_color = Theme.accent_green
         else:
             status, _model, ago, color = self._latest_status()
-            hero_name = latest_name or "\u6682\u65e0\u8bf7\u6c42"
-            hero_sub = f"\u6700\u8fd1 {status} / {ago}" if status != "-" else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42"
+            hero_name = latest_name or ("\u6b63\u5728\u8bfb\u53d6\u6570\u636e" if self._loading or not self.state else "\u6682\u65e0\u6570\u636e")
+            hero_sub = f"\u6700\u8fd1 {status} / {ago}" if status != "-" else ("\u521d\u59cb\u5316\u4e2d" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42")
             hero_color = color if status != "-" else Theme.cyan
         c.create_rectangle(COL_L + 12, y + 13, COL_L + 58, y + 15, fill=Theme.cyan, outline="")
         c.create_text(COL_L + 12, y + 22, anchor="nw", text=self._truncate(hero_name, "font_label_bold", COL_R - COL_L - 32),
@@ -1815,7 +2832,7 @@ class FloatingMonitorApp:
 
         y += 24
         if not accounts:
-            c.create_text(COL_L + 8, y, anchor="nw", text="\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42",
+            c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u8d26\u53f7\u72b6\u6001" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3"),
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 20
         for acc in accounts[:3]:
@@ -1871,7 +2888,7 @@ class FloatingMonitorApp:
                                font=self._fonts["font_label"], fill=value_color)
                 y += 19
         else:
-            c.create_text(COL_L + 8, y, anchor="nw", text="\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55",
+            c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u6700\u8fd1\u8bf7\u6c42" if self._loading or not self.state else "\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55"),
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 22
 
@@ -1903,8 +2920,13 @@ class FloatingMonitorApp:
             ("\u6210\u672c", money(self.state.today_account_cost) if self.state else "$0", Theme.violet),
         ]
         col_w = (COL_R - COL_L) // 3
+        self._draw_rounded_rect(COL_L, y - 5, COL_R, y + 43, r=8,
+                                fill=Theme.ag_surface, outline=Theme.ag_border)
         for i, (lbl, val, color) in enumerate(stats):
             cx = COL_L + col_w * i + col_w // 2
+            if i:
+                c.create_line(COL_L + col_w * i, y + 2, COL_L + col_w * i, y + 36,
+                              fill=Theme.ag_divider, width=1)
             c.create_text(cx, y, anchor="n", text=val,
                            font=self._fonts["font_value"], fill=color)
             c.create_text(cx, y + 26, anchor="n", text=lbl,
@@ -1922,9 +2944,9 @@ class FloatingMonitorApp:
                        font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         y += 22
         cost_stats = [
-            ("\u4eca\u65e5", f"{compact_number(history.get('today_tokens', 0))} tok", Theme.amber_bright),
-            ("\u6628\u65e5", f"{compact_number(history.get('yesterday_tokens', 0))} tok", Theme.cyan),
-            ("\u65e5\u5747", f"{compact_number(float(history.get('seven_day_tokens') or 0) / 7)} tok", Theme.violet),
+            ("\u4eca\u65e5", f"{compact_number(history.get('today_tokens', 0))} tok", Theme.ag_accent),
+            ("\u6628\u65e5", f"{compact_number(history.get('yesterday_tokens', 0))} tok", Theme.ag_success),
+            ("\u65e5\u5747", f"{compact_number(float(history.get('seven_day_tokens') or 0) / 7)} tok", "#79E36B"),
         ]
         for i, (lbl, val, color) in enumerate(cost_stats):
             cx = COL_L + col_w * i + col_w // 2
@@ -1941,12 +2963,20 @@ class FloatingMonitorApp:
             max_cost = max([float(item.get("tokens") or 0) for item in series if isinstance(item, dict)], default=0) or 1
             for index, item in enumerate(series[:7]):
                 cost = float(item.get("tokens") or 0) if isinstance(item, dict) else 0
+                intensity = min(1.0, cost / max_cost) if cost > 0 else 0.0
                 x1 = COL_L + index * (bar_w + gap)
                 x2 = min(COL_R, x1 + bar_w)
                 fill_h = max(2, int(bar_h * min(1.0, cost / max_cost))) if cost > 0 else 2
-                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill=Theme.bg_dark, outline="")
-                color = Theme.amber if index == 6 else (Theme.cyan if cost >= max_cost else Theme.blue)
+                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill="#242424", outline="")
+                color = self._trend_token_color(intensity, index == 6)
                 self._draw_rounded_rect(x1, bar_y + bar_h - fill_h, x2, bar_y + bar_h, r=3, fill=color, outline="")
+                self._add_tooltip(
+                    x1,
+                    bar_y,
+                    x2,
+                    bar_y + bar_h,
+                    f"{item.get('date', '-')}\n{compact_number(int(cost))} token\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
+                )
             y += 72
         else:
             y += 46
@@ -2011,20 +3041,23 @@ class FloatingMonitorApp:
             self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
             selected = self._account_range == value
             hovered = self._hover_btn == button_name
-            fill = Theme.bg_lift if selected else (Theme.bg_hover if hovered else Theme.bg_dark)
-            outline = Theme.amber_dim if selected else Theme.border
-            text_color = Theme.amber_bright if selected else (Theme.text_primary if hovered else Theme.text_secondary)
+            fill = Theme.ag_accent if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
+            outline = Theme.ag_accent if selected else Theme.ag_border
+            text_color = "#FFFFFF" if selected else (Theme.text_primary if hovered else Theme.ag_muted)
             self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=6, fill=fill, outline=outline, width=1)
             c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)
         y += 27
 
         if not top:
-            empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
+            if self._loading or not self.state:
+                empty_text = "\u6b63\u5728\u8bfb\u53d6\u7528\u91cf\u6570\u636e"
+            else:
+                empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
             c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
         window_mode = bool(range_key)
-        row_h = 50 if window_mode else 29
+        row_h = 64 if window_mode else 39
         available_rank_rows = max(1, (H - 44 - y) // row_h)
         max_rank_rows = min(len(top), available_rank_rows)
         display_top = list(top[:max_rank_rows])
@@ -2063,6 +3096,8 @@ class FloatingMonitorApp:
             else:
                 bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
 
+            self._draw_rounded_rect(COL_L, y - 3, COL_R, y + row_h - 5, r=6,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
             marker_bottom = y + (42 if window_mode else 23)
             c.create_rectangle(COL_L, y + 2, COL_L + 3, marker_bottom, fill=bar_color, outline="")
             if source_label:
@@ -2181,12 +3216,8 @@ class FloatingMonitorApp:
                 c.create_line(COL_L + 8, y + 27, COL_R - 4, y + 27, fill=Theme.border, width=1)
             y += row_h
 
-        # ── footer timestamp ──
-        now_str = datetime.now(CN_TZ).strftime("%H:%M:%S UTC+8")
-        c.create_text(W // 2, H - 10, anchor="s", text=now_str,
-                       font=self._fonts["font_tiny"], fill=Theme.text_muted)
-        c.create_line(W - 18, H - 7, W - 7, H - 18, fill=Theme.border, width=1)
-        c.create_line(W - 13, H - 7, W - 7, H - 13, fill=Theme.text_muted, width=1)
+        self._draw_footer(W, H)
+        self._draw_tooltip(W, H)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  ANIMATION
@@ -2215,6 +3246,8 @@ class FloatingMonitorApp:
 
     def _hit_button(self, x: int, y: int) -> str | None:
         for name, (x1, y1, x2, y2) in self._btn_rects.items():
+            if name.startswith("main_") and x1 - 6 <= x <= x2 + 6 and y1 - 8 <= y <= y2 + 8:
+                return name
             if x1 <= x <= x2 and y1 <= y <= y2:
                 return name
         return None
@@ -2225,18 +3258,48 @@ class FloatingMonitorApp:
     def _on_press(self, event: tk.Event) -> None:
         btn = self._hit_button(event.x, event.y)
         if btn == "btn_close":
+            self._resizing = False
             self.close_app()
             return
         if btn == "btn_pin":
+            self._resizing = False
             self._pinned = not self._pinned
             self.root.attributes("-topmost", self._pinned)
             self._draw()
             return
         if btn == "btn_refresh":
+            self._resizing = False
             self.client.clear_client_usage_cache()
             self.refresh_async()
             return
+        if btn in {"main_accounts", "main_budget", "main_stats"}:
+            self._resizing = False
+            self._main_tab = {
+                "main_accounts": "accounts",
+                "main_budget": "budget",
+                "main_stats": "stats",
+            }[btn]
+            self._scroll_offsets[self._main_tab] = 0
+            self._draw()
+            return
+        if 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
+            self._resizing = False
+            tab_width = max(1, (self.WIDTH - 28) / 3)
+            tab_index = int(max(0, min(2, (event.x - 14) // tab_width)))
+            tab_value = ("accounts", "budget", "stats")[tab_index]
+            if self._main_tab != tab_value:
+                self._main_tab = tab_value
+                self._scroll_offsets[tab_value] = 0
+                self._draw()
+            return
+        if btn in {"usage_range_24h", "usage_range_7d", "usage_range_30d", "usage_range_all"}:
+            self._resizing = False
+            self._usage_range = btn.replace("usage_range_", "")
+            self._scroll_offsets["stats"] = 0
+            self._draw()
+            return
         if btn in {"rank_today", "rank_5h", "rank_7d", "rank_cycle"}:
+            self._resizing = False
             self._account_range = {
                 "rank_today": "today",
                 "rank_5h": "5h",
@@ -2254,14 +3317,14 @@ class FloatingMonitorApp:
         self._drag_data["x"] = event.x
         self._drag_data["y"] = event.y
 
+    def _on_release(self, _event: tk.Event) -> None:
+        self._resizing = False
+
     def _on_drag(self, event: tk.Event) -> None:
         if self._resizing:
             new_w = max(self.MIN_WIDTH, self._resize_data["w"] + event.x_root - self._resize_data["x"])
             new_h = max(self.MIN_HEIGHT, self._resize_data["h"] + event.y_root - self._resize_data["y"])
-            self.WIDTH = int(new_w)
-            self.HEIGHT = int(new_h)
-            self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{self.root.winfo_x()}+{self.root.winfo_y()}")
-            self.canvas.configure(width=self.WIDTH, height=self.HEIGHT)
+            self._apply_window_size(int(new_w), int(new_h))
             self._draw()
             return
         dx = event.x - self._drag_data["x"]
@@ -2276,15 +3339,50 @@ class FloatingMonitorApp:
         else:
             self.canvas.configure(cursor="")
         btn = self._hit_button(event.x, event.y)
-        if btn != self._hover_btn:
+        tooltip = self._hit_tooltip(event.x, event.y)
+        tooltip_pos = (int(event.x), int(event.y))
+        if btn != self._hover_btn or tooltip != self._tooltip_text or (tooltip and tooltip_pos != self._tooltip_pos):
             self._hover_btn = btn
+            self._tooltip_text = tooltip
+            self._tooltip_pos = tooltip_pos
             self._draw()
 
     def _on_leave(self, _event: tk.Event) -> None:
         self.canvas.configure(cursor="")
-        if self._hover_btn is not None:
+        if self._hover_btn is not None or self._tooltip_text:
             self._hover_btn = None
+            self._tooltip_text = ""
             self._draw()
+
+    def _on_configure(self, event: tk.Event) -> None:
+        if self._ignore_configure:
+            return
+        width = int(getattr(event, "width", self.WIDTH) or self.WIDTH)
+        height = int(getattr(event, "height", self.HEIGHT) or self.HEIGHT)
+        if width <= 50 or height <= 50:
+            return
+        if self._resizing:
+            self.WIDTH = max(self.MIN_WIDTH, width)
+            self.HEIGHT = max(self.MIN_HEIGHT, height)
+            return
+        if width != self.WIDTH or height != self.HEIGHT:
+            self._apply_window_size(self.WIDTH, self.HEIGHT)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        tab = self._main_tab
+        limit = int(self._scroll_limits.get(tab, 0) or 0)
+        if limit <= 0:
+            return
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            wheel_delta = int(getattr(event, "delta", 0) or 0)
+            delta = -1 if wheel_delta > 0 else 1
+        current = int(self._scroll_offsets.get(tab, 0) or 0)
+        self._scroll_offsets[tab] = max(0, min(limit, current + delta * 42))
+        self._draw()
 
     def _on_focus_in(self, _event: tk.Event) -> None:
         self._ensure_topmost()
@@ -2345,8 +3443,6 @@ class FloatingMonitorApp:
                 result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
             self._maybe_select_cycle_range(result)
-        self._ensure_topmost()
-        self._schedule_topmost_repair()
         self._draw()
 
     def _schedule_auto_refresh(self) -> None:
