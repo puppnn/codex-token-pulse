@@ -2359,6 +2359,7 @@ def main() -> int:
 
     recent_cutoff = now - timedelta(seconds=max(1, CLIENT_USAGE_ACTIVE_WINDOW_SECONDS))
     recent_active_by_label: dict[str, int] = {}
+    recent_sessions_by_label: dict[str, int] = {}
     recent_events_by_label = attribute_codex_events_by_account(
         codex_events,
         markers,
@@ -2367,12 +2368,20 @@ def main() -> int:
         now,
     )
     for label, account_events in recent_events_by_label.items():
-        recent_active_by_label[label] = sum(1 for event in account_events if event.when >= recent_cutoff)
+        recent_events = [event for event in account_events if event.when >= recent_cutoff]
+        recent_active_by_label[label] = len(recent_events)
+        recent_sessions_by_label[label] = len(
+            {
+                event.session_id or event.request_key or codex_event_id(event)
+                for event in recent_events
+            }
+        )
 
     codex_providers = []
     for name, bucket in codex_provider_buckets:
         provider = bucket_to_dict(name, bucket, show_zero=True)
         provider["recent_active"] = int(recent_active_by_label.get(name) or 0)
+        provider["recent_sessions"] = int(recent_sessions_by_label.get(name) or 0)
         for key, value in speed_by_account.get(name, {}).items():
             if key not in provider or provider.get(key) in {"", None}:
                 provider[key] = value

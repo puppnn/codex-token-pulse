@@ -529,12 +529,13 @@ def local_active_accounts_from_client_usage(
         if not is_recent_activity(latest_at):
             continue
         provider_name = str(provider.get("name") or "Local client")
+        recent_sessions = max(1, int(provider.get("recent_sessions") or 0))
         active.append(
             {
                 "id": f"local-{index}",
                 "name": f"LOCAL - {local_provider_display_name(provider_name)}",
-                "current": 1,
-                "max": 1,
+                "current": recent_sessions,
+                "max": recent_sessions,
                 "model": provider.get("latest_model") or "-",
                 "source": "LOCAL",
                 "speed_badge": provider.get("speed_badge") or "",
@@ -1562,57 +1563,57 @@ class Sub2APIClient:
 
 
 class Theme:
-    """Cadence-inspired warm paper card palette."""
+    """Cadence-inspired graphite and electric-blue palette."""
     # ── base surfaces ──
-    bg_dark = "#F5F1EA"
-    bg_card = "#F7F3EC"
-    bg_section = "#ECE6DD"
-    bg_lift = "#FFFDF8"
-    bg_hover = "#E6DED2"
+    bg_dark = "#17181B"
+    bg_card = "#202124"
+    bg_section = "#292A2F"
+    bg_lift = "#303238"
+    bg_hover = "#35373E"
 
-    # ── amber accent ramp ──
-    amber_dim = "#D8A57F"
-    amber = "#C7603F"
-    amber_bright = "#28231F"
-    amber_glow = "#E4B58E"
+    # ── primary blue ramp ──
+    amber_dim = "#365DAA"
+    amber = "#5B8DEF"
+    amber_bright = "#F7F8FA"
+    amber_glow = "#8CB1F7"
 
     # ── secondary accents ──
-    cyan = "#8F6A4C"
-    cyan_dim = "#D9CDBF"
-    violet = "#9C6A4B"
-    blue = "#6B7FBF"
+    cyan = "#79A7FF"
+    cyan_dim = "#3F4654"
+    violet = "#A7BFF5"
+    blue = "#4778DD"
 
     # ── text ──
-    text_primary = "#28231F"
-    text_secondary = "#6F6960"
-    text_muted = "#9A9186"
+    text_primary = "#F7F8FA"
+    text_secondary = "#B2B4BC"
+    text_muted = "#7F828C"
 
     # ── semantic ──
-    accent_cyan = "#8F6A4C"
-    accent_red = "#B85A39"
-    accent_green = "#C7603F"
-    quota_red_bg = "#F1D4C2"
-    quota_amber_bg = "#F2E1C8"
-    quota_green_bg = "#ECE4D7"
-    ag_bg = "#E6E0D7"
-    ag_surface = "#FFFDF8"
-    ag_surface_hover = "#F0E8DD"
-    ag_border = "#DDD4C7"
-    ag_divider = "#E4DCCF"
-    ag_accent = "#C7603F"
-    ag_bar = "#D9915C"
-    ag_success = "#C7603F"
-    ag_warn = "#B9853C"
-    ag_crit = "#A9472C"
-    ag_muted = "#8B8176"
-    ag_input = "#D89A6D"
-    ag_cache = "#C8784C"
-    ag_output = "#B55D35"
-    ag_reason = "#E0B27C"
+    accent_cyan = "#79A7FF"
+    accent_red = "#F06A6A"
+    accent_green = "#68C995"
+    quota_red_bg = "#412B30"
+    quota_amber_bg = "#413829"
+    quota_green_bg = "#263A34"
+    ag_bg = "#292A2F"
+    ag_surface = "#26272B"
+    ag_surface_hover = "#32343A"
+    ag_border = "#383A42"
+    ag_divider = "#313239"
+    ag_accent = "#5B8DEF"
+    ag_bar = "#79A7FF"
+    ag_success = "#68C995"
+    ag_warn = "#E2B45B"
+    ag_crit = "#F06A6A"
+    ag_muted = "#8D9099"
+    ag_input = "#8CB1F7"
+    ag_cache = "#6F9CF2"
+    ag_output = "#4778DD"
+    ag_reason = "#A8C3F7"
 
     # ── misc ──
-    border = "#DDD4C7"
-    shadow = "#BEB4A7"
+    border = "#34363D"
+    shadow = "#101114"
     transparent = "#010203"
 
     # ── fonts (family, size, weight) ──
@@ -1961,16 +1962,16 @@ class FloatingMonitorApp:
     @staticmethod
     def _activity_color(intensity: float) -> str:
         if intensity <= 0:
-            return "#DED8CF"
+            return "#2D2E33"
         if intensity < 0.18:
-            return "#E8C9AA"
+            return "#34466B"
         if intensity < 0.38:
-            return "#E3AE7D"
+            return "#486BAE"
         if intensity < 0.68:
-            return "#D98E55"
+            return "#648FDF"
         if intensity < 0.9:
-            return "#CA6D39"
-        return "#A9472C"
+            return "#82A8F0"
+        return "#2F68DF"
 
     def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
         if is_today:
@@ -2338,7 +2339,7 @@ class FloatingMonitorApp:
         c.create_text(col_l, legend_y + 1, anchor="nw", text="Less",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         legend_x = col_l + 30
-        for idx, color in enumerate(["#DED8CF", "#E8C9AA", "#E3AE7D", "#D98E55", "#A9472C"]):
+        for idx, color in enumerate(["#2D2E33", "#34466B", "#486BAE", "#648FDF", "#2F68DF"]):
             self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
                                     r=2, fill=color, outline=Theme.ag_border)
         c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
