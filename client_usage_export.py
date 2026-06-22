@@ -19,6 +19,19 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_usage_config.json")
@@ -2587,9 +2600,8 @@ def main() -> int:
     }
 
     out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
     same_day_output_high_water(output, out, day)
-    out.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(out, output)
     print(json.dumps(output["today"], ensure_ascii=False))
     return 0
 

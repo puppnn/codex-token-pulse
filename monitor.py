@@ -320,6 +320,19 @@ def load_usage_history() -> dict[str, Any]:
     return data
 
 
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def token_mix_from_client_usage(client_usage: dict[str, Any] | None) -> dict[str, int]:
     mix = {
         "input": 0,
@@ -465,13 +478,9 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         "source_date": source_date,
     }
     try:
-        USAGE_HISTORY_JSON.parent.mkdir(parents=True, exist_ok=True)
-        USAGE_HISTORY_JSON.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(USAGE_HISTORY_JSON, history)
     except Exception:
         pass
-    state.today_requests = new_requests
-    state.today_tokens = new_tokens
-    state.today_account_cost = new_cost
     return summarize_usage_history(history)
 
 
@@ -3455,7 +3464,6 @@ class FloatingMonitorApp:
             pass
         self.error = error
         if result is not None:
-            self._protect_same_day_high_water(result)
             try:
                 result.cost_history = update_usage_history(result)
             except Exception:
@@ -3463,29 +3471,6 @@ class FloatingMonitorApp:
             self.state = result
             self._maybe_select_cycle_range(result)
         self._draw()
-
-    def _protect_same_day_high_water(self, result: MonitorState) -> None:
-        if result.usage_source not in {"local", "client", "local-codex"}:
-            return
-        history = load_usage_history()
-        days = history.get("days") if isinstance(history, dict) else {}
-        existing = days.get(today_key()) if isinstance(days, dict) and isinstance(days.get(today_key()), dict) else {}
-        existing_tokens = int(existing.get("tokens") or 0)
-        current_tokens = int(result.today_tokens or 0)
-        if existing_tokens <= current_tokens or existing_tokens < max(1, int(current_tokens * 1.05)):
-            return
-        result.today_tokens = existing_tokens
-        result.today_requests = max(int(result.today_requests or 0), int(existing.get("requests") or 0))
-        result.today_account_cost = max(float(result.today_account_cost or 0), float(existing.get("cost") or 0))
-        if isinstance(result.client_usage, dict):
-            today = result.client_usage
-            today["tokens"] = result.today_tokens
-            today["requests"] = result.today_requests
-            today["cost"] = result.today_account_cost
-            today["input_tokens"] = max(int(today.get("input_tokens") or 0), int(existing.get("input_tokens") or 0))
-            today["cached_input_tokens"] = max(int(today.get("cached_input_tokens") or 0), int(existing.get("cached_input_tokens") or 0))
-            today["cache_creation_input_tokens"] = max(int(today.get("cache_creation_input_tokens") or 0), int(existing.get("cache_creation_input_tokens") or 0))
-            today["output_tokens"] = max(int(today.get("output_tokens") or 0), int(existing.get("output_tokens") or 0))
 
     def _handle_day_rollover(self, force: bool = False) -> bool:
         current_day = today_key()
