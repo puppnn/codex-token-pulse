@@ -153,9 +153,95 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["today"]["tokens"], 100_000)
         self.assertEqual(current["providers"][0]["window_7d"]["tokens"], 200_000)
 
+    def test_normal_refresh_preserves_cached_30d_account_window(self) -> None:
+        previous = self.snapshot(self.day, 1_000_000)
+        current = self.snapshot(self.day, 1_100_000)
+        previous["account_30d_updated_at"] = f"{self.day.isoformat()}T09:00:00+08:00"
+        previous["providers"][0]["window_30d"] = {
+            "requests": 120,
+            "tokens": 88_000_000,
+            "cost": 84.0,
+        }
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+
+        self.assertEqual(
+            current["account_30d_updated_at"],
+            previous["account_30d_updated_at"],
+        )
+        self.assertEqual(
+            current["providers"][0]["window_30d"]["tokens"],
+            88_000_000,
+        )
+
 
 class WindowSemanticsTests(unittest.TestCase):
-    def test_5h_uses_quota_cycle_while_7d_remains_rolling(self) -> None:
+    def test_30d_window_uses_rolling_account_usage(self) -> None:
+        now = datetime(2026, 6, 23, 12, 0, 0)
+        label = "Codex local - account@example.com"
+        rolling_30d = client_usage_export.UsageBucket(
+            requests=120,
+            input_tokens=88_000_000,
+            cost=84.0,
+        )
+        rolling_7d = client_usage_export.UsageBucket(
+            requests=30,
+            input_tokens=20_000_000,
+            cost=19.0,
+        )
+
+        def scan_accounts(_home: Path, start: datetime, _end: datetime):
+            return {label: rolling_30d if now - start > timedelta(days=20) else rolling_7d}
+
+        aligned = ({}, {}, {}, {}, {}, {}, {})
+        with (
+            patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value={}),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_accounts", side_effect=scan_accounts),
+            patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+            patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+        ):
+            result = client_usage_export.build_codex_window_stats(
+                Path("."),
+                Path("."),
+                now,
+                {},
+                label,
+                include_30d=True,
+            )
+
+        window_30d = result[label]["window_30d"]
+        self.assertEqual(window_30d["requests"], 120)
+        self.assertEqual(window_30d["tokens"], 88_000_000)
+        self.assertEqual(window_30d["cost"], 84.0)
+        self.assertTrue(window_30d["start_at"].startswith("2026-05-24T12:00:00"))
+
+    def test_full_unused_5h_quota_waits_for_first_request(self) -> None:
+        window = {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "quota_available": True,
+            "quota_stale": False,
+            "remaining_percent": 99.0,
+            "utilization": 1.0,
+            "resets_at": "2026-06-23T17:00:00+08:00",
+        }
+
+        client_usage_export.apply_5h_countdown_state(window)
+
+        self.assertTrue(window["quota_idle"])
+        self.assertFalse(window["countdown_active"])
+
+        window["requests"] = 1
+        window["tokens"] = 100
+        client_usage_export.apply_5h_countdown_state(window)
+
+        self.assertFalse(window["quota_idle"])
+        self.assertTrue(window["countdown_active"])
+
+    def test_quota_windows_use_quota_cycle_boundaries(self) -> None:
         now = datetime(2026, 6, 22, 12, 0, 0)
         label = "Codex local - account@example.com"
         rolling_5h = client_usage_export.UsageBucket(
@@ -203,7 +289,7 @@ class WindowSemanticsTests(unittest.TestCase):
             {label: quota_cycle_7d},
             {},
             {label: now - timedelta(hours=2)},
-            {label: now - timedelta(days=4)},
+            {label: datetime(2026, 6, 18, 15, 0, 0)},
             {},
             {},
         )
@@ -227,8 +313,40 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(window_5h["tokens"], 2_000_000)
         self.assertEqual(window_5h["utilization"], 90.0)
         self.assertTrue(window_5h["start_at"].startswith("2026-06-22T10:00:00"))
-        self.assertEqual(window_7d["tokens"], 66_000_000)
+        self.assertEqual(window_7d["tokens"], 40_000_000)
         self.assertEqual(window_7d["utilization"], 83.0)
+        self.assertTrue(window_7d["start_at"].startswith("2026-06-18T15:00:00"))
+
+    def test_7d_without_quota_remains_rolling(self) -> None:
+        now = datetime(2026, 6, 22, 12, 0, 0)
+        label = "Codex local - account@example.com"
+        rolling_7d = client_usage_export.UsageBucket(
+            requests=70,
+            input_tokens=66_000_000,
+            cost=62.0,
+        )
+
+        def scan_accounts(_home: Path, start: datetime, _end: datetime):
+            return {label: rolling_7d}
+
+        aligned = ({}, {}, {}, {}, {}, {}, {})
+        with (
+            patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value={}),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_accounts", side_effect=scan_accounts),
+            patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+            patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+        ):
+            result = client_usage_export.build_codex_window_stats(
+                Path("."),
+                Path("."),
+                now,
+                {},
+                label,
+            )
+
+        window_7d = result[label]["window_7d"]
+        self.assertEqual(window_7d["tokens"], 66_000_000)
         self.assertTrue(window_7d["start_at"].startswith("2026-06-15T12:00:00"))
 
 

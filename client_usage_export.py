@@ -32,6 +32,31 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
             pass
 
 
+def load_cached_account_30d_windows(
+    path: Path,
+    now: datetime,
+) -> tuple[bool, str, dict[str, dict[str, Any]]]:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "", {}
+    updated_text = str(existing.get("account_30d_updated_at") or "")
+    updated_at = parse_dt(updated_text)
+    if updated_at is None:
+        return False, "", {}
+    age_seconds = (now - updated_at).total_seconds()
+    if age_seconds < 0 or age_seconds >= ACCOUNT_30D_CACHE_SECONDS:
+        return False, "", {}
+    windows = {
+        str(provider.get("name") or ""): dict(provider["window_30d"])
+        for provider in existing.get("providers") or []
+        if isinstance(provider, dict)
+        and provider.get("name")
+        and isinstance(provider.get("window_30d"), dict)
+    }
+    return True, updated_text, windows
+
+
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_usage_config.json")
@@ -43,6 +68,7 @@ MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKE
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 CODEX_CURRENT_ACCOUNT_RECENT_SECONDS = int(os.environ.get("CLIENT_USAGE_CURRENT_ACCOUNT_RECENT_SECONDS", "1800"))
 CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "300"))
+ACCOUNT_30D_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_ACCOUNT_30D_CACHE_SECONDS", "300"))
 UNASSIGNED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_UNASSIGNED_CODEX_LABEL", "Unassigned local")
 CODEX_FAST_COST_MULTIPLIER = env_float("CLIENT_USAGE_CODEX_FAST_COST_MULTIPLIER", 2.0)
 CODEX_FORCE_SPEED = os.environ.get("CLIENT_USAGE_CODEX_FORCE_SPEED", "").strip().lower()
@@ -2216,6 +2242,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         merge_cumulative(current_today, existing_today)
     merge_latest_request()
     merge_hourly_today()
+    if "account_30d_updated_at" not in output and existing.get("account_30d_updated_at"):
+        output["account_30d_updated_at"] = existing["account_30d_updated_at"]
 
     current_providers = output.get("providers")
     existing_providers = existing.get("providers")
@@ -2245,6 +2273,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             current_by_name[name] = recovered
             continue
         merge_cumulative(current, previous)
+        if "window_30d" not in current and isinstance(previous.get("window_30d"), dict):
+            current["window_30d"] = dict(previous["window_30d"])
 
     provider_totals = [provider for provider in current_providers if isinstance(provider, dict)]
     provider_tokens = sum(tokens_of(provider) for provider in provider_totals)
@@ -2294,16 +2324,36 @@ def bucket_to_window_dict(bucket: UsageBucket, start: datetime, end: datetime) -
     }
 
 
+def apply_5h_countdown_state(window: dict[str, Any]) -> None:
+    try:
+        remaining = float(window.get("remaining_percent"))
+    except (TypeError, ValueError):
+        remaining = -1.0
+    # The upstream quota snapshot commonly reports a reset/full window as 99%.
+    quota_idle = (
+        bool(window.get("quota_available"))
+        and not bool(window.get("quota_stale"))
+        and remaining >= 99.0
+        and int(window.get("requests") or 0) <= 0
+        and int(window.get("tokens") or 0) <= 0
+        and float(window.get("cost") or 0) <= 0
+    )
+    window["quota_idle"] = quota_idle
+    window["countdown_active"] = bool(window.get("quota_available")) and not quota_idle
+
+
 def build_codex_window_stats(
     home: Path,
     sessions_root: Path,
     now: datetime,
     attribution_ledger: dict[str, str],
     current_label: str,
+    include_30d: bool = False,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     window_end = now + timedelta(seconds=1)
     window_5h_start = now - timedelta(hours=5)
     window_7d_start = now - timedelta(days=7)
+    window_30d_start = now - timedelta(days=30)
 
     quota_by_account = cockpit_codex_quota_by_label(home)
     speed_by_account = cockpit_codex_speed_by_label(home)
@@ -2312,15 +2362,22 @@ def build_codex_window_stats(
         for label, meta in speed_by_account.items()
     }
     direct_7d = scan_cockpit_codex_accounts(home, window_7d_start, window_end)
+    direct_30d = (
+        scan_cockpit_codex_accounts(home, window_30d_start, window_end)
+        if include_30d
+        else {}
+    )
     direct_total = UsageBucket()
-    for bucket in direct_7d.values():
+    for bucket in (direct_30d if include_30d else direct_7d).values():
         add_bucket(direct_total, bucket)
 
     buckets_5h: dict[str, UsageBucket]
     buckets_7d: dict[str, UsageBucket]
+    buckets_30d: dict[str, UsageBucket] = {}
     if direct_total.total_tokens > 0 or direct_total.requests > 0:
         buckets_7d = direct_7d
         buckets_5h = scan_cockpit_codex_accounts(home, window_5h_start, window_end)
+        buckets_30d = direct_30d
     else:
         speed_markers = codex_speed_history(home, window_7d_start, window_end)
         events_7d = scan_all_codex_events(home, sessions_root, window_7d_start, window_end)
@@ -2348,13 +2405,62 @@ def build_codex_window_stats(
             current_label,
             now,
         )
+        if include_30d:
+            speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
+            events_30d = scan_all_codex_events(home, sessions_root, window_30d_start, window_end)
+            apply_codex_speed_fallback(events_30d, speed_markers_30d)
+            markers_30d = scan_cockpit_codex_switch_markers(home, window_30d_start, window_end)
+            markers_30d.extend(
+                scan_cockpit_codex_account_markers(home, window_30d_start, window_end)
+            )
+            buckets_30d = attribute_codex_events_to_account_markers(
+                events_30d,
+                markers_30d,
+                cost_multiplier_by_label,
+                attribution_ledger,
+                current_label,
+                now,
+            )
+    if include_30d and (direct_total.total_tokens > 0 or direct_total.requests > 0):
+        speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
+        events_30d = scan_all_codex_events(home, sessions_root, window_30d_start, window_end)
+        apply_codex_speed_fallback(events_30d, speed_markers_30d)
+        switch_markers_30d = scan_cockpit_codex_switch_markers(
+            home,
+            window_30d_start,
+            window_end,
+        )
+        account_markers_30d = scan_cockpit_codex_account_markers(
+            home,
+            window_30d_start,
+            window_end,
+        )
+        markers_30d = switch_markers_30d + account_markers_30d
+        direct_latest_30d = latest_marker_by_label(account_markers_30d)
+        attributed_30d = attribute_codex_events_by_account(
+            events_30d,
+            markers_30d,
+            attribution_ledger,
+            current_label,
+            now,
+        )
+        for label, account_events in attributed_30d.items():
+            direct_cutoff = direct_latest_30d.get(label)
+            if direct_cutoff is not None:
+                direct_cutoff += timedelta(seconds=2)
+            bucket = buckets_30d.setdefault(label, UsageBucket())
+            multiplier = cost_multiplier_by_label.get(label, 1.0)
+            for event in account_events:
+                if direct_cutoff is not None and event.when <= direct_cutoff:
+                    continue
+                add_codex_event_to_bucket(bucket, event, multiplier)
 
     (
         aligned_5h,
-        _aligned_7d,
+        aligned_7d,
         aligned_cycle,
         aligned_starts_5h,
-        _aligned_starts_7d,
+        aligned_starts_7d,
         aligned_starts_cycle,
         direct_latest,
     ) = scan_cockpit_codex_quota_windows(
@@ -2363,7 +2469,11 @@ def build_codex_window_stats(
         now,
         window_end,
     )
-    aligned_starts = list(aligned_starts_5h.values()) + list(aligned_starts_cycle.values())
+    aligned_starts = (
+        list(aligned_starts_5h.values())
+        + list(aligned_starts_7d.values())
+        + list(aligned_starts_cycle.values())
+    )
     if aligned_starts:
         aligned_scan_start = min(aligned_starts)
         aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
@@ -2388,15 +2498,19 @@ def build_codex_window_stats(
                 multiplier = cost_multiplier_by_label.get(label, 1.0)
                 if label in aligned_starts_5h and event.when >= aligned_starts_5h[label]:
                     add_codex_event_to_bucket(aligned_5h[label], event, multiplier)
+                if label in aligned_starts_7d and event.when >= aligned_starts_7d[label]:
+                    add_codex_event_to_bucket(aligned_7d[label], event, multiplier)
                 if label in aligned_starts_cycle and event.when >= aligned_starts_cycle[label]:
                     add_codex_event_to_bucket(aligned_cycle[label], event, multiplier)
     buckets_5h.update(aligned_5h)
+    buckets_7d.update(aligned_7d)
     buckets_cycle = aligned_cycle
 
     result: dict[str, dict[str, dict[str, Any]]] = {}
     labels = (
         set(buckets_5h)
         | set(buckets_7d)
+        | set(buckets_30d)
         | set(buckets_cycle)
         | set(all_cockpit_codex_account_labels(home))
         | set(quota_by_account)
@@ -2409,7 +2523,12 @@ def build_codex_window_stats(
         )
         window_7d = bucket_to_window_dict(
             buckets_7d.get(label, UsageBucket()),
-            window_7d_start,
+            aligned_starts_7d.get(label, window_7d_start),
+            now,
+        )
+        window_30d = bucket_to_window_dict(
+            buckets_30d.get(label, UsageBucket()),
+            window_30d_start,
             now,
         )
         window_cycle = bucket_to_window_dict(
@@ -2421,11 +2540,14 @@ def build_codex_window_stats(
         window_5h.update(quota.get("window_5h") or {})
         window_7d.update(quota.get("window_7d") or {})
         window_cycle.update(quota.get("window_cycle") or {})
+        apply_5h_countdown_state(window_5h)
         result[label] = {
             "window_5h": window_5h,
             "window_7d": window_7d,
             "window_cycle": window_cycle,
         }
+        if include_30d:
+            result[label]["window_30d"] = window_30d
     return result
 
 
@@ -2433,9 +2555,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Export local Claude/Codex client token usage for Sub2API monitor.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--date", default="")
+    parser.add_argument("--include-30d", action="store_true")
     args = parser.parse_args()
 
     now = datetime.now()
+    out = Path(args.output)
+    cached_30d_valid = False
+    cached_30d_updated_at = ""
+    cached_30d_windows: dict[str, dict[str, Any]] = {}
+    if args.include_30d:
+        (
+            cached_30d_valid,
+            cached_30d_updated_at,
+            cached_30d_windows,
+        ) = load_cached_account_30d_windows(out, now)
+    refresh_30d = args.include_30d and not cached_30d_valid
     if args.date:
         day = datetime.fromisoformat(args.date).date()
     else:
@@ -2515,6 +2649,15 @@ def main() -> int:
         codex_hourly_from_events(codex_events),
         scan_claude_hourly(claude_root, start, end),
     )
+    if args.include_30d and cached_30d_valid:
+        expected_30d_accounts = {
+            name
+            for name, _bucket in codex_provider_buckets
+            if "@" in name
+        }
+        if not expected_30d_accounts.issubset(cached_30d_windows):
+            refresh_30d = True
+            cached_30d_windows = {}
     window_stats_by_account: dict[str, dict[str, dict[str, Any]]] = {}
     if day == now.date():
         window_stats_by_account = build_codex_window_stats(
@@ -2523,6 +2666,7 @@ def main() -> int:
             now,
             attribution_ledger,
             current_label,
+            include_30d=refresh_30d,
         )
     save_attribution_ledger(attribution_ledger, now)
 
@@ -2556,6 +2700,8 @@ def main() -> int:
                 provider[key] = value
         if "@" in name:
             provider.update(window_stats_by_account.get(name, {}))
+            if args.include_30d and name in cached_30d_windows:
+                provider["window_30d"] = cached_30d_windows[name]
         codex_providers.append(provider)
     providers = codex_providers + [bucket_to_dict("Claude local", claude)]
     total = UsageBucket()
@@ -2600,8 +2746,13 @@ def main() -> int:
             "hourly_today": hourly_today,
         },
     }
+    if args.include_30d:
+        output["account_30d_updated_at"] = (
+            now.isoformat(timespec="seconds")
+            if refresh_30d
+            else cached_30d_updated_at
+        )
 
-    out = Path(args.output)
     same_day_output_high_water(output, out, day)
     write_json_atomic(out, output)
     print(json.dumps(output["today"], ensure_ascii=False))

@@ -10,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ REFRESH_SECONDS = 3
 CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "10"))
 CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS", "90"))
 ACCOUNT_WINDOW_CACHE_SECONDS = int(os.environ.get("SUB2API_ACCOUNT_WINDOW_CACHE_SECONDS", "60"))
+ACCOUNT_STATS_CACHE_SECONDS = int(os.environ.get("SUB2API_ACCOUNT_STATS_CACHE_SECONDS", "300"))
 LOCAL_ACTIVE_WINDOW_SECONDS = int(os.environ.get("SUB2API_LOCAL_ACTIVE_WINDOW_SECONDS", "300"))
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 if not CLIENT_USAGE_EXPORT.exists():
@@ -643,11 +645,14 @@ def normalize_usage_window(progress: Any) -> dict[str, Any]:
     return result
 
 
-def load_client_usage() -> dict[str, Any] | None:
+def load_client_usage(include_30d: bool = False) -> dict[str, Any] | None:
     if CLIENT_USAGE_EXPORT.exists():
         try:
+            command = [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)]
+            if include_30d:
+                command.append("--include-30d")
             subprocess.run(
-                [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)],
+                command,
                 cwd=str(APP_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1000,8 +1005,12 @@ class MonitorState:
     client_usage_history: dict[str, Any] | None = None
 
 
-def build_local_monitor_state(error_text: str | None = None, usage_note: str = "本地客户端日志") -> MonitorState:
-    client_usage = load_client_usage() or {
+def build_local_monitor_state(
+    error_text: str | None = None,
+    usage_note: str = "本地客户端日志",
+    include_30d: bool = False,
+) -> MonitorState:
+    client_usage = load_client_usage(include_30d=include_30d) or {
         "requests": 0,
         "tokens": 0,
         "cost": 0.0,
@@ -1029,6 +1038,7 @@ def build_local_monitor_state(error_text: str | None = None, usage_note: str = "
                     "speed_badge": provider.get("speed_badge") or "",
                     "window_5h": provider.get("window_5h") or {},
                     "window_7d": provider.get("window_7d") or {},
+                    "window_30d": provider.get("window_30d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
                     "active_now": False,
                     "is_latest": str(provider.get("name") or "") == latest_provider_name,
@@ -1150,7 +1160,10 @@ class Sub2APIClient:
         self.token: str | None = None
         self._client_usage_cache: dict[str, Any] | None = None
         self._client_usage_cache_at: float = 0.0
+        self._client_usage_cache_has_30d = False
         self._account_window_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self._account_30d_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self.include_account_30d = False
 
     def _sub2api_match_urls(self) -> list[str]:
         env = read_env_files(ENV_FILES)
@@ -1196,20 +1209,27 @@ class Sub2APIClient:
 
     def _load_client_usage_cached(self) -> dict[str, Any] | None:
         now = time.time()
-        if self._client_usage_cache is not None and now - self._client_usage_cache_at < CLIENT_USAGE_CACHE_SECONDS:
+        if (
+            self._client_usage_cache is not None
+            and now - self._client_usage_cache_at < CLIENT_USAGE_CACHE_SECONDS
+            and (not self.include_account_30d or self._client_usage_cache_has_30d)
+        ):
             return self._client_usage_cache
-        client_usage = load_client_usage()
+        client_usage = load_client_usage(include_30d=self.include_account_30d)
         self._client_usage_cache = client_usage
         self._client_usage_cache_at = now
+        self._client_usage_cache_has_30d = self.include_account_30d
         return client_usage
 
     def clear_client_usage_cache(self) -> None:
         self._client_usage_cache = None
         self._client_usage_cache_at = 0.0
+        self._client_usage_cache_has_30d = False
 
     def clear_runtime_caches(self) -> None:
         self.clear_client_usage_cache()
         self._account_window_cache.clear()
+        self._account_30d_cache.clear()
 
     def _load_account_windows_cached(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = int(account.get("id") or 0)
@@ -1232,6 +1252,44 @@ class Sub2APIClient:
             return result
         except Exception:
             return cached[1] if cached else {}
+
+    def _load_account_30d_cached(self, account: dict[str, Any]) -> dict[str, Any]:
+        account_id = int(account.get("id") or 0)
+        if account_id <= 0:
+            return {}
+        now = time.time()
+        cached = self._account_30d_cache.get(account_id)
+        if cached and now - cached[0] < ACCOUNT_STATS_CACHE_SECONDS:
+            return cached[1]
+        try:
+            stats = self._request(
+                "GET",
+                f"/api/v1/admin/accounts/{account_id}/stats",
+                params={"days": 30},
+            ) or {}
+            summary = stats.get("summary") if isinstance(stats, dict) else {}
+            if not isinstance(summary, dict):
+                summary = {}
+            result = {
+                "requests": int(summary.get("total_requests") or 0),
+                "tokens": int(summary.get("total_tokens") or 0),
+                "cost": float(summary.get("total_cost") or 0),
+            }
+            self._account_30d_cache[account_id] = (now, result)
+            return result
+        except Exception:
+            return cached[1] if cached else {}
+
+    def _load_account_30d_batch(self, accounts: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        valid_accounts = [account for account in accounts if int(account.get("id") or 0) > 0]
+        if not valid_accounts:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(8, len(valid_accounts))) as executor:
+            windows = executor.map(self._load_account_30d_cached, valid_accounts)
+            return {
+                int(account.get("id") or 0): window
+                for account, window in zip(valid_accounts, windows)
+            }
 
     def _request(
         self,
@@ -1302,7 +1360,7 @@ class Sub2APIClient:
 
     def fetch_state(self) -> MonitorState:
         if self.mode in {"local", "local-codex", "client", "client-local"}:
-            return build_local_monitor_state()
+            return build_local_monitor_state(include_30d=self.include_account_30d)
         resolved_source, usage_note = self._resolve_usage_source()
         try:
             return self.fetch_sub2api_state()
@@ -1311,6 +1369,7 @@ class Sub2APIClient:
                 return build_local_monitor_state(
                     str(exc),
                     f"{usage_note} / Sub2API 不可用，已切到本地日志",
+                    include_30d=self.include_account_30d,
                 )
             raise
 
@@ -1411,6 +1470,11 @@ class Sub2APIClient:
             latest_account_name = account_map.get(latest_id, {}).get("name") or f"账号 #{latest_id}"
 
         top_accounts = []
+        account_30d_by_id = (
+            self._load_account_30d_batch(accounts)
+            if self.include_account_30d
+            else {}
+        )
         realtime_today_requests = 0
         realtime_today_tokens = 0
         realtime_today_cost = 0.0
@@ -1434,6 +1498,7 @@ class Sub2APIClient:
                     "source_badge": "SUB",
                     "window_5h": account_windows.get("window_5h") or {},
                     "window_7d": account_windows.get("window_7d") or {},
+                    "window_30d": account_30d_by_id.get(account_id) or {},
                     "window_cycle": account_windows.get("window_cycle") or {},
                     "active_now": any(int(row.get("id") or 0) == account_id for row in active_accounts),
                     "is_latest": bool(latest and int(latest.get("account_id") or 0) == account_id),
@@ -1519,6 +1584,7 @@ class Sub2APIClient:
                         "speed_badge": provider.get("speed_badge") or "",
                         "window_5h": provider.get("window_5h") or {},
                         "window_7d": provider.get("window_7d") or {},
+                        "window_30d": provider.get("window_30d") or {},
                         "window_cycle": provider.get("window_cycle") or {},
                         "active_now": False,
                         "is_latest": str(provider.get("name") or "") == latest_provider_name,
@@ -2135,12 +2201,13 @@ class FloatingMonitorApp:
                         "label": label,
                         "quota_available": quota_available,
                         "quota_stale": bool(window.get("quota_stale")),
+                        "quota_idle": bool(window.get("quota_idle")) if key == "window_5h" else False,
                         "utilization": utilization,
                         "remaining": remaining,
                         "resets_at": str(window.get("resets_at") or ""),
                         "tokens": int(window.get("tokens") or 0),
                         "cost": float(window.get("cost") or 0),
-                        "pressure_active": pressure_active,
+                        "pressure_active": pressure_active and not bool(window.get("quota_idle")),
                     }
                 )
             if not windows:
@@ -2516,7 +2583,12 @@ class FloatingMonitorApp:
                         detail = f"\u5269\u4f59 {float(remaining):.0f}%"
                     except (TypeError, ValueError):
                         detail = "\u5269\u4f59 --"
-                    reset = quota_reset_text(window.get("resets_at")) or "\u91cd\u7f6e -"
+                    if window.get("quota_idle"):
+                        utilization = 0.0
+                        detail = "\u6ee1\u989d\u5f85\u4f7f\u7528"
+                        reset = "\u4f7f\u7528\u540e\u5f00\u59cb 5h \u5012\u8ba1\u65f6"
+                    else:
+                        reset = quota_reset_text(window.get("resets_at")) or "\u91cd\u7f6e -"
                     if window.get("quota_stale"):
                         detail = "\u5f85\u5237\u65b0"
                         color = Theme.ag_warn
@@ -3010,12 +3082,16 @@ class FloatingMonitorApp:
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
         raw_top = list(self.state.top_accounts or []) if self.state else []
-        range_key = {"5h": "window_5h", "7d": "window_7d", "cycle": "window_cycle"}.get(self._account_range)
+        range_key = {
+            "5h": "window_5h",
+            "7d": "window_7d",
+            "30d": "window_30d",
+        }.get(self._account_range)
         range_label = {
             "today": "\u4eca\u65e5",
             "5h": "\u6700\u8fd1 5 \u5c0f\u65f6",
-            "7d": "\u6700\u8fd1 7 \u5929",
-            "cycle": "\u5468\u671f",
+            "7d": "7d \u5468\u671f",
+            "30d": "\u8fd1 30 \u5929",
         }.get(self._account_range, "\u4eca\u65e5")
         if range_key:
             top = []
@@ -3038,6 +3114,7 @@ class FloatingMonitorApp:
                 item["resets_at"] = str(window.get("resets_at") or "")
                 item["quota_available"] = has_quota
                 item["quota_stale"] = bool(window.get("quota_stale"))
+                item["quota_idle"] = bool(window.get("quota_idle")) if self._account_range == "5h" else False
                 top.append(item)
             top.sort(key=lambda row: (-row["tokens"], -row["requests"], row["name"]))
         else:
@@ -3052,8 +3129,8 @@ class FloatingMonitorApp:
         tab_specs = [
             ("rank_today", "\u4eca\u65e5", "today"),
             ("rank_5h", "5h \u5468\u671f", "5h"),
-            ("rank_7d", "\u8fd1 7 \u5929", "7d"),
-            ("rank_cycle", "\u5468\u671f", "cycle"),
+            ("rank_7d", "7d \u5468\u671f", "7d"),
+            ("rank_30d", "\u8fd1 30 \u5929", "30d"),
         ]
         tab_w = 52
         tab_gap = 3
@@ -3080,7 +3157,7 @@ class FloatingMonitorApp:
                 empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
             c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
-        window_mode = bool(range_key)
+        window_mode = self._account_range in {"5h", "7d"}
         row_h = 64 if window_mode else 39
         available_rank_rows = max(1, (H - 44 - y) // row_h)
         max_rank_rows = min(len(top), available_rank_rows)
@@ -3113,6 +3190,7 @@ class FloatingMonitorApp:
                     remaining_percent = None
             quota_available = bool(acc.get("quota_available")) if window_mode else False
             quota_stale = bool(acc.get("quota_stale")) if window_mode else False
+            quota_idle = bool(acc.get("quota_idle")) if window_mode else False
             cycle_window = acc.get("window_cycle") if isinstance(acc.get("window_cycle"), dict) else {}
             has_cycle_quota = bool(cycle_window.get("quota_available"))
             if window_mode and quota_available:
@@ -3133,7 +3211,9 @@ class FloatingMonitorApp:
                           font=self._fonts["font_label"], fill=Theme.text_primary)
 
             if window_mode:
-                if quota_available:
+                if quota_idle:
+                    percentage_text = "\u6ee1\u989d"
+                elif quota_available:
                     try:
                         percent_value = float(utilization)
                         percentage_text = f"\u5df2\u7528 {percent_value:.0f}%"
@@ -3175,6 +3255,9 @@ class FloatingMonitorApp:
                 elif quota_stale:
                     right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
                     right_color = Theme.amber_bright
+                elif quota_idle:
+                    right_detail = "\u6ee1\u989d\u5f85\u4f7f\u7528"
+                    right_color = Theme.accent_green
                 elif has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
                     right_detail = "\u770b\u5468\u671f\u9875"
                     right_color = Theme.amber_bright
@@ -3192,12 +3275,15 @@ class FloatingMonitorApp:
                               font=self._fonts["font_micro"], fill=right_color)
 
                 if quota_available:
-                    reset_text = quota_reset_text(str(acc.get("resets_at") or ""))
+                    if quota_idle:
+                        reset_text = "\u9996\u6b21\u4f7f\u7528\u540e\u5f00\u59cb 5h \u5012\u8ba1\u65f6"
+                    else:
+                        reset_text = quota_reset_text(str(acc.get("resets_at") or ""))
                     if self._account_range == "7d" and reset_text:
                         reset_text = f"\u5468\u9650\u989d \u00b7 {reset_text}"
                     elif self._account_range == "cycle" and reset_text:
                         reset_text = f"\u5468\u671f \u00b7 {reset_text}"
-                    elif self._account_range == "5h" and reset_text:
+                    elif self._account_range == "5h" and reset_text and not quota_idle:
                         reset_text = f"5h \u9650\u989d \u00b7 {reset_text}"
                 elif self._account_range == "7d":
                     reset_text = "\u8be5\u8d26\u53f7\u4f7f\u7528\u5468\u671f\u989d\u5ea6" if has_cycle_quota else "\u672a\u63d0\u4f9b\u5468\u989d\u5ea6"
@@ -3213,7 +3299,7 @@ class FloatingMonitorApp:
                                         r=2, fill=Theme.bg_lift, outline="")
                 if quota_available:
                     try:
-                        ratio = max(0.0, min(1.0, float(utilization) / 100.0))
+                        ratio = 0.0 if quota_idle else max(0.0, min(1.0, float(utilization) / 100.0))
                     except (TypeError, ValueError):
                         ratio = 0.0
                     if ratio > 0:
@@ -3322,16 +3408,21 @@ class FloatingMonitorApp:
             self._scroll_offsets["stats"] = 0
             self._draw()
             return
-        if btn in {"rank_today", "rank_5h", "rank_7d", "rank_cycle"}:
+        if btn in {"rank_today", "rank_5h", "rank_7d", "rank_30d"}:
             self._resizing = False
             self._account_range = {
                 "rank_today": "today",
                 "rank_5h": "5h",
                 "rank_7d": "7d",
-                "rank_cycle": "cycle",
+                "rank_30d": "30d",
             }[btn]
             self._account_range_user_selected = True
-            self._draw()
+            if self._account_range == "30d" and not self.client.include_account_30d:
+                self.client.include_account_30d = True
+                self.client.clear_client_usage_cache()
+                self.refresh_async()
+            else:
+                self._draw()
             return
         if self._hit_resize_handle(event.x, event.y):
             self._resizing = True
@@ -3418,22 +3509,6 @@ class FloatingMonitorApp:
     #  DATA REFRESH
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _maybe_select_cycle_range(self, state: MonitorState) -> None:
-        if self._account_range_user_selected or self._account_range_auto_selected:
-            return
-        if self._account_range != "today":
-            return
-        latest = str(state.latest_account_name or "").replace("LOCAL - ", "")
-        for account in state.top_accounts or []:
-            window = account.get("window_cycle") if isinstance(account, dict) else None
-            if not isinstance(window, dict) or not window.get("quota_available"):
-                continue
-            name = str(account.get("name") or "")
-            if latest and (name in latest or latest in name):
-                self._account_range = "cycle"
-                self._account_range_auto_selected = True
-                return
-
     def refresh_async(self) -> None:
         if not self._refresh_lock.acquire(blocking=False):
             return
@@ -3466,7 +3541,6 @@ class FloatingMonitorApp:
             except Exception:
                 result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
-            self._maybe_select_cycle_range(result)
         self._draw()
 
     def _handle_day_rollover(self, force: bool = False) -> bool:
