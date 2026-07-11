@@ -9,6 +9,139 @@ import client_usage_export
 import monitor
 
 
+class ModelPricingFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_online_prices = client_usage_export._ONLINE_PRICE_TABLE
+        self.original_online_details = client_usage_export._ONLINE_PRICE_DETAILS
+
+    def tearDown(self) -> None:
+        client_usage_export._ONLINE_PRICE_TABLE = self.original_online_prices
+        client_usage_export._ONLINE_PRICE_DETAILS = self.original_online_details
+
+    def test_unknown_model_uses_online_exact_price(self) -> None:
+        client_usage_export._ONLINE_PRICE_TABLE = {
+            "gpt-5.6-sol": (6.0, 0.6, 36.0),
+        }
+        client_usage_export._ONLINE_PRICE_DETAILS = {}
+
+        self.assertEqual(
+            client_usage_export.model_price("gpt-5.6-sol"),
+            (6.0, 0.6, 36.0),
+        )
+
+    def test_unknown_gpt5_minor_uses_latest_known_family_price(self) -> None:
+        client_usage_export._ONLINE_PRICE_TABLE = {}
+        client_usage_export._ONLINE_PRICE_DETAILS = {}
+
+        self.assertEqual(
+            client_usage_export.model_price("gpt-5.6-sol"),
+            client_usage_export.model_price("gpt-5.5"),
+        )
+        self.assertGreater(
+            client_usage_export.estimate_cost("gpt-5.6-sol", 1000, 1000, 1000),
+            0,
+        )
+
+    def test_known_model_keeps_exact_price(self) -> None:
+        self.assertEqual(
+            client_usage_export.model_price("gpt-5.4-mini"),
+            (0.75, 0.075, 4.5),
+        )
+
+    def test_online_payload_is_converted_to_per_million_prices(self) -> None:
+        prices = client_usage_export.extract_online_price_table(
+            {
+                "gpt-new": {
+                    "litellm_provider": "openai",
+                    "input_cost_per_token": 0.000006,
+                    "cache_read_input_token_cost": 0.0000006,
+                    "output_cost_per_token": 0.000036,
+                }
+            }
+        )
+
+        self.assertEqual(prices["gpt-new"], (6.0, 0.6, 36.0))
+
+    def test_complete_online_pricing_rules(self) -> None:
+        profile = {
+            "input_cost_per_token": 5.0,
+            "input_cost_per_token_above_272k_tokens": 10.0,
+            "input_cost_per_token_batches": 2.5,
+            "input_cost_per_token_flex": 2.5,
+            "input_cost_per_token_priority": 10.0,
+            "cache_read_input_token_cost": 0.5,
+            "cache_read_input_token_cost_above_272k_tokens": 1.0,
+            "cache_read_input_token_cost_flex": 0.25,
+            "cache_read_input_token_cost_priority": 1.0,
+            "cache_creation_input_token_cost": 6.25,
+            "cache_creation_input_token_cost_above_272k_tokens": 12.5,
+            "cache_creation_input_token_cost_flex": 3.125,
+            "cache_creation_input_token_cost_priority": 12.5,
+            "output_cost_per_token": 30.0,
+            "output_cost_per_token_above_272k_tokens": 45.0,
+            "output_cost_per_token_batches": 15.0,
+            "output_cost_per_token_flex": 15.0,
+            "output_cost_per_token_priority": 60.0,
+        }
+        client_usage_export._ONLINE_PRICE_TABLE = {"gpt-new": (5.0, 0.5, 30.0)}
+        client_usage_export._ONLINE_PRICE_DETAILS = {"gpt-new": profile}
+
+        args = ("gpt-new", 100_000, 100_000, 10_000)
+        self.assertAlmostEqual(
+            client_usage_export.estimate_cost(*args, cache_creation_tokens=50_000),
+            1.1625,
+        )
+        self.assertAlmostEqual(
+            client_usage_export.estimate_cost(*args, cache_creation_tokens=50_000, pricing_tier="priority"),
+            2.325,
+        )
+        self.assertAlmostEqual(
+            client_usage_export.estimate_cost(*args, cache_creation_tokens=50_000, pricing_tier="flex"),
+            0.58125,
+        )
+        self.assertAlmostEqual(
+            client_usage_export.estimate_cost(*args, cache_creation_tokens=50_000, pricing_tier="batch"),
+            0.7625,
+        )
+        self.assertAlmostEqual(
+            client_usage_export.estimate_cost("gpt-new", 200_000, 100_000, 10_000),
+            2.55,
+        )
+
+    def test_priority_event_is_not_multiplied_twice(self) -> None:
+        client_usage_export._ONLINE_PRICE_TABLE = {"gpt-new": (5.0, 0.5, 30.0)}
+        client_usage_export._ONLINE_PRICE_DETAILS = {
+            "gpt-new": {
+                "input_cost_per_token": 5.0,
+                "input_cost_per_token_priority": 10.0,
+                "cache_read_input_token_cost": 0.5,
+                "cache_read_input_token_cost_priority": 1.0,
+                "output_cost_per_token": 30.0,
+                "output_cost_per_token_priority": 60.0,
+            }
+        }
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 11, 12, 0, 0),
+            model="gpt-new",
+            input_tokens=100_000,
+            cached_tokens=0,
+            output_tokens=0,
+            app_speed="fast",
+            cost_multiplier=2.0,
+            pricing_tier="priority",
+        )
+        bucket = client_usage_export.UsageBucket()
+
+        client_usage_export.add_codex_event_to_bucket(bucket, event)
+
+        self.assertAlmostEqual(bucket.cost, 1.0)
+
+    def test_flex_and_batch_tiers_survive_speed_fallback(self) -> None:
+        self.assertEqual(client_usage_export.codex_service_tier_to_speed("flex"), "flex")
+        self.assertEqual(client_usage_export.codex_service_tier_to_speed("batch"), "batch")
+        self.assertEqual(client_usage_export.codex_speed_cost_multiplier("flex"), 1.0)
+
+
 class UsageHistoryIsolationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -274,14 +407,210 @@ class LocalActiveAccountTests(unittest.TestCase):
 
         self.assertEqual(active, [])
 
+    def test_active_sessions_survive_client_usage_loading(self) -> None:
+        session = {
+            "session_id": "session-1",
+            "provider": "Codex local - account@example.com",
+            "model": "gpt-test",
+            "latest_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        payload = {
+            "date": monitor.today_key(),
+            "today": {"requests": 1, "tokens": 100, "cost": 0.1},
+            "providers": [],
+            "active_sessions": [session],
+            "latest_request": {},
+            "updated_at": session["latest_at"],
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(monitor, "CLIENT_USAGE_EXPORT", Path(temporary_directory) / "missing.py"),
+            patch.object(monitor, "CLIENT_USAGE_JSON", Path(temporary_directory) / "usage.json"),
+        ):
+            monitor.CLIENT_USAGE_JSON.write_text(json.dumps(payload), encoding="utf-8")
+            usage = monitor.load_client_usage()
+
+        self.assertEqual(usage["active_sessions"], [session])
+
+
+class LatestRequestFallbackTests(unittest.TestCase):
+    def test_account_fallback_events_merge_after_direct_bucket_latest(self) -> None:
+        label = "Codex local - account@example.com"
+        direct = client_usage_export.UsageBucket()
+        direct.requests = 1
+        direct.input_tokens = 100
+        direct.mark_latest(datetime(2026, 7, 8, 16, 21, 22), "gpt-old")
+
+        old_event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 8, 16, 20, 0),
+            model="gpt-old",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+        )
+        new_event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 8, 17, 22, 34),
+            model="gpt-new",
+            input_tokens=2000,
+            cached_tokens=0,
+            output_tokens=300,
+            request_at=datetime(2026, 7, 8, 17, 22, 30),
+        )
+
+        client_usage_export.merge_codex_account_fallback_events(
+            {label: direct},
+            {label: [old_event, new_event]},
+            {label: 1.0},
+        )
+
+        self.assertEqual(direct.requests, 2)
+        self.assertEqual(direct.total_tokens, 2400)
+        self.assertEqual(direct.latest_model, "gpt-new")
+        self.assertEqual(direct.latest_at, datetime(2026, 7, 8, 17, 22, 30))
+
+    def test_latest_request_from_attributed_events_uses_newest_event(self) -> None:
+        older = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 1, 22, 0, 0),
+            model="gpt-old",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=1,
+            session_id="older",
+        )
+        newer = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 1, 22, 3, 44),
+            model="gpt-new",
+            input_tokens=200,
+            cached_tokens=0,
+            output_tokens=2,
+            session_id="newer",
+        )
+
+        latest = client_usage_export.latest_request_from_attributed_events(
+            {
+                "Codex local - old@example.com": [older],
+                "Codex local - new@example.com": [newer],
+            }
+        )
+
+        self.assertEqual(latest["provider"], "Codex local - new@example.com")
+        self.assertEqual(latest["model"], "gpt-new")
+        self.assertTrue(latest["created_at"].startswith("2026-07-01T22:03:44"))
+
+    def test_latest_request_prefers_email_label_on_tie(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 1, 22, 0, 0),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=1,
+            session_id="same",
+        )
+
+        latest = client_usage_export.latest_request_from_attributed_events(
+            {
+                "Codex local - api-service-local": [event],
+                "Codex local - account@example.com": [event],
+            }
+        )
+
+        self.assertEqual(latest["provider"], "Codex local - account@example.com")
+
+    def test_api_service_latest_request_resolves_concrete_pool_account(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 11, 20, 15, 29, 616000),
+            model="gpt-test",
+            input_tokens=250_000,
+            cached_tokens=10_000,
+            output_tokens=562,
+            session_id="api-session",
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 11, 20, 15, 29, 382000),
+                label="Codex local - wrong@example.com",
+                total_tokens=88_798,
+            ),
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 11, 20, 15, 29, 615000),
+                label="Codex local - matched@example.com",
+                total_tokens=260_562,
+            ),
+        ]
+
+        latest = client_usage_export.latest_request_from_attributed_events(
+            {"Codex local - api-service-local": [event]},
+            markers,
+        )
+
+        self.assertEqual(latest["provider"], "Codex local - matched@example.com")
+
+
+class MonitorModeIsolationTests(unittest.TestCase):
+    def test_auto_mode_uses_local_state_when_codex_endpoint_is_not_sub2api(self) -> None:
+        sentinel = monitor.MonitorState(
+            loading=False,
+            mode="local-codex",
+            usage_source="local",
+            usage_note="local-only",
+            today_requests=1,
+            today_tokens=100,
+        )
+        with (
+            patch.dict("os.environ", {"TOKEN_MONITOR_MODE": "auto"}, clear=False),
+            patch.object(
+                monitor.Sub2APIClient,
+                "_codex_points_to_sub2api",
+                return_value=(False, ["https://api.openai.com/v1"]),
+            ),
+            patch.object(monitor.Sub2APIClient, "fetch_sub2api_state") as fetch_sub2api,
+            patch.object(monitor, "build_local_monitor_state", return_value=sentinel) as local_state,
+        ):
+            client = monitor.Sub2APIClient()
+            state = client.fetch_state()
+
+        self.assertIs(state, sentinel)
+        fetch_sub2api.assert_not_called()
+        local_state.assert_called_once()
+
+    def test_auto_mode_uses_sub2api_state_when_codex_endpoint_matches(self) -> None:
+        sentinel = monitor.MonitorState(
+            loading=False,
+            mode="sub2api",
+            usage_source="sub2api",
+            usage_note="sub2api",
+            today_requests=2,
+            today_tokens=200,
+        )
+        with (
+            patch.dict("os.environ", {"TOKEN_MONITOR_MODE": "auto"}, clear=False),
+            patch.object(
+                monitor.Sub2APIClient,
+                "_codex_points_to_sub2api",
+                return_value=(True, ["http://127.0.0.1:63685/v1"]),
+            ),
+            patch.object(monitor.Sub2APIClient, "fetch_sub2api_state", return_value=sentinel) as fetch_sub2api,
+            patch.object(monitor, "build_local_monitor_state") as local_state,
+        ):
+            client = monitor.Sub2APIClient()
+            state = client.fetch_state()
+
+        self.assertIs(state, sentinel)
+        fetch_sub2api.assert_called_once()
+        local_state.assert_not_called()
+
 
 class LocalExportHighWaterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.output_path = Path(self.temporary_directory.name) / "client_usage_today.json"
+        self.history_path = Path(self.temporary_directory.name) / "usage_history.json"
+        self.original_history_path = client_usage_export.USAGE_HISTORY_PATH
+        client_usage_export.USAGE_HISTORY_PATH = self.history_path
         self.day = date.today()
 
     def tearDown(self) -> None:
+        client_usage_export.USAGE_HISTORY_PATH = self.original_history_path
         self.temporary_directory.cleanup()
 
     def snapshot(self, snapshot_day: date, tokens: int) -> dict:
@@ -346,6 +675,28 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 1_000_000)
         self.assertEqual(current["latest_request"]["model"], "gpt-test")
 
+    def test_high_water_preserves_totals_but_keeps_newer_latest_timestamp(self) -> None:
+        previous = self.snapshot(self.day, 1_000_000)
+        current = self.snapshot(self.day, 100_000)
+        previous["today"]["latest_at"] = f"{self.day.isoformat()}T16:21:22+08:00"
+        previous["today"]["latest_model"] = "gpt-old"
+        previous["providers"][0]["latest_at"] = f"{self.day.isoformat()}T16:21:22+08:00"
+        previous["providers"][0]["latest_model"] = "gpt-old"
+        current["today"]["latest_at"] = f"{self.day.isoformat()}T17:26:35+08:00"
+        current["today"]["latest_model"] = "gpt-new"
+        current["providers"][0]["latest_at"] = f"{self.day.isoformat()}T17:26:35+08:00"
+        current["providers"][0]["latest_model"] = "gpt-new"
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+
+        self.assertEqual(current["today"]["tokens"], 1_000_000)
+        self.assertEqual(current["today"]["latest_at"], f"{self.day.isoformat()}T17:26:35+08:00")
+        self.assertEqual(current["today"]["latest_model"], "gpt-new")
+        self.assertEqual(current["providers"][0]["tokens"], 1_000_000)
+        self.assertEqual(current["providers"][0]["latest_at"], f"{self.day.isoformat()}T17:26:35+08:00")
+        self.assertEqual(current["providers"][0]["latest_model"], "gpt-new")
+
     def test_new_day_never_inherits_previous_day_high_water(self) -> None:
         yesterday = self.day - timedelta(days=1)
         previous = self.snapshot(yesterday, 1_000_000)
@@ -378,6 +729,105 @@ class LocalExportHighWaterTests(unittest.TestCase):
             current["providers"][0]["window_30d"]["tokens"],
             88_000_000,
         )
+
+    def test_usage_history_restores_today_high_water(self) -> None:
+        current = self.snapshot(self.day, 100_000)
+        self.history_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "days": {
+                        self.day.isoformat(): {
+                            "requests": 817,
+                            "tokens": 114_001_494,
+                            "input_tokens": 7_768_363,
+                            "cached_input_tokens": 102_232_192,
+                            "cache_creation_input_tokens": 0,
+                            "output_tokens": 462_026,
+                            "cost": 107.739207,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        client_usage_export.restore_today_from_usage_history(current, self.day)
+
+        self.assertEqual(current["today"]["tokens"], 114_001_494)
+        self.assertEqual(current["today"]["requests"], 817)
+        self.assertEqual(current["providers"][0]["tokens"], 100_000)
+        self.assertEqual(current["providers"][1]["name"], client_usage_export.HIGH_WATER_UNATTRIBUTED_LABEL)
+        self.assertEqual(current["providers"][1]["tokens"], 113_901_494)
+
+    def test_unattributed_gap_provider_matches_today_total(self) -> None:
+        current = self.snapshot(self.day, 1_000_000)
+        current["providers"][0]["tokens"] = 600_000
+        current["providers"][0]["requests"] = 6
+        current["providers"][0]["cost"] = 0.6
+
+        client_usage_export.add_unattributed_provider_gap(current)
+
+        self.assertEqual(current["providers"][1]["name"], client_usage_export.HIGH_WATER_UNATTRIBUTED_LABEL)
+        self.assertEqual(current["providers"][1]["tokens"], 400_000)
+        self.assertEqual(
+            sum(int(provider.get("tokens") or 0) for provider in current["providers"]),
+            current["today"]["tokens"],
+        )
+
+    def test_api_service_providers_are_collapsed_without_changing_total(self) -> None:
+        current = self.snapshot(self.day, 1_000)
+        current["providers"] = [
+            {"name": "Codex local - account@example.com", "requests": 4, "tokens": 400, "cost": 0.4},
+            {"name": "Codex local - codex_local_access_runtime", "requests": 3, "tokens": 300, "cost": 0.3},
+            {"name": "Codex local - api-service-local", "requests": 3, "tokens": 300, "cost": 0.3},
+        ]
+
+        aggregate = client_usage_export.collapse_api_service_mirror_providers(current)
+
+        self.assertEqual(aggregate["tokens"], 600)
+        self.assertEqual(current["today"]["tokens"], 1_000)
+        self.assertEqual(
+            [row["name"] for row in current["providers"]],
+            ["Codex local - account@example.com", client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+        )
+        self.assertEqual(sum(row["tokens"] for row in current["providers"]), current["today"]["tokens"])
+
+    def test_high_water_does_not_replace_direct_account_with_api_pool_high_water(self) -> None:
+        previous = self.snapshot(self.day, 1_400)
+        previous["providers"] = [
+            {"name": "Codex local - account@example.com", "requests": 8, "tokens": 800, "cost": 0.8},
+            {"name": "Codex local - codex_local_access_runtime", "requests": 6, "tokens": 600, "cost": 0.6},
+            {"name": client_usage_export.HIGH_WATER_UNATTRIBUTED_LABEL, "requests": 4, "tokens": 400, "cost": 0.4},
+        ]
+        current = self.snapshot(self.day, 1_100)
+        current["providers"] = [
+            {"name": "Codex local - account@example.com", "requests": 5, "tokens": 500, "cost": 0.5},
+            {"name": client_usage_export.API_SERVICE_AGGREGATE_LABEL, "requests": 6, "tokens": 600, "cost": 0.6},
+        ]
+        current["api_service_aggregate"] = {"requests": 6, "tokens": 600, "cost": 0.6}
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+
+        direct = next(row for row in current["providers"] if row["name"] == "Codex local - account@example.com")
+        self.assertEqual(direct["tokens"], 500)
+        self.assertEqual(current["today"]["tokens"], 1_100)
+        self.assertFalse(
+            any(row["name"] == client_usage_export.HIGH_WATER_UNATTRIBUTED_LABEL for row in current["providers"])
+        )
+
+    def test_history_restore_is_skipped_when_api_aggregate_is_present(self) -> None:
+        current = self.snapshot(self.day, 1_100)
+        current["api_service_aggregate"] = {"requests": 6, "tokens": 600, "cost": 0.6}
+        self.history_path.write_text(
+            json.dumps({"days": {self.day.isoformat(): {"requests": 20, "tokens": 2_000, "input_tokens": 2_000, "cost": 2.0}}}),
+            encoding="utf-8",
+        )
+
+        client_usage_export.restore_today_from_usage_history(current, self.day)
+
+        self.assertEqual(current["today"]["tokens"], 1_100)
 
 
 class WindowSemanticsTests(unittest.TestCase):

@@ -277,7 +277,7 @@ def quota_color(utilization: float | int | None) -> str:
     if value >= 90:
         return Theme.accent_red
     if value >= 60:
-        return Theme.amber_bright
+        return Theme.ag_warn
     return Theme.accent_green
 
 
@@ -756,6 +756,7 @@ def load_client_usage(include_30d: bool = False) -> dict[str, Any] | None:
             "tokens": 0,
             "cost": 0.0,
             "providers": [],
+            "active_sessions": [],
             "latest_request": {},
             "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
             "updated_at": data.get("updated_at") or "",
@@ -767,6 +768,7 @@ def load_client_usage(include_30d: bool = False) -> dict[str, Any] | None:
         "tokens": int(today.get("tokens") or 0),
         "cost": float(today.get("cost") or 0),
         "providers": data.get("providers") or [],
+        "active_sessions": data.get("active_sessions") or [],
         "latest_request": data.get("latest_request") or {},
         "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
         "updated_at": data.get("updated_at") or "",
@@ -1390,7 +1392,13 @@ class Sub2APIClient:
         self.base_url = self.base_url.rstrip("/")
         self.email = os.environ.get("SUB2API_ADMIN_EMAIL") or env.get("ADMIN_EMAIL") or "admin@sub2api.local"
         self.password = os.environ.get("SUB2API_ADMIN_PASSWORD") or env.get("ADMIN_PASSWORD") or ""
-        self.mode = (os.environ.get("SUB2API_MONITOR_MODE") or env.get("SUB2API_MONITOR_MODE") or "auto").strip().lower()
+        self.mode = (
+            os.environ.get("TOKEN_MONITOR_MODE")
+            or env.get("TOKEN_MONITOR_MODE")
+            or os.environ.get("SUB2API_MONITOR_MODE")
+            or env.get("SUB2API_MONITOR_MODE")
+            or "auto"
+        ).strip().lower()
         usage_source = os.environ.get("SUB2API_MONITOR_USAGE_SOURCE") or env.get("SUB2API_MONITOR_USAGE_SOURCE") or ""
         self.usage_source = usage_source.strip().lower() or ("both" if env_bool(env, "SUB2API_INCLUDE_LOCAL_USAGE", False) else "auto")
         self.token: str | None = None
@@ -1428,6 +1436,10 @@ class Sub2APIClient:
             return "local", "手动: 本地日志"
         if self.usage_source in {"both", "merge", "all"}:
             return "both", "手动: 合并显示"
+        if self.mode in {"local", "local-codex", "client", "client-local"}:
+            return "local", "本地日志"
+        if self.mode in {"sub2api", "server"}:
+            return "sub2api", "手动: Sub2API"
         points_to_sub2api, codex_urls = self._codex_points_to_sub2api()
         if points_to_sub2api is True:
             return "sub2api", "Auto: Codex -> Sub2API"
@@ -1596,12 +1608,34 @@ class Sub2APIClient:
 
     def fetch_state(self) -> MonitorState:
         if self.mode in {"local", "local-codex", "client", "client-local"}:
-            return build_local_monitor_state(include_30d=self.include_account_30d)
+            return build_local_monitor_state(
+                usage_note="本地日志（独立监控）",
+                include_30d=self.include_account_30d,
+            )
+
+        if self.mode in {"", "auto", "fallback", "auto-sub2api"}:
+            points_to_sub2api, codex_urls = self._codex_points_to_sub2api()
+            if points_to_sub2api is not True:
+                first = codex_urls[0] if codex_urls else ""
+                endpoint_note = strip_url_path(first) or "未确认 Codex endpoint"
+                return build_local_monitor_state(
+                    usage_note=f"Auto: Codex -> {endpoint_note} / 本地日志",
+                    include_30d=self.include_account_30d,
+                )
+            try:
+                return self.fetch_sub2api_state()
+            except Exception as exc:
+                return build_local_monitor_state(
+                    str(exc),
+                    "Auto: Codex -> Sub2API / Sub2API 不可用，已切到本地日志",
+                    include_30d=self.include_account_30d,
+                )
+
         resolved_source, usage_note = self._resolve_usage_source()
         try:
             return self.fetch_sub2api_state()
         except Exception as exc:
-            if self.mode in {"", "auto"}:
+            if self.mode in {"fallback", "auto-sub2api"}:
                 return build_local_monitor_state(
                     str(exc),
                     f"{usage_note} / Sub2API 不可用，已切到本地日志",
@@ -2015,8 +2049,8 @@ class FloatingMonitorApp:
         self._tooltip_text = ""
         self._tooltip_pos = (0, 0)
         self._main_tab = "accounts"
-        self._scroll_offsets = {"accounts": 0, "budget": 0, "stats": 0}
-        self._scroll_limits = {"accounts": 0, "budget": 0, "stats": 0}
+        self._scroll_offsets = {"accounts": 0, "stats": 0}
+        self._scroll_limits = {"accounts": 0, "stats": 0}
         self._usage_range = "24h"
         self._account_range = "today"
         self._account_range_user_selected = False
@@ -2238,7 +2272,6 @@ class FloatingMonitorApp:
     def _draw_main_tabs(self, col_l: int, col_r: int, y: int) -> int:
         tabs = [
             ("main_accounts", "\u8d26\u53f7", "accounts"),
-            ("main_budget", "Token \u9884\u7b97", "budget"),
             ("main_stats", "\u7528\u91cf\u7edf\u8ba1", "stats"),
         ]
         gap = 5
@@ -3157,11 +3190,6 @@ class FloatingMonitorApp:
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
         y += 10
         y = self._draw_main_tabs(COL_L, COL_R, y)
-        if self._main_tab == "budget":
-            self._draw_token_budget_page(COL_L, COL_R, y, H)
-            self._draw_footer(W, H)
-            self._draw_tooltip(W, H)
-            return
         if self._main_tab == "stats":
             self._draw_usage_stats_page(COL_L, COL_R, y, H)
             self._draw_footer(W, H)
@@ -3510,9 +3538,9 @@ class FloatingMonitorApp:
                 elif percentage_color == Theme.accent_red:
                     percentage_fill = Theme.quota_red_bg
                     percentage_outline = Theme.accent_red
-                elif percentage_color == Theme.amber_bright:
+                elif percentage_color in {Theme.ag_warn, Theme.amber_bright}:
                     percentage_fill = Theme.quota_amber_bg
-                    percentage_outline = Theme.amber_bright
+                    percentage_outline = Theme.ag_warn
                 else:
                     percentage_fill = Theme.quota_green_bg
                     percentage_outline = Theme.accent_green
@@ -3660,11 +3688,10 @@ class FloatingMonitorApp:
             self.client.clear_client_usage_cache()
             self.refresh_async()
             return
-        if btn in {"main_accounts", "main_budget", "main_stats"}:
+        if btn in {"main_accounts", "main_stats"}:
             self._resizing = False
             self._main_tab = {
                 "main_accounts": "accounts",
-                "main_budget": "budget",
                 "main_stats": "stats",
             }[btn]
             self._scroll_offsets[self._main_tab] = 0
@@ -3672,9 +3699,9 @@ class FloatingMonitorApp:
             return
         if 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
             self._resizing = False
-            tab_width = max(1, (self.WIDTH - 28) / 3)
-            tab_index = int(max(0, min(2, (event.x - 14) // tab_width)))
-            tab_value = ("accounts", "budget", "stats")[tab_index]
+            tab_width = max(1, (self.WIDTH - 28) / 2)
+            tab_index = int(max(0, min(1, (event.x - 14) // tab_width)))
+            tab_value = ("accounts", "stats")[tab_index]
             if self._main_tab != tab_value:
                 self._main_tab = tab_value
                 self._scroll_offsets[tab_value] = 0

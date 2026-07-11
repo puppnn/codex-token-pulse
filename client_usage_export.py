@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib import request
 
 
 def env_float(name: str, default: float) -> float:
@@ -63,13 +64,25 @@ CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_us
 SPEED_HISTORY_PATH = Path(os.environ.get("CLIENT_USAGE_SPEED_HISTORY") or APP_DIR / "client_usage_speed_history.json")
 ACCOUNT_TIMELINE_PATH = Path(os.environ.get("CLIENT_USAGE_ACCOUNT_TIMELINE") or APP_DIR / "client_usage_account_timeline.json")
 ATTRIBUTION_LEDGER_PATH = Path(os.environ.get("CLIENT_USAGE_ATTRIBUTION_LEDGER") or APP_DIR / "client_usage_attribution_ledger.json")
+USAGE_HISTORY_PATH = Path(os.environ.get("USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
+MODEL_PRICE_CACHE_PATH = Path(
+    os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE") or APP_DIR / "client_usage_model_prices.json"
+)
+MODEL_PRICE_SOURCE_URL = os.environ.get(
+    "CLIENT_USAGE_MODEL_PRICE_URL",
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+)
+MODEL_PRICE_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS", "86400"))
+MODEL_PRICE_FETCH_TIMEOUT_SECONDS = float(os.environ.get("CLIENT_USAGE_MODEL_PRICE_FETCH_TIMEOUT_SECONDS", "4"))
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
+API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "10"))
 CODEX_CURRENT_ACCOUNT_RECENT_SECONDS = int(os.environ.get("CLIENT_USAGE_CURRENT_ACCOUNT_RECENT_SECONDS", "1800"))
 CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "300"))
 ACCOUNT_30D_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_ACCOUNT_30D_CACHE_SECONDS", "300"))
 QUOTA_WINDOW_START_TOLERANCE_SECONDS = int(os.environ.get("CLIENT_USAGE_QUOTA_WINDOW_START_TOLERANCE_SECONDS", "10"))
+LATEST_REQUEST_LOOKBACK_DAYS = int(os.environ.get("CLIENT_USAGE_LATEST_REQUEST_LOOKBACK_DAYS", "7"))
 UNASSIGNED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_UNASSIGNED_CODEX_LABEL", "Unassigned local")
 CODEX_FAST_COST_MULTIPLIER = env_float("CLIENT_USAGE_CODEX_FAST_COST_MULTIPLIER", 2.0)
 CODEX_FORCE_SPEED = os.environ.get("CLIENT_USAGE_CODEX_FORCE_SPEED", "").strip().lower()
@@ -87,6 +100,19 @@ TURN_ID_RE = re.compile(r'\b(?:turn\.id|turn_id)=(?P<key>[A-Za-z0-9_-]+)')
 CONVERSATION_ID_RE = re.compile(r'\bconversation\.id=(?P<key>[A-Za-z0-9_-]+)')
 SESSION_LOOP_THREAD_ID_RE = re.compile(r'\bsession_loop\{thread_id=(?P<key>[A-Za-z0-9_-]+)\}')
 SUB2API_ROUTED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_SUB2API_ROUTED_CODEX_LABEL", "Codex via Sub2API")
+HIGH_WATER_UNATTRIBUTED_LABEL = os.environ.get(
+    "CLIENT_USAGE_HIGH_WATER_UNATTRIBUTED_LABEL",
+    "Codex local - 历史高水位未归因",
+)
+API_SERVICE_MIRROR_LABELS = {
+    "api-service-local",
+    "api service local",
+    "codex_local_access_runtime",
+}
+API_SERVICE_AGGREGATE_LABEL = "Codex local - api-service-local"
+
+_ONLINE_PRICE_TABLE: dict[str, tuple[float, float, float]] | None = None
+_ONLINE_PRICE_DETAILS: dict[str, dict[str, float]] | None = None
 
 
 @dataclass
@@ -146,6 +172,7 @@ class UsageEvent:
     output_tokens: int
     app_speed: str = ""
     cost_multiplier: float | None = None
+    pricing_tier: str = ""
     session_id: str = ""
     request_key: str = ""
     route: str = ""
@@ -162,6 +189,7 @@ class AccountMarker:
     label: str
     model: str = ""
     kind: str = "request"
+    total_tokens: int = 0
 
 
 @dataclass
@@ -190,20 +218,249 @@ PRICE_PER_MILLION: list[tuple[str, tuple[float, float, float]]] = [
 ]
 
 
+ONLINE_TOKEN_COST_FIELDS = (
+    "input_cost_per_token",
+    "input_cost_per_token_above_272k_tokens",
+    "input_cost_per_token_batches",
+    "input_cost_per_token_flex",
+    "input_cost_per_token_priority",
+    "input_cost_per_token_above_272k_tokens_priority",
+    "cache_read_input_token_cost",
+    "cache_read_input_token_cost_above_272k_tokens",
+    "cache_read_input_token_cost_flex",
+    "cache_read_input_token_cost_priority",
+    "cache_read_input_token_cost_above_272k_tokens_priority",
+    "cache_creation_input_token_cost",
+    "cache_creation_input_token_cost_above_272k_tokens",
+    "cache_creation_input_token_cost_flex",
+    "cache_creation_input_token_cost_priority",
+    "cache_creation_input_token_cost_above_272k_tokens_priority",
+    "output_cost_per_token",
+    "output_cost_per_token_above_272k_tokens",
+    "output_cost_per_token_batches",
+    "output_cost_per_token_flex",
+    "output_cost_per_token_priority",
+    "output_cost_per_token_above_272k_tokens_priority",
+)
+
+
+def extract_online_price_details(payload: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(payload, dict):
+        return {}
+    prices: dict[str, dict[str, float]] = {}
+    for raw_name, row in payload.items():
+        if not isinstance(row, dict):
+            continue
+        provider = str(row.get("litellm_provider") or "").strip().lower()
+        if provider and provider not in {"openai", "anthropic"}:
+            continue
+        detail: dict[str, float] = {}
+        for field_name in ONLINE_TOKEN_COST_FIELDS:
+            try:
+                value = float(row.get(field_name) or 0) * 1_000_000
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                detail[field_name] = value
+        if detail.get("input_cost_per_token", 0) <= 0 or detail.get("output_cost_per_token", 0) <= 0:
+            continue
+        name = str(raw_name or "").strip().lower()
+        if not name:
+            continue
+        prices[name] = detail
+        if name.startswith(("openai/", "anthropic/")):
+            prices.setdefault(name.split("/", 1)[1], detail)
+    return prices
+
+
+def extract_online_price_table(payload: Any) -> dict[str, tuple[float, float, float]]:
+    return {
+        name: (
+            detail["input_cost_per_token"],
+            detail.get("cache_read_input_token_cost", detail["input_cost_per_token"]),
+            detail["output_cost_per_token"],
+        )
+        for name, detail in extract_online_price_details(payload).items()
+    }
+
+
+def load_online_price_table() -> dict[str, tuple[float, float, float]]:
+    global _ONLINE_PRICE_TABLE, _ONLINE_PRICE_DETAILS
+    if _ONLINE_PRICE_TABLE is not None and _ONLINE_PRICE_DETAILS is not None:
+        return _ONLINE_PRICE_TABLE
+
+    cached: dict[str, Any] = {}
+    try:
+        cached = json.loads(MODEL_PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    cached_details = extract_online_price_details(cached.get("models"))
+    cached_prices = {
+        name: (
+            detail["input_cost_per_token"],
+            detail.get("cache_read_input_token_cost", detail["input_cost_per_token"]),
+            detail["output_cost_per_token"],
+        )
+        for name, detail in cached_details.items()
+    }
+    try:
+        fetched_at = float(cached.get("fetched_at") or 0)
+    except (TypeError, ValueError):
+        fetched_at = 0.0
+    now_timestamp = datetime.now().timestamp()
+    if int(cached.get("schema") or 0) >= 2 and cached_prices and 0 <= now_timestamp - fetched_at < MODEL_PRICE_CACHE_SECONDS:
+        _ONLINE_PRICE_DETAILS = cached_details
+        _ONLINE_PRICE_TABLE = cached_prices
+        return _ONLINE_PRICE_TABLE
+
+    try:
+        req = request.Request(
+            MODEL_PRICE_SOURCE_URL,
+            headers={"User-Agent": "token-floating-monitor/1.0"},
+        )
+        with request.urlopen(req, timeout=MODEL_PRICE_FETCH_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        online_details = extract_online_price_details(payload)
+        if online_details:
+            online_prices = {
+                name: (
+                    detail["input_cost_per_token"],
+                    detail.get("cache_read_input_token_cost", detail["input_cost_per_token"]),
+                    detail["output_cost_per_token"],
+                )
+                for name, detail in online_details.items()
+            }
+            cache_models = {
+                name: {field_name: value / 1_000_000 for field_name, value in detail.items()}
+                for name, detail in online_details.items()
+            }
+            write_json_atomic(
+                MODEL_PRICE_CACHE_PATH,
+                {
+                    "schema": 2,
+                    "source": MODEL_PRICE_SOURCE_URL,
+                    "fetched_at": now_timestamp,
+                    "models": cache_models,
+                },
+            )
+            _ONLINE_PRICE_DETAILS = online_details
+            _ONLINE_PRICE_TABLE = online_prices
+            return _ONLINE_PRICE_TABLE
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    _ONLINE_PRICE_DETAILS = cached_details
+    _ONLINE_PRICE_TABLE = cached_prices
+    return _ONLINE_PRICE_TABLE
+
+
+def online_model_price(model: str) -> tuple[float, float, float] | None:
+    name = (model or "").strip().lower()
+    if not name:
+        return None
+    prices = load_online_price_table()
+    for candidate in (name, name.split("/", 1)[-1]):
+        price = prices.get(candidate)
+        if price:
+            return price
+    return None
+
+
+def online_model_price_details(model: str) -> dict[str, float] | None:
+    name = (model or "").strip().lower()
+    if not name:
+        return None
+    load_online_price_table()
+    details = _ONLINE_PRICE_DETAILS or {}
+    for candidate in (name, name.split("/", 1)[-1]):
+        detail = details.get(candidate)
+        if detail:
+            return detail
+    return None
+
+
 def model_price(model: str) -> tuple[float, float, float]:
     name = (model or "").lower()
     for needle, price in PRICE_PER_MILLION:
         if needle in name:
             return price
+    online_price = online_model_price(name)
+    if online_price is not None:
+        return online_price
+    if re.search(r"\bgpt-5(?:\.|\b)", name):
+        return next(price for needle, price in PRICE_PER_MILLION if needle == "gpt-5.5")
     return (0.0, 0.0, 0.0)
 
 
-def estimate_cost(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
+def local_model_price_details(model: str) -> dict[str, float]:
     input_price, cache_price, output_price = model_price(model)
+    multiplier = max(1.0, CODEX_FAST_COST_MULTIPLIER)
+    return {
+        "input_cost_per_token": input_price,
+        "cache_read_input_token_cost": cache_price,
+        "cache_creation_input_token_cost": input_price,
+        "output_cost_per_token": output_price,
+        "input_cost_per_token_priority": input_price * multiplier,
+        "cache_read_input_token_cost_priority": cache_price * multiplier,
+        "cache_creation_input_token_cost_priority": input_price * multiplier,
+        "output_cost_per_token_priority": output_price * multiplier,
+    }
+
+
+def normalize_pricing_tier(value: Any) -> str:
+    tier = str(value or "").strip().lower()
+    if tier in {"priority", "fast", "quick", "turbo"}:
+        return "priority"
+    if tier in {"flex", "batch", "batches"}:
+        return "batch" if tier in {"batch", "batches"} else "flex"
+    return "standard"
+
+
+def token_price_for_request(profile: dict[str, float], base_field: str, tier: str, above_272k: bool) -> float:
+    tier_suffix = {"priority": "priority", "flex": "flex", "batch": "batches"}.get(tier, "")
+    if above_272k and tier_suffix:
+        combined = profile.get(f"{base_field}_above_272k_tokens_{tier_suffix}")
+        if combined:
+            return combined
+    if tier_suffix:
+        tier_price = profile.get(f"{base_field}_{tier_suffix}")
+        if tier_price:
+            return tier_price
+    if above_272k:
+        long_context_price = profile.get(f"{base_field}_above_272k_tokens")
+        if long_context_price:
+            return long_context_price
+    return float(profile.get(base_field) or 0)
+
+
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int = 0,
+    pricing_tier: str = "standard",
+) -> float:
+    profile = online_model_price_details(model) or local_model_price_details(model)
+    tier = normalize_pricing_tier(pricing_tier)
+    input_count = max(0, input_tokens)
+    cached_count = max(0, cached_tokens)
+    cache_creation_count = max(0, cache_creation_tokens)
+    output_count = max(0, output_tokens)
+    above_272k = input_count + cached_count + cache_creation_count > 272_000
+    input_price = token_price_for_request(profile, "input_cost_per_token", tier, above_272k)
+    cache_price = token_price_for_request(profile, "cache_read_input_token_cost", tier, above_272k)
+    cache_creation_price = token_price_for_request(profile, "cache_creation_input_token_cost", tier, above_272k)
+    output_price = token_price_for_request(profile, "output_cost_per_token", tier, above_272k)
+    if cache_price <= 0:
+        cache_price = input_price
+    if cache_creation_price <= 0:
+        cache_creation_price = input_price
     return (
-        max(0, input_tokens) * input_price
-        + max(0, cached_tokens) * cache_price
-        + max(0, output_tokens) * output_price
+        input_count * input_price
+        + cached_count * cache_price
+        + cache_creation_count * cache_creation_price
+        + output_count * output_price
     ) / 1_000_000
 
 
@@ -224,8 +481,10 @@ def speed_badge(cost_multiplier: float | None) -> str:
 
 def codex_service_tier_to_speed(service_tier: Any) -> str:
     tier = str(service_tier or "").strip().lower()
-    if tier in {"priority", "fast", "flex"}:
+    if tier in {"priority", "fast"}:
         return "fast"
+    if tier in {"flex", "batch", "batches"}:
+        return "batch" if tier in {"batch", "batches"} else "flex"
     if tier in {"standard"}:
         return "standard"
     if tier in {"default", "auto", "none", "null", ""}:
@@ -233,11 +492,15 @@ def codex_service_tier_to_speed(service_tier: Any) -> str:
     return ""
 
 
-def codex_internal_service_tier_speed(text: str) -> str:
+def codex_internal_service_tier(text: str) -> str:
     match = INTERNAL_SERVICE_TIER_RE.search(text or "")
     if not match:
         return ""
-    return codex_service_tier_to_speed(match.group("tier"))
+    return normalize_pricing_tier(match.group("tier"))
+
+
+def codex_internal_service_tier_speed(text: str) -> str:
+    return codex_service_tier_to_speed(codex_internal_service_tier(text))
 
 
 def codex_log_request_key(text: str, response: dict[str, Any] | None = None) -> str:
@@ -316,7 +579,8 @@ def add_codex_usage(
     bucket.cached_input_tokens += cached_input
     bucket.output_tokens += output
     multiplier = max(1.0, cost_multiplier)
-    bucket.cost += estimate_cost(model, uncached_input, cached_input, output) * multiplier
+    pricing_tier = "priority" if multiplier > 1 else "standard"
+    bucket.cost += estimate_cost(model, uncached_input, cached_input, output, pricing_tier=pricing_tier)
     bucket.add_model(model, total)
     bucket.mark_latest(when, model, "fast" if multiplier > 1 else "", multiplier)
 
@@ -333,6 +597,7 @@ def make_codex_event(
     request_key: str = "",
     route: str = "",
     request_at: datetime | None = None,
+    pricing_tier: str = "",
 ) -> UsageEvent | None:
     if when is None:
         return None
@@ -350,6 +615,7 @@ def make_codex_event(
         output_tokens=output,
         app_speed=normalize_codex_speed(app_speed),
         cost_multiplier=cost_multiplier,
+        pricing_tier=normalize_pricing_tier(pricing_tier or app_speed),
         session_id=str(session_id or "").strip(),
         request_key=str(request_key or "").strip(),
         route=str(route or "").strip().lower(),
@@ -357,20 +623,29 @@ def make_codex_event(
     )
 
 
-def add_codex_event_to_bucket(bucket: UsageBucket, event: UsageEvent, cost_multiplier: float = 1.0) -> None:
+def add_codex_event_to_bucket(
+    bucket: UsageBucket,
+    event: UsageEvent,
+    cost_multiplier: float = 1.0,
+    bucket_time: datetime | None = None,
+) -> None:
     effective_multiplier = event.cost_multiplier if event.cost_multiplier is not None else cost_multiplier
     effective_multiplier = max(1.0, float(effective_multiplier or 1.0))
     bucket.requests += 1
     bucket.input_tokens += event.input_tokens
     bucket.cached_input_tokens += event.cached_tokens
     bucket.output_tokens += event.output_tokens
-    bucket.cost += (
-        estimate_cost(event.model, event.input_tokens, event.cached_tokens, event.output_tokens)
-        * effective_multiplier
+    pricing_tier = event.pricing_tier or ("priority" if effective_multiplier > 1 else "standard")
+    bucket.cost += estimate_cost(
+        event.model,
+        event.input_tokens,
+        event.cached_tokens,
+        event.output_tokens,
+        pricing_tier=pricing_tier,
     )
     bucket.add_model(event.model, event.total_tokens)
     event_speed = event.app_speed or ("fast" if effective_multiplier > 1 else "")
-    bucket.mark_latest(event.when, event.model, event_speed, effective_multiplier)
+    bucket.mark_latest(bucket_time or event.when, event.model, event_speed, effective_multiplier)
 
 
 def add_bucket(target: UsageBucket, source: UsageBucket) -> None:
@@ -458,7 +733,8 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
     if input_tokens <= 0 and cached_tokens <= 0 and output_tokens <= 0:
         return None
     when = parse_dt(fields.get("event.timestamp")) or epoch_to_local_datetime(ts)
-    app_speed = codex_service_tier_to_speed(fields.get("service_tier"))
+    pricing_tier = normalize_pricing_tier(fields.get("service_tier"))
+    app_speed = codex_service_tier_to_speed(pricing_tier)
     multiplier = codex_speed_cost_multiplier(app_speed) if app_speed else None
     request_key = codex_log_request_key(text)
     ids = codex_log_ids(text)
@@ -475,6 +751,7 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
         request_key=request_key or session_id,
         route=detect_codex_route(text),
         request_at=when,
+        pricing_tier=pricing_tier,
     )
 
 
@@ -754,6 +1031,7 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
     events: list[UsageEvent] = []
     seen_response_ids: set[str] = set()
     speed_by_request: dict[str, str] = {}
+    tier_by_request: dict[str, str] = {}
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         rows = con.execute(
@@ -777,9 +1055,12 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
     for ts, body in rows:
         text = str(body or "")
         request_key = codex_log_request_key(text)
-        internal_speed = codex_internal_service_tier_speed(text)
+        internal_tier = codex_internal_service_tier(text)
+        internal_speed = codex_service_tier_to_speed(internal_tier)
         if request_key and internal_speed:
             speed_by_request[request_key] = internal_speed
+        if request_key and internal_tier:
+            tier_by_request[request_key] = internal_tier
         message = parse_json_after_marker(text, marker)
         if message is None:
             event = codex_event_from_log_fields(text, ts)
@@ -788,6 +1069,8 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
                 if event_key and event_key in speed_by_request:
                     event.app_speed = speed_by_request[event_key]
                     event.cost_multiplier = codex_speed_cost_multiplier(event.app_speed)
+                if event_key and event_key in tier_by_request:
+                    event.pricing_tier = tier_by_request[event_key]
             if event is not None:
                 events.append(event)
             continue
@@ -798,6 +1081,8 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
                 if event_key and event_key in speed_by_request:
                     event.app_speed = speed_by_request[event_key]
                     event.cost_multiplier = codex_speed_cost_multiplier(event.app_speed)
+                if event_key and event_key in tier_by_request:
+                    event.pricing_tier = tier_by_request[event_key]
             if event is not None:
                 events.append(event)
             continue
@@ -826,6 +1111,9 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
             app_speed = speed_by_request.get(response_key, "")
         if not app_speed:
             app_speed = codex_service_tier_to_speed(response.get("service_tier"))
+        pricing_tier = internal_tier or tier_by_request.get(response_key, "")
+        if not pricing_tier:
+            pricing_tier = normalize_pricing_tier(response.get("service_tier") or app_speed)
         multiplier = codex_speed_cost_multiplier(app_speed) if app_speed else None
         if when is None or when < start or when >= end:
             continue
@@ -840,6 +1128,7 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
             session_id=session_id,
             request_key=response_key or session_id,
             route=detect_codex_route(text),
+            pricing_tier=pricing_tier,
         )
         if event is None:
             continue
@@ -1267,6 +1556,8 @@ def codex_config_service_tier_speed(config_path: Path) -> str:
         tier = value.split("#", 1)[0].strip().strip('"').strip("'").lower()
         if tier in {"priority", "fast"}:
             return "fast"
+        if tier in {"flex", "batch", "batches"}:
+            return "batch" if tier in {"batch", "batches"} else "flex"
         if tier in {"standard", "default", "auto", "none", "null", ""}:
             return "standard"
     return "standard"
@@ -1295,6 +1586,8 @@ def codex_service_tier_speed(home: Path) -> str:
             tier = str(state.get("default-service-tier") or "").strip().lower()
             if tier in {"priority", "fast"}:
                 return "fast"
+            if tier in {"flex", "batch", "batches"}:
+                return "batch" if tier in {"batch", "batches"} else "flex"
             if tier in {"standard", "default", "auto", "none", "null", ""}:
                 return "standard"
     return ""
@@ -1390,13 +1683,14 @@ def codex_speed_at(markers: list[SpeedMarker], when: datetime | None) -> str:
 
 def apply_codex_speed_fallback(events: list[UsageEvent], markers: list[SpeedMarker]) -> None:
     for event in events:
-        if event.cost_multiplier is not None:
+        if event.cost_multiplier is not None and event.pricing_tier:
             continue
         speed = codex_speed_at(markers, event.when)
         if not speed:
             continue
         event.app_speed = speed
         event.cost_multiplier = codex_speed_cost_multiplier(speed)
+        event.pricing_tier = normalize_pricing_tier(speed)
 
 
 def account_speed_override(
@@ -1596,10 +1890,15 @@ def add_cockpit_usage_to_bucket(
         cost = float(estimated_cost_usd or 0)
     except (TypeError, ValueError):
         cost = 0.0
-    if cost <= 0:
-        cost = estimate_cost(model, max(0, input_tokens - cached_tokens), cached_tokens, output_tokens)
     multiplier = max(1.0, cost_multiplier)
-    bucket.cost += cost * multiplier
+    calculated_cost = estimate_cost(
+        model,
+        max(0, input_tokens - cached_tokens),
+        cached_tokens,
+        output_tokens,
+        pricing_tier="priority" if multiplier > 1 else "standard",
+    )
+    bucket.cost += calculated_cost if calculated_cost > 0 else cost * multiplier
     bucket.add_model(model, event_total)
     bucket.mark_latest(ms_to_local_datetime(timestamp), model, app_speed, multiplier)
     return True
@@ -1828,7 +2127,8 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 account_id,
                 email,
                 api_key_label,
-                model_id
+                model_id,
+                total_tokens
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
             ORDER BY timestamp ASC
@@ -1840,14 +2140,22 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
         return []
 
     markers: list[AccountMarker] = []
-    for timestamp, account_id, email, api_key_label, model in rows:
+    for timestamp, account_id, email, api_key_label, model, total_tokens in rows:
         when = ms_to_local_datetime(timestamp)
         if when is None:
             continue
         label = cockpit_account_label(str(account_id or ""), str(email or ""), str(api_key_label or ""))
         if label == "Codex local - Unknown":
             continue
-        markers.append(AccountMarker(when=when, label=label, model=codex_model_name(str(model or "codex")), kind="request"))
+        markers.append(
+            AccountMarker(
+                when=when,
+                label=label,
+                model=codex_model_name(str(model or "codex")),
+                kind="request",
+                total_tokens=max(0, int(total_tokens or 0)),
+            )
+        )
     return markers
 
 
@@ -1933,6 +2241,28 @@ def attribute_codex_events_to_account_markers(
         for event in account_events:
             add_codex_event_to_bucket(bucket, event, multiplier)
     return buckets
+
+
+def merge_codex_account_fallback_events(
+    codex_accounts: dict[str, UsageBucket],
+    attributed_events: dict[str, list[UsageEvent]],
+    cost_multiplier_by_label: dict[str, float] | None = None,
+    direct_latest: dict[str, datetime] | None = None,
+) -> None:
+    multipliers = cost_multiplier_by_label or {}
+    latest_markers = direct_latest or {}
+    for label, account_events in attributed_events.items():
+        direct_bucket = codex_accounts.get(label)
+        cutoff = direct_bucket.latest_at if direct_bucket and direct_bucket.latest_at is not None else latest_markers.get(label)
+        filtered = UsageBucket()
+        multiplier = float(multipliers.get(label) or 1.0)
+        for event in account_events:
+            event_time = usage_event_attribution_time(event)
+            if cutoff is not None and event_time <= cutoff + timedelta(seconds=2):
+                continue
+            add_codex_event_to_bucket(filtered, event, multiplier, bucket_time=event_time)
+        if filtered.requests or filtered.total_tokens or filtered.cost:
+            add_bucket(codex_accounts.setdefault(label, UsageBucket()), filtered)
 
 
 def latest_marker_by_label(markers: list[AccountMarker]) -> dict[str, datetime]:
@@ -2062,7 +2392,13 @@ def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
             bucket.output_tokens += output_tokens
             bucket.cache_creation_input_tokens += cache_creation
             bucket.cache_read_input_tokens += cache_read
-            bucket.cost += estimate_cost(model, input_tokens + cache_creation, cache_read, output_tokens)
+            bucket.cost += estimate_cost(
+                model,
+                input_tokens,
+                cache_read,
+                output_tokens,
+                cache_creation_tokens=cache_creation,
+            )
             bucket.add_model(model, total)
             bucket.mark_latest(ts, model)
     return bucket
@@ -2103,7 +2439,13 @@ def scan_claude_hourly(root: Path, start: datetime, end: datetime) -> list[dict[
             bucket = buckets[max(0, min(23, ts.hour))]
             bucket["requests"] += 1
             bucket["tokens"] += total
-            bucket["cost"] += estimate_cost(model, input_tokens + cache_creation, cache_read, output_tokens)
+            bucket["cost"] += estimate_cost(
+                model,
+                input_tokens,
+                cache_read,
+                output_tokens,
+                cache_creation_tokens=cache_creation,
+            )
     for bucket in buckets:
         bucket["cost"] = round(float(bucket["cost"] or 0), 6)
     return buckets
@@ -2120,7 +2462,14 @@ def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
         bucket["requests"] += 1
         bucket["tokens"] += event.total_tokens
         multiplier = event.cost_multiplier if event.cost_multiplier is not None else 1.0
-        bucket["cost"] += estimate_cost(event.model, event.input_tokens, event.cached_tokens, event.output_tokens) * max(1.0, float(multiplier or 1.0))
+        pricing_tier = event.pricing_tier or ("priority" if float(multiplier or 1.0) > 1 else "standard")
+        bucket["cost"] += estimate_cost(
+            event.model,
+            event.input_tokens,
+            event.cached_tokens,
+            event.output_tokens,
+            pricing_tier=pricing_tier,
+        )
     for bucket in buckets:
         bucket["cost"] = round(float(bucket["cost"] or 0), 6)
     return buckets
@@ -2150,6 +2499,103 @@ def latest_at_text(bucket: UsageBucket) -> str:
     return bucket.latest_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
 
 
+def latest_request_from_attributed_events(
+    attributed: dict[str, list[UsageEvent]],
+    account_markers: list[AccountMarker] | None = None,
+) -> dict[str, Any]:
+    latest_label = ""
+    latest_event: UsageEvent | None = None
+    for label, events in attributed.items():
+        for event in events:
+            if latest_event is None or event.when > latest_event.when:
+                latest_label = label
+                latest_event = event
+            elif latest_event is not None and event.when == latest_event.when:
+                if "@" in label and "@" not in latest_label:
+                    latest_label = label
+                    latest_event = event
+    if latest_event is None:
+        return {}
+    if is_api_service_mirror_label(latest_label):
+        latest_label = concrete_api_service_account_label(latest_event, account_markers or []) or API_SERVICE_AGGREGATE_LABEL
+    return {
+        "provider": latest_label,
+        "model": latest_event.model,
+        "created_at": latest_event.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+        "kind": "success",
+    }
+
+
+def is_api_service_mirror_label(label: str) -> bool:
+    name = str(label or "").strip().lower()
+    if name.startswith("codex local - "):
+        name = name[len("codex local - "):].strip()
+    return name in API_SERVICE_MIRROR_LABELS
+
+
+def concrete_api_service_account_label(event: UsageEvent, markers: list[AccountMarker]) -> str:
+    event_time = usage_event_attribution_time(event)
+    candidates = [
+        marker
+        for marker in markers
+        if marker.kind == "request"
+        and marker.total_tokens == event.total_tokens
+        and abs((marker.when - event_time).total_seconds()) <= API_SERVICE_ACTIVITY_MATCH_SECONDS
+    ]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda marker: abs((marker.when - event_time).total_seconds())).label
+
+
+def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, Any]:
+    providers = output.get("providers")
+    if not isinstance(providers, list):
+        return {}
+    mirrors = [
+        provider
+        for provider in providers
+        if isinstance(provider, dict) and is_api_service_mirror_label(str(provider.get("name") or ""))
+    ]
+    if not mirrors:
+        return {}
+    latest = max(mirrors, key=lambda row: parse_dt(row.get("latest_at")) or datetime.min)
+    aggregate = {
+        "name": API_SERVICE_AGGREGATE_LABEL,
+        "requests": sum(int(row.get("requests") or 0) for row in mirrors),
+        "tokens": sum(int(row.get("tokens") or 0) for row in mirrors),
+        "input_tokens": sum(int(row.get("input_tokens") or 0) for row in mirrors),
+        "cached_input_tokens": sum(int(row.get("cached_input_tokens") or 0) for row in mirrors),
+        "cache_creation_input_tokens": sum(int(row.get("cache_creation_input_tokens") or 0) for row in mirrors),
+        "output_tokens": sum(int(row.get("output_tokens") or 0) for row in mirrors),
+        "cost": round(sum(float(row.get("cost") or 0) for row in mirrors), 6),
+        "models": {},
+        "latest_at": str(latest.get("latest_at") or ""),
+        "latest_model": str(latest.get("latest_model") or ""),
+        "recent_active": sum(int(row.get("recent_active") or 0) for row in mirrors),
+        "recent_sessions": sum(int(row.get("recent_sessions") or 0) for row in mirrors),
+        "show_zero": False,
+        "is_api_service_aggregate": True,
+    }
+    for row in mirrors:
+        models = row.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model, tokens in models.items():
+            aggregate["models"][str(model)] = aggregate["models"].get(str(model), 0) + int(tokens or 0)
+    providers[:] = [
+        provider
+        for provider in providers
+        if not (isinstance(provider, dict) and is_api_service_mirror_label(str(provider.get("name") or "")))
+    ] + [aggregate]
+    output["api_service_aggregate"] = {
+        "requests": aggregate["requests"],
+        "tokens": aggregate["tokens"],
+        "cost": aggregate["cost"],
+    }
+    output.pop("api_service_mirror_deduction", None)
+    return aggregate
+
+
 def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day: date) -> None:
     """Keep same-day local totals monotonic across account switches.
 
@@ -2165,6 +2611,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         return
     if str(existing.get("date") or "") != day.isoformat():
         return
+    collapse_api_service_mirror_providers(existing)
+    current_api_aggregate = output.get("api_service_aggregate")
 
     def tokens_of(row: Any) -> int:
         if not isinstance(row, dict):
@@ -2177,6 +2625,10 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     def merge_cumulative(current: dict[str, Any], previous: dict[str, Any]) -> None:
         if tokens_of(previous) <= tokens_of(current):
             return
+        current_latest_dt = latest_time(current)
+        previous_latest_dt = latest_time(previous)
+        current_latest_at = current.get("latest_at")
+        current_latest_model = current.get("latest_model")
         for key in (
             "requests",
             "tokens",
@@ -2192,6 +2644,10 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         ):
             if key in previous:
                 current[key] = previous[key]
+        if current_latest_dt is not None and (previous_latest_dt is None or current_latest_dt >= previous_latest_dt):
+            current["latest_at"] = current_latest_at
+            if current_latest_model:
+                current["latest_model"] = current_latest_model
 
     def latest_time(row: Any) -> datetime | None:
         if not isinstance(row, dict):
@@ -2239,10 +2695,11 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
 
     existing_today = existing.get("today")
     current_today = output.get("today")
-    if isinstance(existing_today, dict) and isinstance(current_today, dict):
+    if not current_api_aggregate and isinstance(existing_today, dict) and isinstance(current_today, dict):
         merge_cumulative(current_today, existing_today)
     merge_latest_request()
-    merge_hourly_today()
+    if not current_api_aggregate:
+        merge_hourly_today()
     if "account_30d_updated_at" not in output and existing.get("account_30d_updated_at"):
         output["account_30d_updated_at"] = existing["account_30d_updated_at"]
 
@@ -2262,6 +2719,10 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         if not name:
             continue
         current = current_by_name.get(name)
+        if current_api_aggregate:
+            if current is not None and "window_30d" not in current and isinstance(previous.get("window_30d"), dict):
+                current["window_30d"] = dict(previous["window_30d"])
+            continue
         if current is None:
             recovered = dict(previous)
             for window_key in ("window_5h", "window_7d", "window_cycle"):
@@ -2287,6 +2748,85 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         current_today["cache_creation_input_tokens"] = sum(int(provider.get("cache_creation_input_tokens") or 0) for provider in provider_totals)
         current_today["output_tokens"] = sum(int(provider.get("output_tokens") or 0) for provider in provider_totals)
         current_today["cost"] = round(sum(float(provider.get("cost") or 0) for provider in provider_totals), 6)
+
+
+def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
+    if output.get("api_service_aggregate"):
+        return
+    try:
+        history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    days = history.get("days") if isinstance(history, dict) else None
+    row = days.get(day.isoformat()) if isinstance(days, dict) else None
+    today = output.get("today")
+    if not isinstance(row, dict) or not isinstance(today, dict):
+        return
+    row = dict(row)
+    try:
+        history_tokens = int(row.get("tokens") or 0)
+        current_tokens = int(today.get("tokens") or 0)
+    except (TypeError, ValueError):
+        return
+    if history_tokens <= current_tokens:
+        return
+    providers = output.get("providers")
+    for key in (
+        "requests",
+        "tokens",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+        "cost",
+    ):
+        if key in row:
+            today[key] = row[key]
+    if not isinstance(providers, list):
+        return
+    add_unattributed_provider_gap(output)
+
+
+def add_unattributed_provider_gap(output: dict[str, Any]) -> None:
+    today = output.get("today")
+    providers = output.get("providers")
+    if not isinstance(today, dict) or not isinstance(providers, list):
+        return
+    normal_providers = [
+        provider
+        for provider in providers
+        if isinstance(provider, dict)
+        and str(provider.get("name") or "") != HIGH_WATER_UNATTRIBUTED_LABEL
+    ]
+
+    def provider_sum(key: str) -> float:
+        total = 0.0
+        for provider in normal_providers:
+            try:
+                total += float(provider.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    delta_tokens = int(today.get("tokens") or 0) - int(provider_sum("tokens"))
+    if delta_tokens <= 0:
+        providers[:] = normal_providers
+        return
+    delta = {
+        "name": HIGH_WATER_UNATTRIBUTED_LABEL,
+        "requests": max(0, int(today.get("requests") or 0) - int(provider_sum("requests"))),
+        "tokens": delta_tokens,
+        "input_tokens": max(0, int(today.get("input_tokens") or 0) - int(provider_sum("input_tokens"))),
+        "cached_input_tokens": max(0, int(today.get("cached_input_tokens") or 0) - int(provider_sum("cached_input_tokens"))),
+        "cache_creation_input_tokens": max(0, int(today.get("cache_creation_input_tokens") or 0) - int(provider_sum("cache_creation_input_tokens"))),
+        "output_tokens": max(0, int(today.get("output_tokens") or 0) - int(provider_sum("output_tokens"))),
+        "cost": round(max(0.0, float(today.get("cost") or 0) - provider_sum("cost")), 6),
+        "models": {},
+        "latest_at": str(today.get("latest_at") or ""),
+        "latest_model": str(today.get("latest_model") or ""),
+        "show_zero": False,
+    }
+    providers[:] = normal_providers + [delta]
 
 
 def bucket_to_dict(name: str, bucket: UsageBucket, show_zero: bool = False) -> dict[str, Any]:
@@ -2596,13 +3136,17 @@ def main() -> int:
     codex_events = scan_all_codex_events(home, codex_sessions_root, start, end)
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)
-    codex_jsonl = bucket_from_codex_events(codex_events)
-    codex_accounts = scan_cockpit_codex_accounts(home, start, end)
     markers = scan_cockpit_codex_switch_markers(home, start, end)
     markers.extend(load_account_timeline())
     account_markers = scan_cockpit_codex_account_markers(home, start, end)
     markers.extend(account_markers)
-    direct_latest = latest_marker_by_label(account_markers)
+    attributed_events = attribute_codex_events_by_account(
+        codex_events,
+        markers,
+        attribution_ledger,
+        current_label,
+        now,
+    )
     attributed = attribute_codex_events_to_account_markers(
         codex_events,
         markers,
@@ -2611,36 +3155,13 @@ def main() -> int:
         current_label,
         now,
     )
-    if codex_accounts:
-        for label, bucket in attributed.items():
-            cutoff = direct_latest.get(label)
-            filtered = UsageBucket()
-            for event in attribute_codex_events_by_account(codex_events, markers, attribution_ledger, current_label, now).get(label, []):
-                if cutoff is not None and event.when <= cutoff + timedelta(seconds=2):
-                    continue
-                add_codex_event_to_bucket(
-                    filtered,
-                    event,
-                    float(cost_multiplier_by_label.get(label) or 1.0),
-                )
-            if filtered.requests or filtered.total_tokens or filtered.cost:
-                add_bucket(codex_accounts.setdefault(label, UsageBucket()), filtered)
     codex = UsageBucket()
-    for bucket in codex_accounts.values():
+    for bucket in attributed.values():
         add_bucket(codex, bucket)
-    if codex.total_tokens <= 0 and codex.requests <= 0:
-        codex = UsageBucket()
-        for bucket in attributed.values():
-            add_bucket(codex, bucket)
-        codex_provider_buckets = sorted(
-            attributed.items(),
-            key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
-        )
-    else:
-        codex_provider_buckets = sorted(
-            codex_accounts.items(),
-            key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
-        )
+    codex_provider_buckets = sorted(
+        attributed.items(),
+        key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
+    )
     codex_provider_map = {name: bucket for name, bucket in codex_provider_buckets}
     for label in all_cockpit_codex_account_labels(home):
         codex_provider_map.setdefault(label, UsageBucket())
@@ -2680,16 +3201,13 @@ def main() -> int:
     recent_active_by_label: dict[str, int] = {}
     recent_sessions_by_label: dict[str, int] = {}
     recent_latest_by_session: dict[str, tuple[str, UsageEvent]] = {}
-    recent_events_by_label = attribute_codex_events_by_account(
-        codex_events,
-        markers,
-        attribution_ledger,
-        current_label,
-        now,
-    )
+    recent_events_by_label = attributed_events
     for label, account_events in recent_events_by_label.items():
         recent_events = [event for event in account_events if event.when >= recent_cutoff]
         for event in recent_events:
+            activity_label = label
+            if is_api_service_mirror_label(activity_label):
+                activity_label = concrete_api_service_account_label(event, account_markers) or API_SERVICE_AGGREGATE_LABEL
             session_id = event.session_id or event.request_key or codex_event_id(event)
             previous = recent_latest_by_session.get(session_id)
             if (
@@ -2697,11 +3215,11 @@ def main() -> int:
                 or event.when > previous[1].when
                 or (
                     event.when == previous[1].when
-                    and "@" in label
+                    and "@" in activity_label
                     and "@" not in previous[0]
                 )
             ):
-                recent_latest_by_session[session_id] = (label, event)
+                recent_latest_by_session[session_id] = (activity_label, event)
     active_sessions = []
     for session_id, (label, event) in recent_latest_by_session.items():
         recent_active_by_label[label] = recent_active_by_label.get(label, 0) + 1
@@ -2746,7 +3264,14 @@ def main() -> int:
     latest_model = ""
     latest_at = ""
     latest_dt: datetime | None = None
-    latest_candidates = list(codex_provider_buckets) + [("Claude local", claude)]
+    codex_latest_request = latest_request_from_attributed_events(attributed_events, account_markers)
+    latest_candidates = [("Claude local", claude)]
+    codex_latest_at = parse_dt(codex_latest_request.get("created_at"))
+    if codex_latest_at is not None:
+        latest_dt = codex_latest_at
+        latest_provider = str(codex_latest_request.get("provider") or "")
+        latest_model = str(codex_latest_request.get("model") or "")
+        latest_at = str(codex_latest_request.get("created_at") or "")
     for provider_name, bucket in latest_candidates:
         if bucket.latest_at is None:
             continue
@@ -2755,6 +3280,30 @@ def main() -> int:
             latest_provider = provider_name
             latest_model = bucket.latest_model
             latest_at = latest_at_text(bucket)
+    recent_latest_request: dict[str, Any] = {}
+    if not latest_at and day == now.date() and LATEST_REQUEST_LOOKBACK_DAYS > 0:
+        lookback_start = now - timedelta(days=LATEST_REQUEST_LOOKBACK_DAYS)
+        lookback_events = scan_all_codex_events(home, codex_sessions_root, lookback_start, end)
+        if lookback_events:
+            lookback_speed_markers = codex_speed_history(home, lookback_start, end)
+            apply_codex_speed_fallback(lookback_events, lookback_speed_markers)
+            lookback_markers = scan_cockpit_codex_switch_markers(home, lookback_start, end)
+            lookback_markers.extend(scan_cockpit_codex_account_markers(home, lookback_start, end))
+            lookback_markers.extend(load_account_timeline())
+            recent_attributed = attribute_codex_events_by_account(
+                    lookback_events,
+                    lookback_markers,
+                    attribution_ledger,
+                    current_label,
+                    now,
+                )
+            recent_latest_request = latest_request_from_attributed_events(
+                recent_attributed,
+                scan_cockpit_codex_account_markers(home, lookback_start, end),
+            )
+            latest_provider = str(recent_latest_request.get("provider") or "")
+            latest_model = str(recent_latest_request.get("model") or "")
+            latest_at = str(recent_latest_request.get("created_at") or "")
 
     output = {
         "schema": 1,
@@ -2781,7 +3330,10 @@ def main() -> int:
             else cached_30d_updated_at
         )
 
+    collapse_api_service_mirror_providers(output)
     same_day_output_high_water(output, out, day)
+    restore_today_from_usage_history(output, day)
+    add_unattributed_provider_gap(output)
     write_json_atomic(out, output)
     print(json.dumps(output["today"], ensure_ascii=False))
     return 0

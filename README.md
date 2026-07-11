@@ -12,12 +12,6 @@
 
 ![账号页](assets/screenshots/accounts.png)
 
-### Token 预算
-
-展示 5h、7d、cycle 等额度窗口的剩余比例、已用比例、重置时间、待刷新状态和低余额压力。
-
-![Token 预算页](assets/screenshots/budget.png)
-
 ### 用量统计
 
 提供 `24h / 7d / 30d / All` 视图，包含 Token Chips、缓存命中率、Activity 热力图、Top Models 和 Provider 成本排行。
@@ -27,14 +21,15 @@
 ## 主要功能
 
 - 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
-- 三个中文页签：`账号`、`Token 预算`、`用量统计`。
+- 两个中文页签：`账号`、`用量统计`。
 - 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
 - 账号排行：按今日、近 5 小时、近 7 天、周期窗口查看账号用量。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
 - 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、Top Models 和 Provider 成本。
 - Activity 热力图：支持 24h、7d、30d、All time，不同强度颜色表示用量高低，鼠标悬停可查看具体值。
 - 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
-- 去重逻辑：保留 Codex fork replay 去重、Sub2API mirror 扣除、成本估算等原有统计规则。
+- 去重逻辑：保留 Codex fork replay 去重和 Sub2API mirror 扣除；Cockpit API 服务模式以去重后的
+  原始请求为权威总量，`api-service-local` / `codex_local_access_runtime` 仅合并为一个展示项，不再重复扣除。
 
 ## 运行要求
 
@@ -46,7 +41,7 @@
 
 ## 快速开始
 
-自动模式会优先读取 Sub2API，失败时回退到本地客户端日志：
+自动模式会先检测当前 Codex endpoint。只有当前账号指向 Sub2API 地址时，才读取 Sub2API 管理端数据；切回官方账号或其他 API 时，只读取本地客户端日志：
 
 ```powershell
 .\start-monitor.ps1
@@ -64,21 +59,25 @@
 python .\monitor.py
 ```
 
-## Sub2API 配置
+## 本地独立监控
 
-复制 `.env.example` 为 `.env`，填写你的本地 Sub2API 管理端配置：
+如果希望完全不碰 Sub2API，可以强制本地独立模式。这个模式只读取本机 Codex/Claude 与 Antigravity Cockpit 本地日志，不请求 Sub2API 管理接口，也不使用 Sub2API 的最近请求、账号统计或并发数据。
 
 ```env
-SUB2API_MONITOR_MODE=auto
-SUB2API_BASE_URL=http://127.0.0.1:8080
-SUB2API_ADMIN_EMAIL=admin@sub2api.local
-SUB2API_ADMIN_PASSWORD=your-password
+TOKEN_MONITOR_MODE=local-codex
 ```
 
-如果希望必须连接 Sub2API，不允许回退到本地日志：
+如果 `.env` 里写着 `SUB2API_MONITOR_MODE=auto`，程序会按“当前 endpoint 门禁”处理：当前 Codex 指向 Sub2API 才读 Sub2API，否则走本地日志。
+
+## Sub2API 兼容模式
+
+显式设置为 `sub2api` 时，悬浮窗会强制请求 Sub2API 管理端接口，适合你确认当前环境就是 Sub2API 时使用：
 
 ```env
 SUB2API_MONITOR_MODE=sub2api
+SUB2API_BASE_URL=http://127.0.0.1:8080
+SUB2API_ADMIN_EMAIL=admin@sub2api.local
+SUB2API_ADMIN_PASSWORD=your-password
 ```
 
 如果你的 Sub2API 有多个本地访问地址，可以配置匹配地址：
@@ -100,22 +99,31 @@ SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
 SUB2API_MONITOR_MODE=local-codex
 CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
+CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS=86400
 SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
 
+遇到本地价格表未收录的新模型时，导出器会从结构化在线价格源查询并写入
+`client_usage_model_prices.json`。缓存默认有效 24 小时；网络不可用或在线源未收录该模型时，
+才会使用本地模型家族价格回退。可通过 `CLIENT_USAGE_MODEL_PRICE_URL` 替换价格源。
+
+成本估算会优先使用在线价格表中的完整 Token 规则：标准、Priority、Flex、Batch、
+超过 272K 输入上下文、缓存读取、缓存写入和输出价格。日志包含 service tier 时按实际 tier
+计费；日志未提供 tier 或缓存写入明细时，只按能够观测到的字段估算，不补造缺失用量。
+
 ## 统计来源
 
 `SUB2API_MONITOR_USAGE_SOURCE` 支持：
 
-- `auto`：自动检测当前 Codex endpoint。
+- `auto`：自动检测当前 Codex endpoint，只有匹配 Sub2API 地址时才使用 Sub2API 数据。
 - `sub2api`：只使用 Sub2API 服务端统计。
 - `local`：只使用本地客户端日志。
 - `both`：同时展示 Sub2API 服务端统计和本地日志，适合对账，但可能重复计算。
 
-默认建议使用 `auto`。当 Codex 指向你的 Sub2API 地址时，主统计优先来自 Sub2API；因为客户端本身也会写本地 token 日志，默认不会把本地日志直接合并进总量，避免重复计算。
+默认建议使用 `auto` 或本地独立模式。`auto` 不会盲目依赖 Sub2API；只有当前 Codex endpoint 匹配 `SUB2API_BASE_URL` 或 `SUB2API_MATCH_BASE_URLS` 时，才会使用 Sub2API 服务端统计。
 
 ## 隐私说明
 
