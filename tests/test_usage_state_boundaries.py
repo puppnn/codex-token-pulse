@@ -1455,6 +1455,8 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(app.client.clear_calls, 1)
         app._refresh_lock.release()
+
+
 class CodexSessionModelTests(unittest.TestCase):
     def write_session(self, root: Path, name: str, rows: list[dict]) -> None:
         session_dir = root / "2026" / "07" / "12"
@@ -1554,6 +1556,157 @@ class CodexSessionModelTests(unittest.TestCase):
             )
 
         self.assertEqual([event.model for event in events], ["gpt-5.6-sol", "gpt-5.4"])
+
+    def test_only_terminal_turn_errors_are_collected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-failures.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T02:50:00",
+                        "type": "session_meta",
+                        "payload": {"id": "failure-session"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:00:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "retry-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:05:00",
+                        "type": "event_msg",
+                        "payload": {"type": "stream_error", "message": "retrying"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:06:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "retry-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:10:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "interrupted-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:11:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "turn_aborted",
+                            "turn_id": "interrupted-turn",
+                            "reason": "interrupted",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:20:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "legacy-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:21:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "error",
+                            "message": "stream disconnected",
+                            "codex_error_info": {
+                                "response_stream_disconnected": {"http_status_code": 502}
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:22:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "legacy-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:30:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "terminal-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:31:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "terminal-error",
+                            "error": {
+                                "message": "server failed",
+                                "codex_error_info": "internal_server_error",
+                            },
+                        },
+                    },
+                ],
+            )
+            failures: list[client_usage_export.CodexFailureEvent] = []
+
+            client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 2, 0),
+                datetime(2026, 7, 12, 4, 0),
+                failure_events=failures,
+            )
+
+        self.assertEqual([failure.turn_id for failure in failures], ["legacy-error", "terminal-error"])
+        self.assertEqual([failure.when.minute for failure in failures], [22, 31])
+
+    def test_error_marks_only_the_adjacent_observed_zero_hour(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3].update({"requests": 137, "tokens": 23_100_000})
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="failed-turn",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 4, 20),
+        )
+
+        self.assertTrue(hourly[4]["failure"])
+        self.assertEqual(hourly[4]["failure_count"], 1)
+        self.assertFalse(any(row.get("failure") for row in hourly[5:]))
+
+    def test_error_marker_waits_for_the_hour_and_clears_when_activity_resumes(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3]["tokens"] = 100
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="failed-turn",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 3, 59),
+        )
+        self.assertFalse(any(row.get("failure") for row in hourly))
+
+        hourly[4]["tokens"] = 50
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 30),
+        )
+        self.assertFalse(any(row.get("failure") for row in hourly))
+
+
 class AttributionLedgerTests(unittest.TestCase):
     def test_stable_event_id_wins_when_route_time_changes(self) -> None:
         event = client_usage_export.UsageEvent(

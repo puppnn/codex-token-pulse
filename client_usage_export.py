@@ -198,6 +198,13 @@ class SessionLifecycle:
 
 
 @dataclass
+class CodexFailureEvent:
+    when: datetime
+    session_id: str = ""
+    turn_id: str = ""
+
+
+@dataclass
 class AccountMarker:
     when: datetime
     label: str
@@ -570,6 +577,33 @@ def codex_model_name(model: str) -> str:
     return name
 
 
+NON_TURN_ERROR_KINDS = {"active_turn_not_steerable", "thread_rollback_failed"}
+
+
+def codex_error_kind(error: Any) -> str:
+    if not isinstance(error, dict):
+        return ""
+    info = error.get("codex_error_info")
+    if isinstance(info, str):
+        return re.sub(r"[^a-z0-9]+", "_", info.lower()).strip("_")
+    if not isinstance(info, dict):
+        return ""
+    for key in ("type", "kind", "code"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    if len(info) == 1:
+        value = str(next(iter(info))).strip()
+        return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return ""
+
+
+def codex_error_affects_turn(error: Any) -> bool:
+    if not error:
+        return False
+    return codex_error_kind(error) not in NON_TURN_ERROR_KINDS
+
+
 def usage_int(usage: dict[str, Any], key: str) -> int:
     try:
         return int(usage.get(key) or 0)
@@ -828,8 +862,11 @@ def scan_codex_events(
     start: datetime,
     end: datetime,
     session_lifecycle: dict[str, SessionLifecycle] | None = None,
+    *,
+    failure_events: list[CodexFailureEvent] | None = None,
 ) -> list[UsageEvent]:
     events: list[UsageEvent] = []
+    failures_by_turn: dict[tuple[str, str], CodexFailureEvent] = {}
     seen_events: set[tuple[str, str, int, int, int, int]] = set()
     seen_totals: set[tuple[str, int, int, int, int]] = set()
     for path in iter_recent_jsonl(root, start):
@@ -856,6 +893,8 @@ def scan_codex_events(
             session_id = str(meta_payload.get("id") or "").strip()
             break
         fork_replay_cutoff = codex_fork_replay_cutoff(lines)
+        session_key = session_id or str(path)
+        active_turn_id = ""
         for line in lines:
             try:
                 row = json.loads(line)
@@ -871,6 +910,7 @@ def scan_codex_events(
             if row_type != "event_msg":
                 continue
             payload_type = str(payload.get("type") or "")
+            event_ts = parse_dt(row.get("timestamp"))
             if (
                 session_lifecycle is not None
                 and session_id
@@ -888,11 +928,53 @@ def scan_codex_events(
                     existing_lifecycle = session_lifecycle.get(session_id)
                     if existing_lifecycle is None or candidate.when >= existing_lifecycle.when:
                         session_lifecycle[session_id] = candidate
+            if payload_type in {"task_started", "turn_started"}:
+                active_turn_id = str(payload.get("turn_id") or "").strip()
+                if not active_turn_id:
+                    active_turn_id = f"started:{row.get('timestamp') or ''}"
+                continue
+            if payload_type == "error":
+                if (
+                    active_turn_id
+                    and event_ts is not None
+                    and (fork_replay_cutoff is None or event_ts > fork_replay_cutoff)
+                    and codex_error_affects_turn(payload)
+                ):
+                    key = (session_key, active_turn_id)
+                    failures_by_turn[key] = CodexFailureEvent(
+                        when=event_ts,
+                        session_id=session_id,
+                        turn_id=active_turn_id,
+                    )
+                continue
+            if payload_type in {"task_complete", "turn_complete"}:
+                turn_id = str(payload.get("turn_id") or active_turn_id).strip()
+                key = (session_key, turn_id)
+                valid_event = (
+                    event_ts is not None
+                    and (fork_replay_cutoff is None or event_ts > fork_replay_cutoff)
+                )
+                if valid_event and codex_error_affects_turn(payload.get("error")):
+                    failures_by_turn[key] = CodexFailureEvent(
+                        when=event_ts,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                elif valid_event and key in failures_by_turn:
+                    failures_by_turn[key].when = event_ts
+                if not turn_id or turn_id == active_turn_id:
+                    active_turn_id = ""
+                continue
+            if payload_type == "turn_aborted":
+                turn_id = str(payload.get("turn_id") or active_turn_id).strip()
+                if not turn_id or turn_id == active_turn_id:
+                    active_turn_id = ""
+                continue
             if payload_type != "token_count":
                 continue
             info = payload.get("info") or {}
             total = info.get("total_token_usage") or {}
-            ts = parse_dt(row.get("timestamp"))
+            ts = event_ts
             current = {
                 "input_tokens": usage_int(total, "input_tokens"),
                 "cached_input_tokens": usage_int(total, "cached_input_tokens"),
@@ -989,6 +1071,17 @@ def scan_codex_events(
                     events.append(event)
             last_total = current
     events.sort(key=lambda event: event.when)
+    if failure_events is not None:
+        failure_events.extend(
+            sorted(
+                (
+                    failure
+                    for failure in failures_by_turn.values()
+                    if start <= failure.when < end
+                ),
+                key=lambda failure: failure.when,
+            )
+        )
     return events
 
 
@@ -1283,12 +1376,15 @@ def scan_all_codex_events(
     start: datetime,
     end: datetime,
     session_lifecycle: dict[str, SessionLifecycle] | None = None,
+    *,
+    failure_events: list[CodexFailureEvent] | None = None,
 ) -> list[UsageEvent]:
     events = scan_codex_events(
         sessions_root,
         start,
         end,
         session_lifecycle=session_lifecycle,
+        failure_events=failure_events,
     )
     events.extend(scan_codex_logs2_events(home, start, end))
     route_markers = scan_codex_route_markers(home, start, end)
@@ -2583,6 +2679,52 @@ def merge_hourly_buckets(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]
     return merged
 
 
+def mark_codex_failure_hours(
+    buckets: list[dict[str, Any]],
+    failures: list[CodexFailureEvent],
+    day: date,
+    as_of: datetime,
+) -> None:
+    by_hour = {
+        max(0, min(23, int(bucket.get("hour") or 0))): bucket
+        for bucket in buckets
+        if isinstance(bucket, dict)
+    }
+    for bucket in by_hour.values():
+        bucket.pop("failure", None)
+        bucket.pop("failure_count", None)
+        bucket.pop("failure_at", None)
+
+    if as_of.date() < day:
+        return
+    last_observed_hour = as_of.hour if as_of.date() == day else 23
+    for failure in failures:
+        if failure.when.date() != day:
+            continue
+        candidate_hour = failure.when.hour
+        candidate = by_hour.get(candidate_hour)
+        if candidate is None:
+            continue
+        if int(candidate.get("tokens") or 0) > 0:
+            candidate_hour += 1
+            candidate = by_hour.get(candidate_hour)
+        if (
+            candidate is None
+            or candidate_hour <= 0
+            or candidate_hour > last_observed_hour
+            or int(candidate.get("tokens") or 0) > 0
+        ):
+            continue
+        previous = by_hour.get(candidate_hour - 1)
+        if previous is None or int(previous.get("tokens") or 0) <= 0:
+            continue
+        candidate["failure"] = True
+        candidate["failure_count"] = int(candidate.get("failure_count") or 0) + 1
+        failure_at = failure.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        if failure_at > str(candidate.get("failure_at") or ""):
+            candidate["failure_at"] = failure_at
+
+
 def latest_at_text(bucket: UsageBucket) -> str:
     if bucket.latest_at is None:
         return ""
@@ -3129,6 +3271,17 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
                 continue
             if tokens_of(previous_row) > tokens_of(current_row):
                 current_row.update(previous_row)
+            if tokens_of(current_row) <= 0 and previous_row.get("failure"):
+                current_row["failure"] = True
+                current_row["failure_count"] = max(
+                    int(current_row.get("failure_count") or 0),
+                    int(previous_row.get("failure_count") or 0),
+                )
+                if previous_row.get("failure_at"):
+                    current_row["failure_at"] = max(
+                        str(current_row.get("failure_at") or ""),
+                        str(previous_row.get("failure_at") or ""),
+                    )
 
     existing_today = existing.get("today")
     current_today = output.get("today")
@@ -3671,12 +3824,14 @@ def main() -> int:
         for label, meta in speed_by_account.items()
     }
     session_lifecycle: dict[str, SessionLifecycle] = {}
+    codex_failures: list[CodexFailureEvent] = []
     codex_events = scan_all_codex_events(
         home,
         codex_sessions_root,
         start,
         end,
         session_lifecycle=session_lifecycle,
+        failure_events=codex_failures,
     )
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)
@@ -3731,6 +3886,7 @@ def main() -> int:
         ),
         scan_claude_hourly(claude_root, start, end),
     )
+    mark_codex_failure_hours(hourly_today, codex_failures, day, now)
     if args.include_30d and cached_30d_valid:
         expected_30d_accounts = {
             name
