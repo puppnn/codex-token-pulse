@@ -1455,8 +1455,105 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(app.client.clear_calls, 1)
         app._refresh_lock.release()
+class CodexSessionModelTests(unittest.TestCase):
+    def write_session(self, root: Path, name: str, rows: list[dict]) -> None:
+        session_dir = root / "2026" / "07" / "12"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / name).write_text(
+            "\n".join(json.dumps(row) for row in rows),
+            encoding="utf-8",
+        )
 
+    def token_count(self, timestamp: str, input_tokens: int, output_tokens: int) -> dict:
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens,
+                    },
+                },
+            },
+        }
 
+    def test_token_count_inherits_model_from_turn_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-session-1.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "session-1"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.6-sol"},
+                    },
+                    self.token_count("2026-07-12T10:01:00", 100, 10),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].model, "gpt-5.6-sol")
+
+    def test_model_switch_only_applies_to_later_token_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.token_count("2026-07-12T10:01:00", 100, 10)
+            second = self.token_count("2026-07-12T10:03:00", 200, 20)
+            second["payload"]["info"]["total_token_usage"].update(
+                {"input_tokens": 300, "output_tokens": 30}
+            )
+            self.write_session(
+                root,
+                "rollout-session-2.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "session-2"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.6-sol"},
+                    },
+                    first,
+                    {
+                        "timestamp": "2026-07-12T10:02:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.4"},
+                    },
+                    second,
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual([event.model for event in events], ["gpt-5.6-sol", "gpt-5.4"])
 class AttributionLedgerTests(unittest.TestCase):
     def test_stable_event_id_wins_when_route_time_changes(self) -> None:
         event = client_usage_export.UsageEvent(

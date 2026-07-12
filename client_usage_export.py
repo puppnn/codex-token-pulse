@@ -838,6 +838,7 @@ def scan_codex_events(
         except OSError:
             file_activity_at = None
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        current_model = CODEX_DEFAULT_MODEL
         seen: set[tuple[int, int, int, int]] = set()
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -860,9 +861,15 @@ def scan_codex_events(
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("type") != "event_msg":
-                continue
+            row_type = row.get("type")
             payload = row.get("payload") or {}
+            if row_type == "turn_context":
+                context_model = str(row.get("model") or payload.get("model") or "").strip()
+                if context_model:
+                    current_model = codex_model_name(context_model)
+                continue
+            if row_type != "event_msg":
+                continue
             payload_type = str(payload.get("type") or "")
             if (
                 session_lifecycle is not None
@@ -905,7 +912,8 @@ def scan_codex_events(
                 continue
             if ts >= end:
                 continue
-            model = codex_model_name(str(row.get("model") or payload.get("model") or "codex"))
+            explicit_model = str(row.get("model") or payload.get("model") or "").strip()
+            model = codex_model_name(explicit_model) if explicit_model else current_model
             total_key = (
                 model,
                 current["input_tokens"],
