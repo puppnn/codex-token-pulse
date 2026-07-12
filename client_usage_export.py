@@ -77,9 +77,12 @@ MODEL_PRICE_FETCH_TIMEOUT_SECONDS = float(os.environ.get("CLIENT_USAGE_MODEL_PRI
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
-API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "10"))
+API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
 CODEX_CURRENT_ACCOUNT_RECENT_SECONDS = int(os.environ.get("CLIENT_USAGE_CURRENT_ACCOUNT_RECENT_SECONDS", "1800"))
-CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "300"))
+CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "60"))
+CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS = int(
+    os.environ.get("CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS", "7200")
+)
 ACCOUNT_30D_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_ACCOUNT_30D_CACHE_SECONDS", "300"))
 QUOTA_WINDOW_START_TOLERANCE_SECONDS = int(os.environ.get("CLIENT_USAGE_QUOTA_WINDOW_START_TOLERANCE_SECONDS", "10"))
 LATEST_REQUEST_LOOKBACK_DAYS = int(os.environ.get("CLIENT_USAGE_LATEST_REQUEST_LOOKBACK_DAYS", "7"))
@@ -109,6 +112,8 @@ API_SERVICE_MIRROR_LABELS = {
     "api service local",
     "codex_local_access_runtime",
 }
+if "CLIENT_USAGE_HIGH_WATER_UNATTRIBUTED_LABEL" not in os.environ:
+    HIGH_WATER_UNATTRIBUTED_LABEL = "Codex local - \u5386\u53f2\u7f3a\u53e3\u672a\u5f52\u5c5e"
 API_SERVICE_AGGREGATE_LABEL = "Codex local - api-service-local"
 
 _ONLINE_PRICE_TABLE: dict[str, tuple[float, float, float]] | None = None
@@ -184,12 +189,25 @@ class UsageEvent:
 
 
 @dataclass
+class SessionLifecycle:
+    session_id: str
+    state: str
+    when: datetime
+    turn_id: str = ""
+    file_activity_at: datetime | None = None
+
+
+@dataclass
 class AccountMarker:
     when: datetime
     label: str
     model: str = ""
     kind: str = "request"
     total_tokens: int = 0
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
+    event_key: str = ""
 
 
 @dataclass
@@ -805,11 +823,20 @@ def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
     return paths
 
 
-def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageEvent]:
+def scan_codex_events(
+    root: Path,
+    start: datetime,
+    end: datetime,
+    session_lifecycle: dict[str, SessionLifecycle] | None = None,
+) -> list[UsageEvent]:
     events: list[UsageEvent] = []
     seen_events: set[tuple[str, str, int, int, int, int]] = set()
     seen_totals: set[tuple[str, int, int, int, int]] = set()
     for path in iter_recent_jsonl(root, start):
+        try:
+            file_activity_at = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            file_activity_at = None
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
         seen: set[tuple[int, int, int, int]] = set()
         try:
@@ -836,7 +863,25 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
             if row.get("type") != "event_msg":
                 continue
             payload = row.get("payload") or {}
-            if payload.get("type") != "token_count":
+            payload_type = str(payload.get("type") or "")
+            if (
+                session_lifecycle is not None
+                and session_id
+                and payload_type in {"task_started", "task_complete", "turn_aborted"}
+            ):
+                lifecycle_at = parse_dt(row.get("timestamp"))
+                if lifecycle_at is not None and lifecycle_at < end:
+                    candidate = SessionLifecycle(
+                        session_id=session_id,
+                        state=payload_type,
+                        when=lifecycle_at,
+                        turn_id=str(payload.get("turn_id") or ""),
+                        file_activity_at=file_activity_at,
+                    )
+                    existing_lifecycle = session_lifecycle.get(session_id)
+                    if existing_lifecycle is None or candidate.when >= existing_lifecycle.when:
+                        session_lifecycle[session_id] = candidate
+            if payload_type != "token_count":
                 continue
             info = payload.get("info") or {}
             total = info.get("total_token_usage") or {}
@@ -1224,8 +1269,19 @@ def usage_event_info_score(event: UsageEvent) -> int:
     return score
 
 
-def scan_all_codex_events(home: Path, sessions_root: Path, start: datetime, end: datetime) -> list[UsageEvent]:
-    events = scan_codex_events(sessions_root, start, end)
+def scan_all_codex_events(
+    home: Path,
+    sessions_root: Path,
+    start: datetime,
+    end: datetime,
+    session_lifecycle: dict[str, SessionLifecycle] | None = None,
+) -> list[UsageEvent]:
+    events = scan_codex_events(
+        sessions_root,
+        start,
+        end,
+        session_lifecycle=session_lifecycle,
+    )
     events.extend(scan_codex_logs2_events(home, start, end))
     route_markers = scan_codex_route_markers(home, start, end)
     apply_codex_route_hints(events, route_markers)
@@ -2128,7 +2184,11 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 email,
                 api_key_label,
                 model_id,
-                total_tokens
+                total_tokens,
+                input_tokens,
+                cached_tokens,
+                output_tokens,
+                event_key
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
             ORDER BY timestamp ASC
@@ -2140,7 +2200,18 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
         return []
 
     markers: list[AccountMarker] = []
-    for timestamp, account_id, email, api_key_label, model, total_tokens in rows:
+    for (
+        timestamp,
+        account_id,
+        email,
+        api_key_label,
+        model,
+        total_tokens,
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        event_key,
+    ) in rows:
         when = ms_to_local_datetime(timestamp)
         if when is None:
             continue
@@ -2154,6 +2225,10 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 model=codex_model_name(str(model or "codex")),
                 kind="request",
                 total_tokens=max(0, int(total_tokens or 0)),
+                input_tokens=max(0, int(input_tokens or 0)),
+                cached_tokens=max(0, int(cached_tokens or 0)),
+                output_tokens=max(0, int(output_tokens or 0)),
+                event_key=str(event_key or "").strip(),
             )
         )
     return markers
@@ -2233,6 +2308,13 @@ def attribute_codex_events_to_account_markers(
         current_label,
         now,
     )
+    return buckets_from_attributed_events(attributed, cost_multiplier_by_label)
+
+
+def buckets_from_attributed_events(
+    attributed: dict[str, list[UsageEvent]],
+    cost_multiplier_by_label: dict[str, float] | None = None,
+) -> dict[str, UsageBucket]:
     multipliers = cost_multiplier_by_label or {}
     buckets: dict[str, UsageBucket] = {}
     for label, account_events in attributed.items():
@@ -2502,6 +2584,7 @@ def latest_at_text(bucket: UsageBucket) -> str:
 def latest_request_from_attributed_events(
     attributed: dict[str, list[UsageEvent]],
     account_markers: list[AccountMarker] | None = None,
+    session_account_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     latest_label = ""
     latest_event: UsageEvent | None = None
@@ -2517,7 +2600,11 @@ def latest_request_from_attributed_events(
     if latest_event is None:
         return {}
     if is_api_service_mirror_label(latest_label):
-        latest_label = concrete_api_service_account_label(latest_event, account_markers or []) or API_SERVICE_AGGREGATE_LABEL
+        latest_label = (
+            concrete_api_service_account_label(latest_event, account_markers or [])
+            or (session_account_labels or {}).get(latest_event.session_id, "")
+            or API_SERVICE_AGGREGATE_LABEL
+        )
     return {
         "provider": latest_label,
         "model": latest_event.model,
@@ -2533,18 +2620,360 @@ def is_api_service_mirror_label(label: str) -> bool:
     return name in API_SERVICE_MIRROR_LABELS
 
 
-def concrete_api_service_account_label(event: UsageEvent, markers: list[AccountMarker]) -> str:
+def account_markers_by_total_tokens(markers: list[AccountMarker]) -> dict[int, list[AccountMarker]]:
+    indexed: dict[int, list[AccountMarker]] = {}
+    for marker in markers:
+        if marker.kind == "request" and marker.total_tokens > 0:
+            indexed.setdefault(marker.total_tokens, []).append(marker)
+    return indexed
+
+
+def concrete_api_service_account_marker(
+    event: UsageEvent,
+    markers: list[AccountMarker],
+    marker_index: dict[int, list[AccountMarker]] | None = None,
+) -> AccountMarker | None:
     event_time = usage_event_attribution_time(event)
-    candidates = [
+    exact_candidates = (
+        (marker_index or {}).get(event.total_tokens, [])
+        if marker_index is not None
+        else [
+            marker
+            for marker in markers
+            if marker.kind == "request" and marker.total_tokens == event.total_tokens
+        ]
+    )
+    nearby = [
+        marker
+        for marker in exact_candidates
+        if abs((marker.when - event_time).total_seconds()) <= API_SERVICE_ACTIVITY_MATCH_SECONDS
+    ]
+    if nearby:
+        return min(nearby, key=lambda marker: abs((marker.when - event_time).total_seconds()))
+    fuzzy_token_delta = max(256, int(event.total_tokens * 0.005))
+    fuzzy_candidates = [
         marker
         for marker in markers
         if marker.kind == "request"
-        and marker.total_tokens == event.total_tokens
-        and abs((marker.when - event_time).total_seconds()) <= API_SERVICE_ACTIVITY_MATCH_SECONDS
+        and abs((marker.when - event_time).total_seconds()) <= 30
+        and abs(marker.total_tokens - event.total_tokens) <= fuzzy_token_delta
     ]
-    if not candidates:
-        return ""
-    return min(candidates, key=lambda marker: abs((marker.when - event_time).total_seconds())).label
+    if fuzzy_candidates:
+        return min(
+            fuzzy_candidates,
+            key=lambda marker: (
+                abs(marker.total_tokens - event.total_tokens),
+                abs((marker.when - event_time).total_seconds()),
+            ),
+        )
+    if len(exact_candidates) == 1:
+        return exact_candidates[0]
+    return None
+
+
+def concrete_api_service_account_label(
+    event: UsageEvent,
+    markers: list[AccountMarker],
+    marker_index: dict[int, list[AccountMarker]] | None = None,
+) -> str:
+    marker = concrete_api_service_account_marker(event, markers, marker_index)
+    return marker.label if marker is not None else ""
+
+
+def previous_active_session_account_labels(path: Path, day: date) -> dict[str, str]:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if str(existing.get("date") or "") != day.isoformat():
+        return {}
+    sessions = existing.get("active_sessions")
+    if not isinstance(sessions, list):
+        return {}
+    result: dict[str, str] = {}
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = str(session.get("session_id") or "").strip()
+        provider = str(session.get("provider") or "").strip()
+        if session_id and provider and not is_api_service_mirror_label(provider):
+            result[session_id] = provider
+    return result
+
+
+def resolve_api_service_event_accounts(
+    attributed: dict[str, list[UsageEvent]],
+    account_markers: list[AccountMarker],
+    known_session_accounts: dict[str, str] | None = None,
+) -> tuple[dict[str, list[UsageEvent]], dict[str, str], int]:
+    marker_index = account_markers_by_total_tokens(account_markers)
+    session_accounts = dict(known_session_accounts or {})
+    resolved: dict[str, list[UsageEvent]] = {}
+    unresolved = 0
+    ordered = sorted(
+        (
+            (label, event)
+            for label, events in attributed.items()
+            for event in events
+        ),
+        key=lambda item: usage_event_attribution_time(item[1]),
+    )
+    for label, event in ordered:
+        session_id = event.session_id or event.request_key or codex_event_id(event)
+        resolved_label = label
+        matched_marker = concrete_api_service_account_marker(event, account_markers, marker_index)
+        if matched_marker is not None:
+            resolved_label = matched_marker.label
+            session_accounts[session_id] = matched_marker.label
+            if matched_marker.model:
+                event.model = matched_marker.model
+        elif is_api_service_mirror_label(label):
+            resolved_label = session_accounts.get(session_id, "") or label
+            if is_api_service_mirror_label(resolved_label):
+                unresolved += 1
+        else:
+            session_accounts[session_id] = label
+        resolved.setdefault(resolved_label, []).append(event)
+    return resolved, session_accounts, unresolved
+
+
+def build_active_session_rows(
+    attributed_events: dict[str, list[UsageEvent]],
+    session_account_labels: dict[str, str],
+    session_lifecycle: dict[str, SessionLifecycle],
+    current_label: str,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int], int]:
+    """Build concurrency from task lifecycle, with token activity as a legacy fallback."""
+    latest_by_session: dict[str, tuple[str, UsageEvent]] = {}
+    labels_by_session = dict(session_account_labels)
+    for label, account_events in attributed_events.items():
+        for event in account_events:
+            if event.route == "cockpit-db-fallback":
+                continue
+            session_id = (event.session_id or event.request_key or codex_event_id(event)).strip()
+            if not session_id:
+                continue
+            if not is_api_service_mirror_label(label):
+                labels_by_session[session_id] = label
+            previous = latest_by_session.get(session_id)
+            if previous is None or usage_event_attribution_time(event) > usage_event_attribution_time(previous[1]):
+                latest_by_session[session_id] = (label, event)
+
+    active_sessions: list[dict[str, Any]] = []
+    unresolved = 0
+
+    def add_active(
+        session_id: str,
+        label: str,
+        event: UsageEvent | None,
+        activity_at: datetime,
+        source: str,
+        started_at: datetime | None = None,
+    ) -> None:
+        nonlocal unresolved
+        resolved_label = labels_by_session.get(session_id, "") or label
+        if is_api_service_mirror_label(resolved_label):
+            resolved_label = ""
+        if not resolved_label and current_label and not is_api_service_mirror_label(current_label):
+            resolved_label = current_label
+        if not resolved_label:
+            unresolved += 1
+        active_sessions.append(
+            {
+                "session_id": session_id,
+                "provider": resolved_label,
+                "model": event.model if event is not None else CODEX_DEFAULT_MODEL,
+                "latest_at": activity_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                "started_at": (
+                    started_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+                    if started_at is not None
+                    else ""
+                ),
+                "tokens": event.total_tokens if event is not None else 0,
+                "active": True,
+                "activity_source": source,
+            }
+        )
+
+    for session_id, lifecycle in session_lifecycle.items():
+        if lifecycle.state != "task_started":
+            continue
+        file_activity_at = lifecycle.file_activity_at or lifecycle.when
+        activity_age = (now - file_activity_at).total_seconds()
+        if activity_age < -300 or activity_age > max(1, CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS):
+            continue
+        event_label, event = latest_by_session.get(session_id, ("", None))
+        event_at = usage_event_attribution_time(event) if event is not None else lifecycle.when
+        activity_at = max(lifecycle.when, file_activity_at, event_at)
+        add_active(
+            session_id,
+            event_label,
+            event,
+            activity_at,
+            "task-lifecycle",
+            lifecycle.when,
+        )
+
+    # Older Codex logs may not contain task lifecycle events. Only in that
+    # case retain a short token-activity fallback instead of a five-minute lag.
+    if not session_lifecycle:
+        recent_cutoff = now - timedelta(seconds=max(1, CLIENT_USAGE_ACTIVE_WINDOW_SECONDS))
+        for session_id, (label, event) in latest_by_session.items():
+            activity_at = usage_event_attribution_time(event)
+            if activity_at < recent_cutoff:
+                continue
+            add_active(
+                session_id,
+                label,
+                event,
+                activity_at,
+                "token-activity-fallback",
+            )
+
+    active_sessions.sort(key=lambda row: str(row.get("latest_at") or ""), reverse=True)
+    active_by_label: dict[str, int] = {}
+    sessions_by_label: dict[str, int] = {}
+    for row in active_sessions:
+        label = str(row.get("provider") or "")
+        if not label:
+            continue
+        active_by_label[label] = active_by_label.get(label, 0) + 1
+        sessions_by_label[label] = sessions_by_label.get(label, 0) + 1
+    return active_sessions, active_by_label, sessions_by_label, unresolved
+
+
+def cockpit_marker_identity(marker: AccountMarker) -> tuple[str, str, int, str]:
+    return (
+        marker.when.isoformat(timespec="milliseconds"),
+        marker.label,
+        marker.total_tokens,
+        marker.event_key,
+    )
+
+
+def merge_missing_cockpit_account_events(
+    attributed: dict[str, list[UsageEvent]],
+    account_markers: list[AccountMarker],
+) -> tuple[dict[str, list[UsageEvent]], int]:
+    merged = {label: list(events) for label, events in attributed.items()}
+    marker_index = account_markers_by_total_tokens(account_markers)
+    represented: set[tuple[str, str, int, str]] = set()
+    for events in attributed.values():
+        for event in events:
+            marker = concrete_api_service_account_marker(event, account_markers, marker_index)
+            if marker is not None:
+                represented.add(cockpit_marker_identity(marker))
+
+    added = 0
+    for marker in account_markers:
+        if marker.total_tokens <= 0 or cockpit_marker_identity(marker) in represented:
+            continue
+        cached = min(marker.cached_tokens, marker.total_tokens)
+        output = min(marker.output_tokens, max(0, marker.total_tokens - cached))
+        uncached_input = max(0, marker.total_tokens - cached - output)
+        event = UsageEvent(
+            when=marker.when,
+            model=marker.model or CODEX_DEFAULT_MODEL,
+            input_tokens=uncached_input,
+            cached_tokens=cached,
+            output_tokens=output,
+            session_id="",
+            request_key=marker.event_key or f"cockpit-{marker.when.timestamp()}-{marker.total_tokens}",
+            route="cockpit-db-fallback",
+            request_at=marker.when,
+        )
+        merged.setdefault(marker.label, []).append(event)
+        added += 1
+    return merged, added
+
+
+def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
+    try:
+        history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    days = history.get("days") if isinstance(history, dict) else None
+    if not isinstance(days, dict):
+        return 0
+    missing: list[date] = []
+    for key, row in days.items():
+        if not isinstance(row, dict) or int(row.get("tokens") or 0) <= 0:
+            continue
+        if isinstance(row.get("providers"), list) and isinstance(row.get("models"), dict):
+            continue
+        try:
+            missing.append(datetime.fromisoformat(str(key)).date())
+        except ValueError:
+            continue
+    if not missing:
+        return 0
+
+    start = datetime.combine(min(missing), datetime.min.time())
+    end = datetime.combine(max(missing) + timedelta(days=1), datetime.min.time())
+    events = scan_all_codex_events(home, sessions_root, start, end)
+    apply_codex_speed_fallback(events, codex_speed_history(home, start, end))
+    account_markers = scan_cockpit_codex_account_markers(home, start, end)
+    markers = scan_cockpit_codex_switch_markers(home, start, end)
+    markers.extend(load_account_timeline())
+    markers.extend(account_markers)
+    attributed = attribute_codex_events_by_account(
+        events,
+        markers,
+        load_attribution_ledger(),
+        current_codex_account_label(home),
+        datetime.now(),
+    )
+    resolved, _session_accounts, _unresolved = resolve_api_service_event_accounts(
+        attributed,
+        account_markers,
+    )
+    speed_by_account = cockpit_codex_speed_by_label(home)
+    multipliers = {
+        label: float(meta.get("cost_multiplier") or 1.0)
+        for label, meta in speed_by_account.items()
+    }
+    wanted = {item.isoformat() for item in missing}
+    buckets_by_day: dict[str, dict[str, UsageBucket]] = {}
+    for label, account_events in resolved.items():
+        for event in account_events:
+            key = usage_event_attribution_time(event).date().isoformat()
+            if key not in wanted:
+                continue
+            bucket = buckets_by_day.setdefault(key, {}).setdefault(label, UsageBucket())
+            add_codex_event_to_bucket(
+                bucket,
+                event,
+                multipliers.get(label, 1.0),
+                bucket_time=usage_event_attribution_time(event),
+            )
+
+    updated = 0
+    for key in wanted:
+        row = days.get(key)
+        buckets = buckets_by_day.get(key)
+        if not isinstance(row, dict) or not buckets:
+            continue
+        providers = [
+            bucket_to_dict(label, bucket)
+            for label, bucket in sorted(
+                buckets.items(),
+                key=lambda item: (-item[1].total_tokens, item[0]),
+            )
+            if bucket.total_tokens > 0 or bucket.requests > 0
+        ]
+        models: dict[str, int] = {}
+        for provider in providers:
+            for model, tokens in (provider.get("models") or {}).items():
+                models[str(model)] = models.get(str(model), 0) + int(tokens or 0)
+        row["providers"] = providers
+        row["models"] = models
+        row["detail_tokens"] = sum(int(provider.get("tokens") or 0) for provider in providers)
+        updated += 1
+    if updated:
+        history["schema"] = max(2, int(history.get("schema") or 1))
+        write_json_atomic(USAGE_HISTORY_PATH, history)
+    return updated
 
 
 def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, Any]:
@@ -2612,7 +3041,7 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     if str(existing.get("date") or "") != day.isoformat():
         return
     collapse_api_service_mirror_providers(existing)
-    current_api_aggregate = output.get("api_service_aggregate")
+    current_api_aggregate = output.get("api_service_aggregate") or output.get("api_service_routed")
 
     def tokens_of(row: Any) -> int:
         if not isinstance(row, dict):
@@ -2768,8 +3197,43 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         current_tokens = int(today.get("tokens") or 0)
     except (TypeError, ValueError):
         return
-    if history_tokens <= current_tokens:
-        return
+    gap = row.get("source_gap") if isinstance(row.get("source_gap"), dict) else None
+    if gap is None:
+        if history_tokens <= current_tokens:
+            return
+        gap = {}
+        for key in (
+            "requests",
+            "tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+        ):
+            gap[key] = max(0, int(row.get(key) or 0) - int(today.get(key) or 0))
+        gap["cost"] = round(max(0.0, float(row.get("cost") or 0) - float(today.get("cost") or 0)), 6)
+        history_row = days.get(day.isoformat()) if isinstance(days, dict) else None
+        if isinstance(history_row, dict):
+            history_row["source_gap"] = gap
+            try:
+                write_json_atomic(USAGE_HISTORY_PATH, history)
+            except OSError:
+                pass
+    gap = dict(gap)
+    gap_tokens = max(0, int(gap.get("tokens") or 0))
+    token_fields = (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    )
+    excess = max(0, sum(max(0, int(gap.get(key) or 0)) for key in token_fields) - gap_tokens)
+    for key in ("cached_input_tokens", "input_tokens", "cache_creation_input_tokens", "output_tokens"):
+        value = max(0, int(gap.get(key) or 0))
+        reduction = min(value, excess)
+        gap[key] = value - reduction
+        excess -= reduction
+    gap["tokens"] = gap_tokens
     providers = output.get("providers")
     for key in (
         "requests",
@@ -2778,10 +3242,9 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         "cached_input_tokens",
         "cache_creation_input_tokens",
         "output_tokens",
-        "cost",
     ):
-        if key in row:
-            today[key] = row[key]
+        today[key] = int(today.get(key) or 0) + int(gap.get(key) or 0)
+    today["cost"] = round(float(today.get("cost") or 0) + float(gap.get("cost") or 0), 6)
     if not isinstance(providers, list):
         return
     add_unattributed_provider_gap(output)
@@ -2814,6 +3277,7 @@ def add_unattributed_provider_gap(output: dict[str, Any]) -> None:
         return
     delta = {
         "name": HIGH_WATER_UNATTRIBUTED_LABEL,
+        "is_unattributed_gap": True,
         "requests": max(0, int(today.get("requests") or 0) - int(provider_sum("requests"))),
         "tokens": delta_tokens,
         "input_tokens": max(0, int(today.get("input_tokens") or 0) - int(provider_sum("input_tokens"))),
@@ -2859,7 +3323,12 @@ def bucket_to_window_dict(bucket: UsageBucket, start: datetime, end: datetime) -
     result = {
         "requests": bucket.requests,
         "tokens": bucket.total_tokens,
+        "input_tokens": bucket.input_tokens,
+        "cached_input_tokens": bucket.cached_input_tokens + bucket.cache_read_input_tokens,
+        "cache_creation_input_tokens": bucket.cache_creation_input_tokens,
+        "output_tokens": bucket.output_tokens,
         "cost": round(bucket.cost, 6),
+        "models": dict(sorted(bucket.models.items(), key=lambda item: item[1], reverse=True)[:8]),
         "start_at": start.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "end_at": end.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
     }
@@ -2886,6 +3355,22 @@ def apply_5h_countdown_state(window: dict[str, Any]) -> None:
     )
     window["quota_idle"] = quota_idle
     window["countdown_active"] = bool(window.get("quota_available")) and not quota_idle
+
+
+def prefer_more_complete_usage_buckets(
+    primary: dict[str, UsageBucket],
+    candidate: dict[str, UsageBucket],
+) -> dict[str, UsageBucket]:
+    result = dict(primary)
+    for label, bucket in candidate.items():
+        existing = result.get(label)
+        if (
+            existing is None
+            or bucket.total_tokens > existing.total_tokens
+            or (bucket.total_tokens == existing.total_tokens and bucket.requests > existing.requests)
+        ):
+            result[label] = bucket
+    return result
 
 
 def build_codex_window_stats(
@@ -2982,7 +3467,7 @@ def build_codex_window_stats(
             window_end,
         )
         markers_30d = switch_markers_30d + account_markers_30d
-        direct_latest_30d = latest_marker_by_label(account_markers_30d)
+        marker_index_30d = account_markers_by_total_tokens(account_markers_30d)
         attributed_30d = attribute_codex_events_by_account(
             events_30d,
             markers_30d,
@@ -2990,16 +3475,27 @@ def build_codex_window_stats(
             current_label,
             now,
         )
+        raw_30d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_30d.items():
-            direct_cutoff = direct_latest_30d.get(label)
-            if direct_cutoff is not None:
-                direct_cutoff += timedelta(seconds=2)
-            bucket = buckets_30d.setdefault(label, UsageBucket())
-            multiplier = cost_multiplier_by_label.get(label, 1.0)
             for event in account_events:
-                if direct_cutoff is not None and event.when <= direct_cutoff:
-                    continue
-                add_codex_event_to_bucket(bucket, event, multiplier)
+                resolved_label = label
+                matched_marker = concrete_api_service_account_marker(
+                    event,
+                    account_markers_30d,
+                    marker_index_30d,
+                )
+                if matched_marker is not None:
+                    resolved_label = matched_marker.label
+                    if matched_marker.model:
+                        event.model = matched_marker.model
+                multiplier = cost_multiplier_by_label.get(resolved_label, 1.0)
+                add_codex_event_to_bucket(
+                    raw_30d.setdefault(resolved_label, UsageBucket()),
+                    event,
+                    multiplier,
+                    bucket_time=usage_event_attribution_time(event),
+                )
+        buckets_30d = prefer_more_complete_usage_buckets(buckets_30d, raw_30d)
 
     (
         aligned_5h,
@@ -3008,7 +3504,7 @@ def build_codex_window_stats(
         aligned_starts_5h,
         aligned_starts_7d,
         aligned_starts_cycle,
-        direct_latest,
+        _direct_latest,
     ) = scan_cockpit_codex_quota_windows(
         home,
         quota_by_account,
@@ -3020,13 +3516,17 @@ def build_codex_window_stats(
         + list(aligned_starts_7d.values())
         + list(aligned_starts_cycle.values())
     )
-    if aligned_starts:
-        aligned_scan_start = min(aligned_starts)
+    rolling_7d_buckets = dict(direct_7d)
+    scan_starts = aligned_starts + [window_7d_start]
+    if scan_starts:
+        aligned_scan_start = min(scan_starts)
         aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
         speed_markers = codex_speed_history(home, aligned_scan_start, window_end)
         apply_codex_speed_fallback(aligned_events, speed_markers)
         aligned_markers = scan_cockpit_codex_switch_markers(home, aligned_scan_start, window_end)
-        aligned_markers.extend(scan_cockpit_codex_account_markers(home, aligned_scan_start, window_end))
+        aligned_account_markers = scan_cockpit_codex_account_markers(home, aligned_scan_start, window_end)
+        aligned_markers.extend(aligned_account_markers)
+        aligned_marker_index = account_markers_by_total_tokens(aligned_account_markers)
         attributed_events = attribute_codex_events_by_account(
             aligned_events,
             aligned_markers,
@@ -3034,20 +3534,41 @@ def build_codex_window_stats(
             current_label,
             now,
         )
+        raw_5h = {label: UsageBucket() for label in aligned_starts_5h}
+        raw_7d = {label: UsageBucket() for label in aligned_starts_7d}
+        raw_cycle = {label: UsageBucket() for label in aligned_starts_cycle}
+        raw_rolling_7d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_events.items():
-            direct_cutoff = direct_latest.get(label)
-            if direct_cutoff is not None:
-                direct_cutoff += timedelta(seconds=2)
             for event in account_events:
-                if direct_cutoff is not None and event.when <= direct_cutoff:
-                    continue
-                multiplier = cost_multiplier_by_label.get(label, 1.0)
-                if label in aligned_starts_5h and event.when >= aligned_starts_5h[label]:
-                    add_codex_event_to_bucket(aligned_5h[label], event, multiplier)
-                if label in aligned_starts_7d and event.when >= aligned_starts_7d[label]:
-                    add_codex_event_to_bucket(aligned_7d[label], event, multiplier)
-                if label in aligned_starts_cycle and event.when >= aligned_starts_cycle[label]:
-                    add_codex_event_to_bucket(aligned_cycle[label], event, multiplier)
+                resolved_label = label
+                matched_marker = concrete_api_service_account_marker(
+                    event,
+                    aligned_account_markers,
+                    aligned_marker_index,
+                )
+                if matched_marker is not None:
+                    resolved_label = matched_marker.label
+                    if matched_marker.model:
+                        event.model = matched_marker.model
+                event_time = usage_event_attribution_time(event)
+                multiplier = cost_multiplier_by_label.get(resolved_label, 1.0)
+                if event_time >= window_7d_start:
+                    add_codex_event_to_bucket(
+                        raw_rolling_7d.setdefault(resolved_label, UsageBucket()),
+                        event,
+                        multiplier,
+                        bucket_time=event_time,
+                    )
+                if resolved_label in aligned_starts_5h and event_time >= aligned_starts_5h[resolved_label]:
+                    add_codex_event_to_bucket(raw_5h[resolved_label], event, multiplier, bucket_time=event_time)
+                if resolved_label in aligned_starts_7d and event_time >= aligned_starts_7d[resolved_label]:
+                    add_codex_event_to_bucket(raw_7d[resolved_label], event, multiplier, bucket_time=event_time)
+                if resolved_label in aligned_starts_cycle and event_time >= aligned_starts_cycle[resolved_label]:
+                    add_codex_event_to_bucket(raw_cycle[resolved_label], event, multiplier, bucket_time=event_time)
+        aligned_5h = prefer_more_complete_usage_buckets(aligned_5h, raw_5h)
+        aligned_7d = prefer_more_complete_usage_buckets(aligned_7d, raw_7d)
+        aligned_cycle = prefer_more_complete_usage_buckets(aligned_cycle, raw_cycle)
+        rolling_7d_buckets = prefer_more_complete_usage_buckets(rolling_7d_buckets, raw_rolling_7d)
     buckets_5h.update(aligned_5h)
     buckets_7d.update(aligned_7d)
     buckets_cycle = aligned_cycle
@@ -3056,6 +3577,7 @@ def build_codex_window_stats(
     labels = (
         set(buckets_5h)
         | set(buckets_7d)
+        | set(rolling_7d_buckets)
         | set(buckets_30d)
         | set(buckets_cycle)
         | set(all_cockpit_codex_account_labels(home))
@@ -3070,6 +3592,11 @@ def build_codex_window_stats(
         window_7d = bucket_to_window_dict(
             buckets_7d.get(label, UsageBucket()),
             aligned_starts_7d.get(label, window_7d_start),
+            now,
+        )
+        window_rolling_7d = bucket_to_window_dict(
+            rolling_7d_buckets.get(label, UsageBucket()),
+            window_7d_start,
             now,
         )
         window_30d = bucket_to_window_dict(
@@ -3090,6 +3617,7 @@ def build_codex_window_stats(
         result[label] = {
             "window_5h": window_5h,
             "window_7d": window_7d,
+            "window_rolling_7d": window_rolling_7d,
             "window_cycle": window_cycle,
         }
         if include_30d:
@@ -3102,6 +3630,7 @@ def main() -> int:
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--date", default="")
     parser.add_argument("--include-30d", action="store_true")
+    parser.add_argument("--backfill-history-details", action="store_true")
     args = parser.parse_args()
 
     now = datetime.now()
@@ -3133,27 +3662,43 @@ def main() -> int:
         label: float(meta.get("cost_multiplier") or 1.0)
         for label, meta in speed_by_account.items()
     }
-    codex_events = scan_all_codex_events(home, codex_sessions_root, start, end)
+    session_lifecycle: dict[str, SessionLifecycle] = {}
+    codex_events = scan_all_codex_events(
+        home,
+        codex_sessions_root,
+        start,
+        end,
+        session_lifecycle=session_lifecycle,
+    )
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)
     markers = scan_cockpit_codex_switch_markers(home, start, end)
     markers.extend(load_account_timeline())
     account_markers = scan_cockpit_codex_account_markers(home, start, end)
     markers.extend(account_markers)
-    attributed_events = attribute_codex_events_by_account(
+    raw_attributed_events = attribute_codex_events_by_account(
         codex_events,
         markers,
         attribution_ledger,
         current_label,
         now,
     )
-    attributed = attribute_codex_events_to_account_markers(
-        codex_events,
-        markers,
+    api_service_routed = any(
+        is_api_service_mirror_label(label)
+        for label in raw_attributed_events
+    ) or bool(account_markers)
+    raw_attributed_events, cockpit_fallback_events = merge_missing_cockpit_account_events(
+        raw_attributed_events,
+        account_markers,
+    )
+    attributed_events, provider_session_accounts, unresolved_provider_events = resolve_api_service_event_accounts(
+        raw_attributed_events,
+        account_markers,
+        previous_active_session_account_labels(out, day),
+    )
+    attributed = buckets_from_attributed_events(
+        attributed_events,
         cost_multiplier_by_label,
-        attribution_ledger,
-        current_label,
-        now,
     )
     codex = UsageBucket()
     for bucket in attributed.values():
@@ -3173,7 +3718,9 @@ def main() -> int:
     claude_root = home / ".claude" / "projects"
     claude = scan_claude(claude_root, start, end)
     hourly_today = merge_hourly_buckets(
-        codex_hourly_from_events(codex_events),
+        codex_hourly_from_events(
+            [event for events in attributed_events.values() for event in events]
+        ),
         scan_claude_hourly(claude_root, start, end),
     )
     if args.include_30d and cached_30d_valid:
@@ -3197,43 +3744,19 @@ def main() -> int:
         )
     save_attribution_ledger(attribution_ledger, now)
 
-    recent_cutoff = now - timedelta(seconds=max(1, CLIENT_USAGE_ACTIVE_WINDOW_SECONDS))
-    recent_active_by_label: dict[str, int] = {}
-    recent_sessions_by_label: dict[str, int] = {}
-    recent_latest_by_session: dict[str, tuple[str, UsageEvent]] = {}
-    recent_events_by_label = attributed_events
-    for label, account_events in recent_events_by_label.items():
-        recent_events = [event for event in account_events if event.when >= recent_cutoff]
-        for event in recent_events:
-            activity_label = label
-            if is_api_service_mirror_label(activity_label):
-                activity_label = concrete_api_service_account_label(event, account_markers) or API_SERVICE_AGGREGATE_LABEL
-            session_id = event.session_id or event.request_key or codex_event_id(event)
-            previous = recent_latest_by_session.get(session_id)
-            if (
-                previous is None
-                or event.when > previous[1].when
-                or (
-                    event.when == previous[1].when
-                    and "@" in activity_label
-                    and "@" not in previous[0]
-                )
-            ):
-                recent_latest_by_session[session_id] = (activity_label, event)
-    active_sessions = []
-    for session_id, (label, event) in recent_latest_by_session.items():
-        recent_active_by_label[label] = recent_active_by_label.get(label, 0) + 1
-        recent_sessions_by_label[label] = recent_sessions_by_label.get(label, 0) + 1
-        active_sessions.append(
-            {
-                "session_id": session_id,
-                "provider": label,
-                "model": event.model,
-                "latest_at": event.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-                "tokens": event.total_tokens,
-            }
-        )
-    active_sessions.sort(key=lambda row: str(row.get("latest_at") or ""), reverse=True)
+    session_account_labels = dict(provider_session_accounts)
+    (
+        active_sessions,
+        recent_active_by_label,
+        recent_sessions_by_label,
+        unresolved_active_sessions,
+    ) = build_active_session_rows(
+        attributed_events,
+        session_account_labels,
+        session_lifecycle,
+        current_label,
+        now,
+    )
 
     codex_providers = []
     for name, bucket in codex_provider_buckets:
@@ -3264,7 +3787,11 @@ def main() -> int:
     latest_model = ""
     latest_at = ""
     latest_dt: datetime | None = None
-    codex_latest_request = latest_request_from_attributed_events(attributed_events, account_markers)
+    codex_latest_request = latest_request_from_attributed_events(
+        attributed_events,
+        account_markers,
+        session_account_labels,
+    )
     latest_candidates = [("Claude local", claude)]
     codex_latest_at = parse_dt(codex_latest_request.get("created_at"))
     if codex_latest_at is not None:
@@ -3319,6 +3846,10 @@ def main() -> int:
             "kind": "success" if latest_at else "",
         },
         "active_sessions": active_sessions,
+        "unresolved_active_sessions": unresolved_active_sessions,
+        "api_service_routed": api_service_routed,
+        "unresolved_api_service_events": unresolved_provider_events,
+        "cockpit_fallback_events": cockpit_fallback_events,
         "dashboard": {
             "hourly_today": hourly_today,
         },
@@ -3335,6 +3866,8 @@ def main() -> int:
     restore_today_from_usage_history(output, day)
     add_unattributed_provider_gap(output)
     write_json_atomic(out, output)
+    if args.backfill_history_details:
+        backfill_usage_history_details(home, codex_sessions_root)
     print(json.dumps(output["today"], ensure_ascii=False))
     return 0
 

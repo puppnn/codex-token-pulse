@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -389,6 +390,43 @@ class LocalActiveAccountTests(unittest.TestCase):
         self.assertIn("hails24.uranium@icloud.com", active[0]["name"])
         self.assertEqual(active[0]["current"], 1)
 
+    def test_lifecycle_active_session_does_not_expire_by_token_timestamp(self) -> None:
+        old_timestamp = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        usage = {
+            "active_sessions": [
+                {
+                    "session_id": "session-running",
+                    "provider": "Codex local - account@example.com",
+                    "model": "gpt-test",
+                    "latest_at": old_timestamp,
+                    "active": True,
+                    "activity_source": "task-lifecycle",
+                }
+            ],
+            "providers": [],
+        }
+
+        active = monitor.local_active_accounts_from_client_usage(usage)
+
+        self.assertEqual(len(active), 1)
+        self.assertIn("account@example.com", active[0]["name"])
+
+    def test_explicitly_inactive_session_is_not_shown(self) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        usage = {
+            "active_sessions": [
+                {
+                    "session_id": "session-complete",
+                    "provider": "Codex local - account@example.com",
+                    "latest_at": now,
+                    "active": False,
+                }
+            ],
+            "providers": [],
+        }
+
+        self.assertEqual(monitor.local_active_accounts_from_client_usage(usage), [])
+
     def test_recent_provider_without_recent_session_is_not_active(self) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         usage = {
@@ -431,6 +469,75 @@ class LocalActiveAccountTests(unittest.TestCase):
             usage = monitor.load_client_usage()
 
         self.assertEqual(usage["active_sessions"], [session])
+
+    def test_detailed_usage_history_keeps_provider_and_model_totals(self) -> None:
+        details = monitor.detailed_usage_from_client_usage(
+            {
+                "providers": [
+                    {
+                        "name": "Codex local - account@example.com",
+                        "requests": 3,
+                        "tokens": 5_000,
+                        "cost": 4.5,
+                        "models": {"gpt-5.6-sol": 5_000},
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(details["models"], {"gpt-5.6-sol": 5_000})
+        self.assertEqual(details["providers"][0]["tokens"], 5_000)
+
+    def test_usage_range_accounts_and_models_use_the_same_history_days(self) -> None:
+        app = object.__new__(monitor.FloatingMonitorApp)
+        app.state = monitor.MonitorState(client_usage={"providers": []})
+        today = monitor.today_key()
+        old_day = (datetime.now(monitor.CN_TZ).date() - timedelta(days=8)).isoformat()
+        history = {
+            "schema": 2,
+            "days": {
+                today: {
+                    "requests": 1,
+                    "tokens": 1_000,
+                    "cost": 1.0,
+                    "providers": [
+                        {
+                            "name": "today@example.com",
+                            "requests": 1,
+                            "tokens": 1_000,
+                            "cost": 1.0,
+                            "models": {"today-model": 1_000},
+                        }
+                    ],
+                },
+                old_day: {
+                    "requests": 1,
+                    "tokens": 9_000,
+                    "cost": 9.0,
+                    "providers": [
+                        {
+                            "name": "old@example.com",
+                            "requests": 1,
+                            "tokens": 9_000,
+                            "cost": 9.0,
+                            "models": {"old-model": 9_000},
+                        }
+                    ],
+                },
+            },
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(monitor, "USAGE_HISTORY_JSON", Path(temporary_directory) / "history.json"),
+        ):
+            monitor.USAGE_HISTORY_JSON.write_text(json.dumps(history), encoding="utf-8")
+            seven_day = app._usage_range_providers("7d")
+            seven_day_models = app._top_models("7d")
+            all_time = app._usage_range_providers("all")
+
+        self.assertEqual([row["name"] for row in seven_day], ["today@example.com"])
+        self.assertEqual(seven_day_models, [("today-model", 1_000)])
+        self.assertEqual(sum(int(row["tokens"]) for row in all_time), 10_000)
 
 
 class LatestRequestFallbackTests(unittest.TestCase):
@@ -544,6 +651,136 @@ class LatestRequestFallbackTests(unittest.TestCase):
         )
 
         self.assertEqual(latest["provider"], "Codex local - matched@example.com")
+
+    def test_api_service_account_match_allows_delayed_client_event(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 11, 21, 0, 32, 334000),
+            model="gpt-test",
+            input_tokens=4_076,
+            cached_tokens=17_152,
+            output_tokens=1_005,
+            session_id="delayed-session",
+        )
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 11, 20, 58, 16, 156000),
+            label="Codex local - delayed@example.com",
+            total_tokens=22_233,
+        )
+
+        label = client_usage_export.concrete_api_service_account_label(event, [marker])
+
+        self.assertEqual(label, "Codex local - delayed@example.com")
+
+    def test_api_service_account_match_allows_small_total_token_difference(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 0, 0, 21, 677000),
+            model="gpt-test",
+            input_tokens=1_032,
+            cached_tokens=205_568,
+            output_tokens=41,
+            session_id="midnight-session",
+        )
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 12, 0, 0, 31, 298000),
+            label="Codex local - midnight@example.com",
+            total_tokens=206_708,
+        )
+
+        label = client_usage_export.concrete_api_service_account_label(event, [marker])
+
+        self.assertEqual(label, "Codex local - midnight@example.com")
+
+    def test_api_service_latest_request_reuses_confirmed_session_account(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 11, 21, 0, 0),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=1,
+            session_id="known-session",
+        )
+
+        latest = client_usage_export.latest_request_from_attributed_events(
+            {"Codex local - api-service-local": [event]},
+            [],
+            {"known-session": "Codex local - confirmed@example.com"},
+        )
+
+        self.assertEqual(latest["provider"], "Codex local - confirmed@example.com")
+
+    def test_api_service_events_are_moved_to_concrete_accounts_without_duplication(self) -> None:
+        first = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 0, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+        )
+        second = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 1, 0),
+            model="gpt-test",
+            input_tokens=1_800,
+            cached_tokens=0,
+            output_tokens=200,
+            session_id="session-1",
+        )
+        marker = client_usage_export.AccountMarker(
+            when=first.when,
+            label="Codex local - account@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=1_000,
+        )
+
+        resolved, session_accounts, unresolved = client_usage_export.resolve_api_service_event_accounts(
+            {"Codex local - api-service-local": [first, second]},
+            [marker],
+        )
+
+        self.assertEqual(list(resolved), ["Codex local - account@example.com"])
+        self.assertEqual(sum(event.total_tokens for events in resolved.values() for event in events), 3_000)
+        self.assertEqual(session_accounts["session-1"], "Codex local - account@example.com")
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(first.model, "gpt-5.6-sol")
+
+    def test_cockpit_union_adds_only_requests_missing_from_client_logs(self) -> None:
+        client_event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 0, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+        )
+        represented = client_usage_export.AccountMarker(
+            when=client_event.when,
+            label="Codex local - account@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=1_000,
+            input_tokens=900,
+            output_tokens=100,
+            event_key="represented",
+        )
+        missing = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 12, 8, 1, 0),
+            label="Codex local - account@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=2_000,
+            input_tokens=1_800,
+            output_tokens=200,
+            event_key="missing",
+        )
+
+        merged, added = client_usage_export.merge_missing_cockpit_account_events(
+            {"Codex local - api-service-local": [client_event]},
+            [represented, missing],
+        )
+
+        self.assertEqual(added, 1)
+        self.assertEqual(sum(event.total_tokens for events in merged.values() for event in events), 3_000)
+        fallback = merged["Codex local - account@example.com"][0]
+        self.assertEqual(fallback.route, "cockpit-db-fallback")
+        self.assertEqual(fallback.model, "gpt-5.6-sol")
 
 
 class MonitorModeIsolationTests(unittest.TestCase):
@@ -831,6 +1068,51 @@ class LocalExportHighWaterTests(unittest.TestCase):
 
 
 class WindowSemanticsTests(unittest.TestCase):
+    def test_window_dict_preserves_model_and_token_breakdown(self) -> None:
+        bucket = client_usage_export.UsageBucket(
+            requests=2,
+            input_tokens=1_000,
+            cached_input_tokens=2_000,
+            output_tokens=300,
+            cost=1.25,
+            models={"gpt-5.6-sol": 3_300},
+        )
+
+        window = client_usage_export.bucket_to_window_dict(
+            bucket,
+            datetime(2026, 7, 1, 0, 0, 0),
+            datetime(2026, 7, 8, 0, 0, 0),
+        )
+
+        self.assertEqual(window["models"], {"gpt-5.6-sol": 3_300})
+        self.assertEqual(window["input_tokens"], 1_000)
+        self.assertEqual(window["cached_input_tokens"], 2_000)
+        self.assertEqual(window["output_tokens"], 300)
+
+    def test_more_complete_raw_window_replaces_partial_direct_database_bucket(self) -> None:
+        label = "Codex local - account@example.com"
+        partial_direct = client_usage_export.UsageBucket(requests=80, input_tokens=14_000_000, cost=11.0)
+        complete_raw = client_usage_export.UsageBucket(requests=732, input_tokens=108_000_000, cost=90.0)
+
+        merged = client_usage_export.prefer_more_complete_usage_buckets(
+            {label: partial_direct},
+            {label: complete_raw},
+        )
+
+        self.assertIs(merged[label], complete_raw)
+
+    def test_partial_raw_window_does_not_replace_complete_direct_database_bucket(self) -> None:
+        label = "Codex local - account@example.com"
+        complete_direct = client_usage_export.UsageBucket(requests=100, input_tokens=20_000_000, cost=18.0)
+        partial_raw = client_usage_export.UsageBucket(requests=20, input_tokens=4_000_000, cost=3.0)
+
+        merged = client_usage_export.prefer_more_complete_usage_buckets(
+            {label: complete_direct},
+            {label: partial_raw},
+        )
+
+        self.assertIs(merged[label], complete_direct)
+
     def test_30d_window_uses_rolling_account_usage(self) -> None:
         now = datetime(2026, 6, 23, 12, 0, 0)
         label = "Codex local - account@example.com"
@@ -1016,6 +1298,163 @@ class WindowSemanticsTests(unittest.TestCase):
         window_7d = result[label]["window_7d"]
         self.assertEqual(window_7d["tokens"], 66_000_000)
         self.assertTrue(window_7d["start_at"].startswith("2026-06-15T12:00:00"))
+
+
+class ActiveSessionLifecycleTests(unittest.TestCase):
+    def test_running_lifecycle_wins_over_old_token_activity(self) -> None:
+        now = datetime(2026, 7, 12, 14, 0, 0)
+        label = "Codex local - account@example.com"
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(minutes=20),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_started",
+            when=now - timedelta(minutes=15),
+            file_activity_at=now - timedelta(seconds=1),
+        )
+
+        rows, active_by_label, sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {label: [event]},
+                {"session-1": label},
+                {"session-1": lifecycle},
+                label,
+                now,
+            )
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["active"])
+        self.assertEqual(rows[0]["activity_source"], "task-lifecycle")
+        self.assertEqual(active_by_label[label], 1)
+        self.assertEqual(sessions_by_label[label], 1)
+        self.assertEqual(unresolved, 0)
+
+    def test_completed_lifecycle_suppresses_recent_token_fallback(self) -> None:
+        now = datetime(2026, 7, 12, 14, 0, 0)
+        label = "Codex local - account@example.com"
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(seconds=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_complete",
+            when=now,
+            file_activity_at=now,
+        )
+
+        rows, active_by_label, sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {label: [event]},
+                {"session-1": label},
+                {"session-1": lifecycle},
+                label,
+                now,
+            )
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(active_by_label, {})
+        self.assertEqual(sessions_by_label, {})
+        self.assertEqual(unresolved, 0)
+
+    def test_scanner_keeps_latest_task_lifecycle_event(self) -> None:
+        start = datetime(2026, 7, 12, 0, 0, 0)
+        end = start + timedelta(days=1)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            day_dir = root / "2026" / "07" / "12"
+            day_dir.mkdir(parents=True)
+            path = day_dir / "session.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-07-12T05:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "session-1"},
+                },
+                {
+                    "timestamp": "2026-07-12T05:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "turn-1"},
+                },
+                {
+                    "timestamp": "2026-07-12T05:02:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "turn_id": "turn-1"},
+                },
+            ]
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            lifecycle: dict[str, client_usage_export.SessionLifecycle] = {}
+
+            client_usage_export.scan_codex_events(
+                root,
+                start,
+                end,
+                session_lifecycle=lifecycle,
+            )
+
+        self.assertEqual(lifecycle["session-1"].state, "turn_aborted")
+        self.assertEqual(lifecycle["session-1"].turn_id, "turn-1")
+
+
+class ManualRefreshTests(unittest.TestCase):
+    def test_manual_refresh_is_queued_while_refresh_is_running(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._refresh_lock = threading.Lock()
+        app._refresh_lock.acquire()
+        app._refresh_pending = False
+        app._draw = lambda: None
+
+        started = app.refresh_async(force=True)
+
+        self.assertFalse(started)
+        self.assertTrue(app._refresh_pending)
+        app._refresh_lock.release()
+
+    def test_manual_refresh_clears_all_runtime_caches(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.clear_calls = 0
+
+            def clear_runtime_caches(self) -> None:
+                self.clear_calls += 1
+
+        class FakeThread:
+            def __init__(self, target, daemon: bool) -> None:
+                self.target = target
+                self.daemon = daemon
+
+            def start(self) -> None:
+                return
+
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._refresh_lock = threading.Lock()
+        app._refresh_pending = False
+        app._loading = False
+        app.client = FakeClient()
+        app._draw = lambda: None
+        app._pulse_tick = lambda: None
+
+        with patch.object(monitor.threading, "Thread", FakeThread):
+            started = app.refresh_async(force=True)
+
+        self.assertTrue(started)
+        self.assertEqual(app.client.clear_calls, 1)
+        app._refresh_lock.release()
 
 
 class AttributionLedgerTests(unittest.TestCase):

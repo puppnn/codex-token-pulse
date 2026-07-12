@@ -361,6 +361,43 @@ def token_mix_from_client_usage(client_usage: dict[str, Any] | None) -> dict[str
     return mix
 
 
+def detailed_usage_from_client_usage(client_usage: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(client_usage, dict):
+        return {"models": {}, "providers": []}
+    providers = client_usage.get("providers")
+    if not isinstance(providers, list):
+        return {"models": {}, "providers": []}
+    model_totals: dict[str, int] = {}
+    provider_rows: list[dict[str, Any]] = []
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        requests_count = int(provider.get("requests") or 0)
+        tokens = int(provider.get("tokens") or 0)
+        cost = float(provider.get("cost") or 0)
+        if requests_count <= 0 and tokens <= 0 and cost <= 0:
+            continue
+        models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+        normalized_models: dict[str, int] = {}
+        for model, amount in models.items():
+            value = max(0, int(amount or 0))
+            if value <= 0:
+                continue
+            name = str(model or "unknown")
+            normalized_models[name] = normalized_models.get(name, 0) + value
+            model_totals[name] = model_totals.get(name, 0) + value
+        provider_rows.append(
+            {
+                "name": str(provider.get("name") or "Local client"),
+                "requests": requests_count,
+                "tokens": tokens,
+                "cost": round(cost, 6),
+                "models": normalized_models,
+            }
+        )
+    return {"models": model_totals, "providers": provider_rows}
+
+
 def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
     days = history.get("days") if isinstance(history, dict) else {}
     if not isinstance(days, dict):
@@ -451,6 +488,8 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         source_date = str(state.client_usage.get("date") or "").strip()
     existing_source_date = str(existing.get("source_date") or "").strip()
     mix = token_mix_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
+    details = detailed_usage_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
+    preserve_existing_details = False
 
     # Same-day client usage is reconstructed from local logs and account
     # markers. Account switches can briefly make attribution smaller than the
@@ -465,8 +504,15 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
             mix["cached"] = max(mix["cached"], int(existing.get("cached_input_tokens") or 0))
             mix["cache_create"] = max(mix["cache_create"], int(existing.get("cache_creation_input_tokens") or 0))
             mix["output"] = max(mix["output"], int(existing.get("output_tokens") or 0))
+            preserve_existing_details = True
 
-    days[key] = {
+    if preserve_existing_details:
+        if isinstance(existing.get("models"), dict):
+            details["models"] = existing["models"]
+        if isinstance(existing.get("providers"), list):
+            details["providers"] = existing["providers"]
+
+    updated_row = {
         "date": key,
         "source": state.usage_source,
         "requests": new_requests,
@@ -476,9 +522,14 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         "cache_creation_input_tokens": mix["cache_create"],
         "output_tokens": mix["output"],
         "cost": round(new_cost, 6),
+        "models": details["models"],
+        "providers": details["providers"],
         "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
         "source_date": source_date,
     }
+    if isinstance(existing.get("source_gap"), dict):
+        updated_row["source_gap"] = existing["source_gap"]
+    days[key] = updated_row
     try:
         write_json_atomic(USAGE_HISTORY_JSON, history)
     except Exception:
@@ -571,9 +622,12 @@ def local_active_accounts_from_client_usage(
             if not isinstance(session, dict):
                 continue
             latest_at = str(session.get("latest_at") or "")
-            if not is_recent_activity(latest_at):
+            lifecycle_active = session.get("active") is True
+            if session.get("active") is False:
                 continue
-            provider_name = str(session.get("provider") or "Local client")
+            if not lifecycle_active and not is_recent_activity(latest_at):
+                continue
+            provider_name = str(session.get("provider") or "").strip() or "正在识别账号"
             row = active_by_provider.get(provider_name)
             if row is None:
                 row = {
@@ -723,12 +777,17 @@ def normalize_usage_window(progress: Any) -> dict[str, Any]:
     return result
 
 
-def load_client_usage(include_30d: bool = False) -> dict[str, Any] | None:
+def load_client_usage(
+    include_30d: bool = False,
+    backfill_history_details: bool = False,
+) -> dict[str, Any] | None:
     if CLIENT_USAGE_EXPORT.exists():
         try:
             command = [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)]
             if include_30d:
                 command.append("--include-30d")
+            if backfill_history_details:
+                command.append("--backfill-history-details")
             subprocess.run(
                 command,
                 cwd=str(APP_DIR),
@@ -1276,9 +1335,11 @@ def build_local_monitor_state(
                     "latest_model": provider.get("latest_model") or "",
                     "window_5h": provider.get("window_5h") or {},
                     "window_7d": provider.get("window_7d") or {},
+                    "window_rolling_7d": provider.get("window_rolling_7d") or {},
                     "window_30d": provider.get("window_30d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
                     "active_now": False,
+                    "is_unattributed_gap": bool(provider.get("is_unattributed_gap")),
                     "is_latest": str(provider.get("name") or "") == latest_provider_name,
                 }
             )
@@ -1405,9 +1466,11 @@ class Sub2APIClient:
         self._client_usage_cache: dict[str, Any] | None = None
         self._client_usage_cache_at: float = 0.0
         self._client_usage_cache_has_30d = False
+        self._client_usage_cache_has_history_details = False
         self._account_window_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self._account_30d_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self.include_account_30d = False
+        self.include_history_details = False
 
     def _sub2api_match_urls(self) -> list[str]:
         env = read_env_files(ENV_FILES)
@@ -1461,18 +1524,24 @@ class Sub2APIClient:
             self._client_usage_cache is not None
             and now - self._client_usage_cache_at < CLIENT_USAGE_CACHE_SECONDS
             and (not self.include_account_30d or self._client_usage_cache_has_30d)
+            and (not self.include_history_details or self._client_usage_cache_has_history_details)
         ):
             return self._client_usage_cache
-        client_usage = load_client_usage(include_30d=self.include_account_30d)
+        client_usage = load_client_usage(
+            include_30d=self.include_account_30d,
+            backfill_history_details=self.include_history_details,
+        )
         self._client_usage_cache = client_usage
         self._client_usage_cache_at = now
         self._client_usage_cache_has_30d = self.include_account_30d
+        self._client_usage_cache_has_history_details = self.include_history_details
         return client_usage
 
     def clear_client_usage_cache(self) -> None:
         self._client_usage_cache = None
         self._client_usage_cache_at = 0.0
         self._client_usage_cache_has_30d = False
+        self._client_usage_cache_has_history_details = False
 
     def clear_runtime_caches(self) -> None:
         self.clear_client_usage_cache()
@@ -1885,9 +1954,11 @@ class Sub2APIClient:
                     "latest_model": provider.get("latest_model") or "",
                     "window_5h": provider.get("window_5h") or {},
                     "window_7d": provider.get("window_7d") or {},
+                    "window_rolling_7d": provider.get("window_rolling_7d") or {},
                     "window_30d": provider.get("window_30d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
                     "active_now": False,
+                    "is_unattributed_gap": bool(provider.get("is_unattributed_gap")),
                     "is_latest": provider_name == latest_provider_name,
                 }
                 top_accounts.append(row)
@@ -2038,6 +2109,7 @@ class FloatingMonitorApp:
         self._pinned = True
         self._loading = False
         self._refresh_lock = threading.Lock()
+        self._refresh_pending = False
         self._pulse_phase = 0.0
         self._fade_alpha = 0.0
         self._drag_data = {"x": 0, "y": 0}
@@ -2049,8 +2121,9 @@ class FloatingMonitorApp:
         self._tooltip_text = ""
         self._tooltip_pos = (0, 0)
         self._main_tab = "accounts"
-        self._scroll_offsets = {"accounts": 0, "stats": 0}
-        self._scroll_limits = {"accounts": 0, "stats": 0}
+        self._scroll_offsets = {"accounts": 0, "active": 0, "stats": 0}
+        self._scroll_limits = {"accounts": 0, "active": 0, "stats": 0}
+        self._active_scroll_rect: tuple[int, int, int, int] | None = None
         self._usage_range = "24h"
         self._account_range = "today"
         self._account_range_user_selected = False
@@ -2102,10 +2175,6 @@ class FloatingMonitorApp:
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", self._on_mousewheel)
         self.canvas.bind("<Button-5>", self._on_mousewheel)
-        self.root.bind("<ButtonPress-1>", self._on_press)
-        self.root.bind("<ButtonRelease-1>", self._on_release)
-        self.root.bind("<MouseWheel>", self._on_mousewheel)
-        self.root.bind_all("<ButtonPress-1>", self._on_press)
 
         # ── initial draw & data ──
         self._draw()
@@ -2387,12 +2456,83 @@ class FloatingMonitorApp:
         mix["unknown"] = max(0, int(summary.get("tokens") or 0) - known)
         return mix
 
-    def _top_models(self) -> list[tuple[str, int]]:
-        totals: dict[str, int] = {}
-        for provider in self._client_providers():
-            models = provider.get("models")
-            if not isinstance(models, dict):
+    def _usage_range_providers(self, range_key: str) -> list[dict[str, Any]]:
+        if range_key == "24h":
+            return [
+                provider
+                for provider in self._client_providers()
+                if int(provider.get("requests") or 0) > 0
+                or int(provider.get("tokens") or 0) > 0
+                or float(provider.get("cost") or 0) > 0
+            ]
+
+        history = load_usage_history()
+        days = history.get("days") if isinstance(history, dict) else {}
+        if not isinstance(days, dict):
+            return []
+        if range_key in {"7d", "30d"}:
+            count = 7 if range_key == "7d" else 30
+            selected_keys = {date_key(offset) for offset in range(count)}
+            selected_days = [row for key, row in days.items() if key in selected_keys]
+        else:
+            selected_days = list(days.values())
+        aggregated: dict[str, dict[str, Any]] = {}
+        history_requests = 0
+        history_tokens = 0
+        history_cost = 0.0
+        for day in selected_days:
+            day_requests = int(day.get("requests") or 0) if isinstance(day, dict) else 0
+            day_tokens = int(day.get("tokens") or 0) if isinstance(day, dict) else 0
+            day_cost = float(day.get("cost") or 0) if isinstance(day, dict) else 0.0
+            history_requests += day_requests
+            history_tokens += day_tokens
+            history_cost += day_cost
+            providers = day.get("providers") if isinstance(day, dict) else None
+            if not isinstance(providers, list):
                 continue
+            valid_providers = [provider for provider in providers if isinstance(provider, dict)]
+            detail_tokens = sum(max(0, int(provider.get("tokens") or 0)) for provider in valid_providers)
+            detail_requests = sum(max(0, int(provider.get("requests") or 0)) for provider in valid_providers)
+            detail_cost = sum(max(0.0, float(provider.get("cost") or 0)) for provider in valid_providers)
+            token_scale = min(1.0, day_tokens / detail_tokens) if detail_tokens > 0 else 1.0
+            request_scale = min(1.0, day_requests / detail_requests) if detail_requests > 0 else 1.0
+            cost_scale = min(1.0, day_cost / detail_cost) if detail_cost > 0 else 1.0
+            for provider in valid_providers:
+                name = str(provider.get("name") or "Local client")
+                row = aggregated.setdefault(
+                    name,
+                    {"name": name, "requests": 0, "tokens": 0, "cost": 0.0, "models": {}},
+                )
+                row["requests"] += int(max(0, int(provider.get("requests") or 0)) * request_scale)
+                row["tokens"] += int(max(0, int(provider.get("tokens") or 0)) * token_scale)
+                row["cost"] += max(0.0, float(provider.get("cost") or 0)) * cost_scale
+                models = provider.get("models")
+                if isinstance(models, dict):
+                    for model, amount in models.items():
+                        model_name = str(model or "unknown")
+                        row["models"][model_name] = row["models"].get(model_name, 0) + int(
+                            max(0, int(amount or 0)) * token_scale
+                        )
+        tracked_requests = sum(int(row.get("requests") or 0) for row in aggregated.values())
+        tracked_tokens = sum(int(row.get("tokens") or 0) for row in aggregated.values())
+        tracked_cost = sum(float(row.get("cost") or 0) for row in aggregated.values())
+        missing_tokens = max(0, history_tokens - tracked_tokens)
+        if missing_tokens > 0:
+            aggregated["Historical detail gap"] = {
+                "name": "Historical detail gap",
+                "requests": max(0, history_requests - tracked_requests),
+                "tokens": missing_tokens,
+                "cost": round(max(0.0, history_cost - tracked_cost), 6),
+                "models": {},
+            }
+        return list(aggregated.values())
+
+    def _top_models(self, range_key: str) -> list[tuple[str, int]]:
+        totals: dict[str, int] = {}
+        for provider in self._usage_range_providers(range_key):
+            models = provider.get("models")
+            models = models if isinstance(models, dict) else {}
+            tracked = 0
             for model, tokens in models.items():
                 try:
                     amount = int(tokens or 0)
@@ -2401,6 +2541,10 @@ class FloatingMonitorApp:
                 if amount > 0:
                     name = str(model or "unknown")
                     totals[name] = totals.get(name, 0) + amount
+                    tracked += amount
+            untracked = max(0, int(provider.get("tokens") or 0) - tracked)
+            if untracked > 0:
+                totals["Untracked"] = totals.get("Untracked", 0) + untracked
         return sorted(totals.items(), key=lambda item: item[1], reverse=True)[:6]
 
     def _usage_range_summary(self, range_key: str) -> dict[str, Any]:
@@ -3057,7 +3201,7 @@ class FloatingMonitorApp:
                           font=self._fonts["font_label"], fill=Theme.ag_muted)
             y += 30
 
-        models = self._top_models()
+        models = self._top_models(self._usage_range)
         y = self._draw_ag_section(col_l, col_r, y, "Top Models", f"{len(models)} models")
         if not models:
             c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u6a21\u578b\u7edf\u8ba1",
@@ -3080,26 +3224,27 @@ class FloatingMonitorApp:
                 y += 34
 
         providers = sorted(
-            self._client_providers(),
+            self._usage_range_providers(self._usage_range),
             key=lambda row: (-float(row.get("cost") or 0), -int(row.get("tokens") or 0), str(row.get("name") or "")),
         )
-        y = self._draw_ag_section(col_l, col_r, y, "Provider Cost Breakdown", f"{len(providers)} providers")
+        y = self._draw_ag_section(col_l, col_r, y, "Account Cumulative", f"{len(providers)} accounts")
         list_top = y
         list_bottom = H - 38
         row_h = 48
-        max_scroll = max(0, len(providers) * row_h - max(1, list_bottom - list_top))
+        available_rows = max(1, (list_bottom - list_top) // row_h)
+        max_start_index = max(0, len(providers) - available_rows)
+        max_scroll = max_start_index * row_h
         self._scroll_limits["stats"] = max_scroll
         self._scroll_offsets["stats"] = max(0, min(self._scroll_offsets.get("stats", 0), max_scroll))
-        offset = self._scroll_offsets.get("stats", 0)
         if not providers:
             c.create_text(col_l + 8, y, anchor="nw", text="\u6682\u65e0 provider \u6570\u636e",
                           font=self._fonts["font_label"], fill=Theme.ag_muted)
             return
         max_provider_cost = max([float(row.get("cost") or 0) for row in providers], default=0.0) or 1.0
-        for index, provider in enumerate(providers):
-            row_y = list_top + index * row_h - offset
-            if row_y < list_top or row_y > list_bottom:
-                continue
+        first_index = min(max_start_index, self._scroll_offsets["stats"] // row_h)
+        visible_providers = providers[first_index:first_index + available_rows]
+        for visible_index, provider in enumerate(visible_providers):
+            row_y = list_top + visible_index * row_h
             self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 7, r=6,
                                     fill=Theme.ag_surface, outline=Theme.ag_border)
             name = self._truncate(local_provider_display_name(str(provider.get("name") or "-")),
@@ -3124,6 +3269,8 @@ class FloatingMonitorApp:
         c = self.canvas
         c.delete("all")
         self._tooltip_rects = []
+        self._active_scroll_rect = None
+        self._scroll_limits["active"] = 0
         W, H = self.WIDTH, self.HEIGHT
         actual_w = self.root.winfo_width()
         actual_h = self.root.winfo_height()
@@ -3157,7 +3304,10 @@ class FloatingMonitorApp:
             c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=Theme.accent_green, outline="")
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
-        updated = "\u8bfb\u53d6\u4e2d" if self._loading else "\u7b49\u5f85\u5237\u65b0"
+        if self._refresh_pending:
+            updated = "\u5237\u65b0\u5df2\u6392\u961f"
+        else:
+            updated = "\u6b63\u5728\u5237\u65b0" if self._loading else "\u7b49\u5f85\u5237\u65b0"
         if self.state and self.state.updated_at:
             updated = relative_time(datetime.fromtimestamp(self.state.updated_at, timezone.utc).isoformat())
         subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
@@ -3183,6 +3333,8 @@ class FloatingMonitorApp:
             fg = Theme.amber_bright if is_hover else Theme.text_secondary
             if name == "btn_close":
                 fg = Theme.accent_red if is_hover else Theme.text_secondary
+            elif name == "btn_refresh" and (self._loading or self._refresh_pending):
+                fg = Theme.cyan
             c.create_text(bx, btn_y + 7, text=glyph, font=self._fonts["font_icon"],
                            fill=fg, anchor="center")
 
@@ -3202,7 +3354,7 @@ class FloatingMonitorApp:
         y += 12
         self._draw_rounded_rect(COL_L, y, COL_R, y + 72, r=13, fill=Theme.bg_section, outline=Theme.border)
         all_active_accounts = list(self.state.active_accounts or []) if self.state else []
-        accounts = all_active_accounts[:5]
+        accounts = all_active_accounts
         latest_name = self.state.latest_account_name if self.state else ""
         if accounts:
             hero_name = accounts[0].get("name", latest_name or "-")
@@ -3225,28 +3377,100 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  ACTIVE ACCOUNTS
         # ════════════════════════════════════════════════════════
-        c.create_text(COL_L, y, anchor="nw", text="\u5f53\u524d\u6d3b\u8dc3",
-                       font=self._fonts["font_section"], fill=Theme.amber)
+        section_y = y
+        c.create_text(COL_L, section_y, anchor="nw", text="\u5f53\u524d\u6d3b\u8dc3",
+                      font=self._fonts["font_section"], fill=Theme.amber)
 
         y += 24
+        active_row_h = 26
+        extra_active_rows = max(0, (H - int(type(self).HEIGHT)) // active_row_h)
+        active_capacity = max(3, 3 + extra_active_rows)
+        visible_active_rows = min(len(accounts), active_capacity)
+        max_active_start = max(0, len(accounts) - visible_active_rows)
+        active_scroll_limit = max_active_start * active_row_h
+        self._scroll_limits["active"] = active_scroll_limit
+        self._scroll_offsets["active"] = max(
+            0,
+            min(int(self._scroll_offsets.get("active", 0) or 0), active_scroll_limit),
+        )
+        first_active_index = min(
+            max_active_start,
+            self._scroll_offsets["active"] // active_row_h,
+        )
+        visible_accounts = accounts[
+            first_active_index:first_active_index + visible_active_rows
+        ]
+        if active_scroll_limit > 0:
+            last_active_index = first_active_index + len(visible_accounts)
+            c.create_text(
+                COL_R,
+                section_y + 1,
+                anchor="ne",
+                text=f"{first_active_index + 1}-{last_active_index}/{len(accounts)}",
+                font=self._fonts["font_micro"],
+                fill=Theme.text_muted,
+            )
+
         if not accounts:
             c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u8d26\u53f7\u72b6\u6001" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3"),
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 20
-        for acc in accounts[:3]:
-            name = self._truncate(acc.get("name", "-"), "font_label", 230)
+        else:
+            active_list_top = y
+            active_list_bottom = y + visible_active_rows * active_row_h
+            self._active_scroll_rect = (
+                COL_L,
+                active_list_top,
+                COL_R,
+                active_list_bottom,
+            )
+
+        for acc in visible_accounts:
+            full_name = str(acc.get("name") or "-")
             cur = acc.get("current", 0)
             mx = acc.get("max", 1)
-
-            c.create_text(COL_L + 8, y, anchor="nw", text=name,
-                           font=self._fonts["font_label"], fill=Theme.text_primary)
-            frac_text = f"{compact_number(cur)}/{compact_number(mx)}"
             pill_w = 54
+            name_x = COL_L + 8
+            pill_left = COL_R - pill_w
+            name_max_w = max(60, pill_left - name_x - 10)
+            name = self._truncate(full_name, "font_label", name_max_w)
+
+            c.create_text(name_x, y, anchor="nw", text=name,
+                           font=self._fonts["font_label"], fill=Theme.text_primary)
+            if name != full_name:
+                self._add_tooltip(name_x, y, pill_left - 8, y + 21, full_name)
+            frac_text = f"{compact_number(cur)}/{compact_number(mx)}"
             self._draw_rounded_rect(COL_R - pill_w, y - 2, COL_R - 4, y + 21, r=8,
                                     fill=Theme.bg_section, outline=Theme.border)
             c.create_text(COL_R - 4 - pill_w / 2, y + 9, anchor="center", text=frac_text,
                            font=self._fonts["font_label_bold"], fill=Theme.accent_green)
-            y += 26
+            y += active_row_h
+
+        if active_scroll_limit > 0 and self._active_scroll_rect is not None:
+            track_x = COL_R - 1
+            track_top = self._active_scroll_rect[1]
+            track_bottom = self._active_scroll_rect[3] - 3
+            track_h = max(1, track_bottom - track_top)
+            thumb_h = max(12, int(track_h * visible_active_rows / len(accounts)))
+            thumb_y = track_top + int(
+                (track_h - thumb_h) * first_active_index / max_active_start
+            )
+            c.create_rectangle(
+                track_x,
+                track_top,
+                track_x + 2,
+                track_bottom,
+                fill=Theme.border,
+                outline="",
+            )
+            c.create_rectangle(
+                track_x,
+                thumb_y,
+                track_x + 2,
+                thumb_y + thumb_h,
+                fill=Theme.amber,
+                outline="",
+            )
 
         y += 4
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
@@ -3383,7 +3607,11 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
-        raw_top = list(self.state.top_accounts or []) if self.state else []
+        raw_top = [
+            account
+            for account in (list(self.state.top_accounts or []) if self.state else [])
+            if not account.get("is_unattributed_gap")
+        ]
         range_key = {
             "5h": "window_5h",
             "7d": "window_7d",
@@ -3466,9 +3694,16 @@ class FloatingMonitorApp:
         window_mode = self._account_range in {"5h", "7d"}
         row_h = 64 if window_mode else 39
         available_rank_rows = max(1, (H - 44 - y) // row_h)
-        max_rank_rows = min(len(top), available_rank_rows)
-        display_top = list(top[:max_rank_rows])
-        for index, acc in enumerate(display_top):
+        max_start_index = max(0, len(top) - available_rank_rows)
+        max_scroll = max_start_index * row_h
+        self._scroll_limits["accounts"] = max_scroll
+        self._scroll_offsets["accounts"] = max(
+            0,
+            min(int(self._scroll_offsets.get("accounts", 0) or 0), max_scroll),
+        )
+        first_index = min(max_start_index, self._scroll_offsets["accounts"] // row_h)
+        display_top = list(enumerate(top[first_index:first_index + available_rank_rows], start=first_index))
+        for index, acc in display_top:
             health_badge = str(acc.get("health_badge") or "")
             source_badge = str(acc.get("source_badge") or "")
             speed_badge = str(acc.get("speed_badge") or "")
@@ -3685,8 +3920,7 @@ class FloatingMonitorApp:
             return
         if btn == "btn_refresh":
             self._resizing = False
-            self.client.clear_client_usage_cache()
-            self.refresh_async()
+            self.refresh_async(force=True)
             return
         if btn in {"main_accounts", "main_stats"}:
             self._resizing = False
@@ -3695,6 +3929,8 @@ class FloatingMonitorApp:
                 "main_stats": "stats",
             }[btn]
             self._scroll_offsets[self._main_tab] = 0
+            if self._main_tab == "accounts":
+                self._scroll_offsets["active"] = 0
             self._draw()
             return
         if 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
@@ -3705,13 +3941,24 @@ class FloatingMonitorApp:
             if self._main_tab != tab_value:
                 self._main_tab = tab_value
                 self._scroll_offsets[tab_value] = 0
+                if tab_value == "accounts":
+                    self._scroll_offsets["active"] = 0
                 self._draw()
             return
         if btn in {"usage_range_24h", "usage_range_7d", "usage_range_30d", "usage_range_all"}:
             self._resizing = False
             self._usage_range = btn.replace("usage_range_", "")
             self._scroll_offsets["stats"] = 0
-            self._draw()
+            if self._usage_range == "30d" and not self.client.include_account_30d:
+                self.client.include_account_30d = True
+                self.client.clear_client_usage_cache()
+                self.refresh_async()
+            elif self._usage_range == "all" and not self.client.include_history_details:
+                self.client.include_history_details = True
+                self.client.clear_client_usage_cache()
+                self.refresh_async()
+            else:
+                self._draw()
             return
         if btn in {"rank_today", "rank_5h", "rank_7d", "rank_30d"}:
             self._resizing = False
@@ -3722,6 +3969,7 @@ class FloatingMonitorApp:
                 "rank_30d": "30d",
             }[btn]
             self._account_range_user_selected = True
+            self._scroll_offsets["accounts"] = 0
             if self._account_range == "30d" and not self.client.include_account_30d:
                 self.client.include_account_30d = True
                 self.client.clear_client_usage_cache()
@@ -3789,19 +4037,40 @@ class FloatingMonitorApp:
             self._apply_window_size(self.WIDTH, self.HEIGHT)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
-        tab = self._main_tab
-        limit = int(self._scroll_limits.get(tab, 0) or 0)
-        if limit <= 0:
-            return
         if getattr(event, "num", None) == 4:
             delta = -1
         elif getattr(event, "num", None) == 5:
             delta = 1
         else:
             wheel_delta = int(getattr(event, "delta", 0) or 0)
+            if wheel_delta == 0:
+                return
             delta = -1 if wheel_delta > 0 else 1
+
+        if self._main_tab == "accounts" and self._active_scroll_rect is not None:
+            x1, y1, x2, y2 = self._active_scroll_rect
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                active_limit = int(self._scroll_limits.get("active", 0) or 0)
+                if active_limit <= 0:
+                    return
+                active_current = int(self._scroll_offsets.get("active", 0) or 0)
+                self._scroll_offsets["active"] = max(
+                    0,
+                    min(active_limit, active_current + delta * 26),
+                )
+                self._draw()
+                return
+
+        tab = self._main_tab
+        limit = int(self._scroll_limits.get(tab, 0) or 0)
+        if limit <= 0:
+            return
         current = int(self._scroll_offsets.get(tab, 0) or 0)
-        self._scroll_offsets[tab] = max(0, min(limit, current + delta * 42))
+        if tab == "accounts":
+            step = 64 if self._account_range in {"5h", "7d"} else 39
+        else:
+            step = 48
+        self._scroll_offsets[tab] = max(0, min(limit, current + delta * step))
         self._draw()
 
     def _on_focus_in(self, _event: tk.Event) -> None:
@@ -3814,9 +4083,15 @@ class FloatingMonitorApp:
     #  DATA REFRESH
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def refresh_async(self) -> None:
+    def refresh_async(self, force: bool = False) -> bool:
         if not self._refresh_lock.acquire(blocking=False):
-            return
+            if force:
+                self._refresh_pending = True
+                self._draw()
+            return False
+        if force:
+            self.client.clear_runtime_caches()
+        self._refresh_pending = False
         self._loading = True
         self._draw()
         self._pulse_tick()
@@ -3832,8 +4107,11 @@ class FloatingMonitorApp:
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
+        return True
 
     def _apply_state(self, result: MonitorState | None, error: str | None = None) -> None:
+        refresh_pending = self._refresh_pending
+        self._refresh_pending = False
         self._loading = False
         try:
             self._refresh_lock.release()
@@ -3847,6 +4125,8 @@ class FloatingMonitorApp:
                 result.cost_history = summarize_usage_history(load_usage_history())
             self.state = result
         self._draw()
+        if refresh_pending and not self.closed:
+            self.refresh_async(force=True)
 
     def _handle_day_rollover(self, force: bool = False) -> bool:
         current_day = today_key()
