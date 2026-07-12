@@ -2750,7 +2750,12 @@ class FloatingMonitorApp:
                     failure_count = max(1, int(item.get("failure_count") or 1))
                     failure_at = str(item.get("failure_at") or "")
                     failure_time = failure_at[11:16] if len(failure_at) >= 16 else ""
-                    if failure_count == 1:
+                    if item.get("failure_kind") == "desktop_network":
+                        if failure_count == 1:
+                            failure_note = "\nCodex network outage detected"
+                        else:
+                            failure_note = f"\n{failure_count} Codex network outages detected"
+                    elif failure_count == 1:
                         failure_note = "\nCodex task error detected"
                     else:
                         failure_note = f"\n{failure_count} Codex task errors detected"

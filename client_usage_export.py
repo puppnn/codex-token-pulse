@@ -93,6 +93,16 @@ CODEX_SPEED_OVERRIDES = os.environ.get("CLIENT_USAGE_CODEX_SPEED_OVERRIDES", "")
 LOCAL_TZ = timezone(timedelta(hours=8))
 JSON_DECODER = json.JSONDecoder()
 LOG_FIELD_RE = re.compile(r'(?<![A-Za-z0-9_.-])(?P<key>[A-Za-z0-9_.-]+)=(?P<value>"[^"]*"|\S+)')
+DESKTOP_LOG_LINE_RE = re.compile(r"^(?P<timestamp>\S+)\s+\S+\s+(?P<body>.*)$")
+DESKTOP_NETWORK_ERROR_CODES = (
+    "net::ERR_CONNECTION_CLOSED",
+    "net::ERR_CONNECTION_RESET",
+    "net::ERR_INTERNET_DISCONNECTED",
+    "net::ERR_NETWORK_CHANGED",
+    "net::ERR_TIMED_OUT",
+)
+DESKTOP_NETWORK_FAILURE_MIN_COUNT = 3
+DESKTOP_NETWORK_FAILURE_CLUSTER_GAP = timedelta(minutes=5)
 INTERNAL_SERVICE_TIER_RE = re.compile(
     r'service_tier:\s*Some\((?:Some\()?\"(?P<tier>[^\"]+)\"'
 )
@@ -202,6 +212,7 @@ class CodexFailureEvent:
     when: datetime
     session_id: str = ""
     turn_id: str = ""
+    kind: str = "task"
 
 
 @dataclass
@@ -855,6 +866,80 @@ def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
         if modified >= start - timedelta(hours=2):
             add_path(path)
     return paths
+
+
+def default_codex_desktop_log_root() -> Path | None:
+    configured = os.environ.get("CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT", "").strip()
+    if configured:
+        return Path(configured)
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        return None
+    return Path(local_app_data) / "Codex" / "Logs"
+
+
+def iter_codex_desktop_logs(root: Path, start: datetime, end: datetime) -> list[Path]:
+    if not root.exists():
+        return []
+    utc_start = start.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+    utc_end = end.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+    current_day = utc_start.date()
+    end_day = utc_end.date()
+    paths: list[Path] = []
+    while current_day <= end_day:
+        day_dir = root / f"{current_day.year:04d}" / f"{current_day.month:02d}" / f"{current_day.day:02d}"
+        if day_dir.exists():
+            paths.extend(sorted(day_dir.glob("codex-desktop-*.log")))
+        current_day += timedelta(days=1)
+    return paths
+
+
+def scan_codex_desktop_failure_events(
+    root: Path,
+    start: datetime,
+    end: datetime,
+) -> list[CodexFailureEvent]:
+    network_failures: list[datetime] = []
+    for path in iter_codex_desktop_logs(root, start, end):
+        try:
+            lines = path.open(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
+                match = DESKTOP_LOG_LINE_RE.match(line)
+                if match is None:
+                    continue
+                body = match.group("body")
+                if "sa_server_request_failed" not in body:
+                    continue
+                if not any(code in body for code in DESKTOP_NETWORK_ERROR_CODES):
+                    continue
+                when = parse_dt(match.group("timestamp"))
+                if when is not None and start <= when < end:
+                    network_failures.append(when)
+
+    failures: list[CodexFailureEvent] = []
+    cluster: list[datetime] = []
+
+    def finish_cluster() -> None:
+        if len(cluster) < DESKTOP_NETWORK_FAILURE_MIN_COUNT:
+            return
+        failures.append(
+            CodexFailureEvent(
+                when=cluster[0],
+                session_id="codex-desktop",
+                kind="desktop_network",
+            )
+        )
+
+    for when in sorted(set(network_failures)):
+        if cluster and when - cluster[-1] > DESKTOP_NETWORK_FAILURE_CLUSTER_GAP:
+            finish_cluster()
+            cluster = []
+        cluster.append(when)
+    finish_cluster()
+    return failures
 
 
 def scan_codex_events(
@@ -2694,6 +2779,7 @@ def mark_codex_failure_hours(
         bucket.pop("failure", None)
         bucket.pop("failure_count", None)
         bucket.pop("failure_at", None)
+        bucket.pop("failure_kind", None)
 
     if as_of.date() < day:
         return
@@ -2723,6 +2809,7 @@ def mark_codex_failure_hours(
         failure_at = failure.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
         if failure_at > str(candidate.get("failure_at") or ""):
             candidate["failure_at"] = failure_at
+            candidate["failure_kind"] = failure.kind
 
 
 def latest_at_text(bucket: UsageBucket) -> str:
@@ -3277,11 +3364,16 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
                     int(current_row.get("failure_count") or 0),
                     int(previous_row.get("failure_count") or 0),
                 )
-                if previous_row.get("failure_at"):
-                    current_row["failure_at"] = max(
-                        str(current_row.get("failure_at") or ""),
-                        str(previous_row.get("failure_at") or ""),
-                    )
+                previous_failure_at = str(previous_row.get("failure_at") or "")
+                current_failure_at = str(current_row.get("failure_at") or "")
+                if previous_failure_at and previous_failure_at >= current_failure_at:
+                    current_row["failure_at"] = previous_failure_at
+                if (
+                    previous_row.get("failure_kind")
+                    and previous_failure_at
+                    and previous_failure_at >= current_failure_at
+                ):
+                    current_row["failure_kind"] = previous_row["failure_kind"]
 
     existing_today = existing.get("today")
     current_today = output.get("today")
@@ -3833,6 +3925,11 @@ def main() -> int:
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
+    desktop_log_root = default_codex_desktop_log_root()
+    if desktop_log_root is not None:
+        codex_failures.extend(
+            scan_codex_desktop_failure_events(desktop_log_root, start, end)
+        )
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)
     markers = scan_cockpit_codex_switch_markers(home, start, end)

@@ -1706,6 +1706,74 @@ class CodexSessionModelTests(unittest.TestCase):
         )
         self.assertFalse(any(row.get("failure") for row in hourly))
 
+    def test_repeated_desktop_network_failures_mark_adjacent_idle_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_root = Path(directory)
+            log_dir = log_root / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:16.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            failures = client_usage_export.scan_codex_desktop_failure_events(
+                log_root,
+                datetime(2026, 7, 12),
+                datetime(2026, 7, 13),
+            )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].when, datetime(2026, 7, 12, 3, 59, 53))
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3]["tokens"] = 23_100_000
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 0),
+        )
+        self.assertTrue(hourly[4]["failure"])
+        self.assertEqual(hourly[4]["failure_kind"], "desktop_network")
+
+    def test_transient_or_unrelated_desktop_errors_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_root = Path(directory)
+            log_dir = log_root / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z error [desktop-notifications][global-error] "
+                        "ResizeObserver loop completed with undelivered notifications.",
+                        "2026-07-11T20:00:16.000Z error [windows-store-updater] "
+                        "Failed to check for updates errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            failures = client_usage_export.scan_codex_desktop_failure_events(
+                log_root,
+                datetime(2026, 7, 12),
+                datetime(2026, 7, 13),
+            )
+
+        self.assertEqual(failures, [])
+
 
 class AttributionLedgerTests(unittest.TestCase):
     def test_stable_event_id_wins_when_route_time_changes(self) -> None:
