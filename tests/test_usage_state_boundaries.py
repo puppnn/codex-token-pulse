@@ -579,6 +579,66 @@ class LocalActiveAccountTests(unittest.TestCase):
         self.assertEqual(seven_day_models, [("today-model", 1_000)])
         self.assertEqual(sum(int(row["tokens"]) for row in all_time), 10_000)
 
+    def test_local_30d_account_rows_use_history_without_export_scan(self) -> None:
+        app = object.__new__(monitor.FloatingMonitorApp)
+        app.state = monitor.MonitorState(
+            client_usage={"providers": []},
+            top_accounts=[
+                {
+                    "name": "Codex local - account@example.com",
+                    "source_badge": "LOCAL",
+                }
+            ],
+        )
+        today = monitor.today_key()
+        history = {
+            "schema": 2,
+            "days": {
+                today: {
+                    "requests": 3,
+                    "tokens": 1_000,
+                    "cost": 1.0,
+                    "providers": [
+                        {
+                            "name": "Codex local - account@example.com",
+                            "requests": 2,
+                            "tokens": 900,
+                            "cost": 0.9,
+                            "models": {"gpt-test": 900},
+                        }
+                    ],
+                }
+            },
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(monitor, "USAGE_HISTORY_JSON", Path(temporary_directory) / "history.json"),
+        ):
+            monitor.USAGE_HISTORY_JSON.write_text(json.dumps(history), encoding="utf-8")
+            rows = app._history_account_rows("30d")
+
+        self.assertEqual(sum(int(row["tokens"]) for row in rows), 1_000)
+        account = next(row for row in rows if row["name"].endswith("account@example.com"))
+        gap = next(row for row in rows if row.get("is_history_detail_gap"))
+        self.assertEqual(account["tokens"], 900)
+        self.assertEqual(account["source_badge"], "LOCAL")
+        self.assertEqual(gap["name"], "历史明细缺口")
+        self.assertEqual(gap["tokens"], 100)
+        self.assertFalse(app._needs_server_account_30d())
+        app.state.top_accounts.append({"name": "server-account", "source_badge": "SUB"})
+        self.assertTrue(app._needs_server_account_30d())
+
+    def test_client_usage_cache_never_requests_expensive_local_30d_scan(self) -> None:
+        client = monitor.Sub2APIClient()
+        client.include_account_30d = True
+        with patch.object(monitor, "load_client_usage", return_value={"providers": []}) as loader:
+            client._load_client_usage_cached()
+
+        loader.assert_called_once_with(
+            include_30d=False,
+            backfill_history_details=False,
+        )
+
 
 class LatestRequestFallbackTests(unittest.TestCase):
     def test_account_fallback_events_merge_after_direct_bucket_latest(self) -> None:

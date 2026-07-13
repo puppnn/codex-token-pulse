@@ -1536,17 +1536,16 @@ class Sub2APIClient:
         if (
             self._client_usage_cache is not None
             and now - self._client_usage_cache_at < CLIENT_USAGE_CACHE_SECONDS
-            and (not self.include_account_30d or self._client_usage_cache_has_30d)
             and (not self.include_history_details or self._client_usage_cache_has_history_details)
         ):
             return self._client_usage_cache
         client_usage = load_client_usage(
-            include_30d=self.include_account_30d,
+            include_30d=False,
             backfill_history_details=self.include_history_details,
         )
         self._client_usage_cache = client_usage
         self._client_usage_cache_at = now
-        self._client_usage_cache_has_30d = self.include_account_30d
+        self._client_usage_cache_has_30d = False
         self._client_usage_cache_has_history_details = self.include_history_details
         return client_usage
 
@@ -2038,69 +2037,76 @@ class Sub2APIClient:
 
 
 class Theme:
-    """Neutral charcoal palette with restrained periwinkle-blue data accents."""
-    # ── base surfaces ──
-    bg_dark = "#18181B"
-    bg_card = "#202023"
-    bg_section = "#26262B"
-    bg_lift = "#2B2B31"
-    bg_hover = "#39393F"
+    """Cool light glass palette inspired by electron-liquid-glass."""
+    # ── translucent-looking surfaces ──
+    bg_dark = "#E7EDF5"
+    bg_card = "#EAF0F7"
+    bg_section = "#F4F7FB"
+    bg_lift = "#DDE6F0"
+    bg_hover = "#D8E8FA"
+    glass_surface = "#F5F8FC"
+    glass_highlight = "#FFFFFF"
+    glass_edge = "#C4D0DE"
+    glass_shadow = "#9AA7B9"
+    glass_pink = "#E7A9C7"
+    glass_blue = "#83AEE8"
+    glass_cyan = "#78D6D1"
 
     # ── primary blue ramp ──
-    amber_dim = "#405F98"
-    amber = "#6E9DF8"
-    amber_bright = "#F4F4F6"
-    amber_glow = "#97B8F8"
+    amber_dim = "#6E819B"
+    amber = "#355F92"
+    amber_bright = "#A66710"
+    amber_glow = "#7289C9"
 
     # ── secondary accents ──
-    cyan = "#8DB2F8"
-    cyan_dim = "#44444B"
-    violet = "#B5C8F5"
-    blue = "#4E7FE4"
+    cyan = "#19789A"
+    cyan_dim = "#B7D7E8"
+    violet = "#7056A8"
+    blue = "#3972BA"
 
     # ── text ──
-    text_primary = "#F5F5F7"
-    text_secondary = "#B8B8BF"
-    text_muted = "#888891"
+    text_primary = "#1D293D"
+    text_secondary = "#506078"
+    text_muted = "#78869A"
 
     # ── semantic ──
-    accent_cyan = "#8DB2F8"
-    accent_red = "#F06A6A"
-    accent_green = "#68C995"
-    quota_red_bg = "#412B30"
-    quota_amber_bg = "#413829"
-    quota_green_bg = "#263A34"
-    ag_bg = "#29292E"
-    ag_surface = "#27272C"
-    ag_surface_hover = "#39393F"
-    ag_border = "#35353B"
-    ag_divider = "#303035"
-    ag_accent = "#6E9DF8"
-    ag_bar = "#87ACF5"
-    ag_success = "#68C995"
-    ag_warn = "#E2B45B"
-    ag_crit = "#F06A6A"
-    ag_muted = "#92929B"
-    ag_input = "#91B4F8"
-    ag_cache = "#6E9DF8"
-    ag_output = "#4E7FE4"
-    ag_reason = "#BBCDF8"
+    accent_cyan = "#197F9A"
+    accent_red = "#C94654"
+    accent_green = "#23845A"
+    quota_red_bg = "#F8E5E8"
+    quota_amber_bg = "#F8EDD9"
+    quota_green_bg = "#E0F1E9"
+    ag_bg = "#E2E9F1"
+    ag_surface = "#F5F8FC"
+    ag_surface_hover = "#EAF2FC"
+    ag_border = "#C7D2DF"
+    ag_divider = "#D6DFE9"
+    ag_accent = "#2E67B7"
+    ag_bar = "#4C8CCE"
+    ag_success = "#23845A"
+    ag_warn = "#B87716"
+    ag_crit = "#C94654"
+    ag_muted = "#6E7B8E"
+    ag_input = "#3E7BC4"
+    ag_cache = "#7358AD"
+    ag_output = "#21849A"
+    ag_reason = "#A85892"
 
     # ── misc ──
-    border = "#34343A"
-    shadow = "#0E0E10"
+    border = "#CBD6E2"
+    shadow = "#A5B0BF"
     transparent = "#010203"
 
     # ── fonts (family, size, weight) ──
-    font_title = ("Segoe UI", 18, "bold")
-    font_section = ("Segoe UI", 11, "bold")
-    font_label = ("Segoe UI", 10, "normal")
-    font_label_bold = ("Segoe UI", 10, "bold")
-    font_value = ("Segoe UI", 18, "bold")
-    font_value_sm = ("Segoe UI", 14, "bold")
-    font_tiny = ("Segoe UI", 9, "normal")
-    font_micro = ("Segoe UI", 8, "normal")
-    font_icon = ("Segoe UI", 13, "normal")
+    font_title = ("Segoe UI Variable Display", 17, "bold")
+    font_section = ("Microsoft YaHei UI", 10, "bold")
+    font_label = ("Microsoft YaHei UI", 9, "normal")
+    font_label_bold = ("Microsoft YaHei UI", 9, "bold")
+    font_value = ("Segoe UI Variable Display", 17, "bold")
+    font_value_sm = ("Segoe UI Variable Display", 13, "bold")
+    font_tiny = ("Microsoft YaHei UI", 8, "normal")
+    font_micro = ("Microsoft YaHei UI", 8, "normal")
+    font_icon = ("Segoe UI", 12, "normal")
 
 
 class FloatingMonitorApp:
@@ -2110,7 +2116,7 @@ class FloatingMonitorApp:
     HEIGHT = 760
     MIN_WIDTH = 360
     MIN_HEIGHT = 640
-    WINDOW_ALPHA = 0.99
+    WINDOW_ALPHA = 0.985
 
     def __init__(self) -> None:
         self.WIDTH = int(type(self).WIDTH)
@@ -2233,6 +2239,127 @@ class FloatingMonitorApp:
         pts = self._rounded_rect_points(x1, y1, x2, y2, r)
         return self.canvas.create_polygon(pts, smooth=True, **kw)
 
+    def _draw_glass_panel(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        r: int = 10,
+        *,
+        fill: str | None = None,
+        outline: str | None = None,
+        shadow: bool = False,
+        highlight: bool = True,
+    ) -> int:
+        """Draw a layered glass-like surface without changing layout geometry."""
+        fill = fill or Theme.glass_surface
+        outline = outline or Theme.glass_edge
+        if shadow:
+            self._draw_rounded_rect(
+                x1 + 2,
+                y1 + 3,
+                x2 + 2,
+                y2 + 3,
+                r=r,
+                fill=Theme.glass_shadow,
+                outline="",
+            )
+        panel_id = self._draw_rounded_rect(
+            x1,
+            y1,
+            x2,
+            y2,
+            r=r,
+            fill=fill,
+            outline=outline,
+            width=1,
+        )
+        if highlight and x2 - x1 > r * 2 + 8 and y2 - y1 >= 12:
+            self.canvas.create_line(
+                x1 + r,
+                y1 + 1,
+                x2 - r,
+                y1 + 1,
+                fill=Theme.glass_highlight,
+                width=1,
+            )
+        return panel_id
+
+    def _draw_window_control(self, name: str, cx: int, cy: int, *, active: bool = False) -> None:
+        hovered = self._hover_btn == name
+        fill = Theme.glass_highlight if hovered else (Theme.bg_hover if active else Theme.ag_surface)
+        outline = Theme.glass_blue if hovered or active else Theme.ag_border
+        if name == "btn_close" and hovered:
+            fill = Theme.quota_red_bg
+            outline = Theme.accent_red
+        self._draw_glass_panel(
+            cx - 9,
+            cy - 9,
+            cx + 9,
+            cy + 9,
+            r=7,
+            fill=fill,
+            outline=outline,
+            highlight=hovered,
+        )
+        fg = Theme.ag_accent if hovered or active else Theme.text_secondary
+        if name == "btn_close":
+            fg = Theme.accent_red if hovered else Theme.text_secondary
+            self.canvas.create_line(cx - 3, cy - 3, cx + 3, cy + 3, fill=fg, width=2)
+            self.canvas.create_line(cx + 3, cy - 3, cx - 3, cy + 3, fill=fg, width=2)
+        elif name == "btn_refresh":
+            if self._loading or self._refresh_pending:
+                fg = Theme.accent_cyan
+            self.canvas.create_arc(
+                cx - 5,
+                cy - 5,
+                cx + 5,
+                cy + 5,
+                start=38,
+                extent=278,
+                style="arc",
+                outline=fg,
+                width=2,
+            )
+            self.canvas.create_polygon(
+                cx + 3,
+                cy - 5,
+                cx + 6,
+                cy - 5,
+                cx + 5,
+                cy - 2,
+                fill=fg,
+                outline="",
+            )
+        else:
+            points = [
+                cx - 3,
+                cy - 5,
+                cx + 3,
+                cy - 5,
+                cx + 2,
+                cy - 1,
+                cx + 4,
+                cy + 1,
+                cx + 1,
+                cy + 1,
+                cx,
+                cy + 5,
+                cx - 1,
+                cy + 1,
+                cx - 4,
+                cy + 1,
+                cx - 2,
+                cy - 1,
+            ]
+            self.canvas.create_polygon(
+                points,
+                fill=fg if active else "",
+                outline=fg,
+                width=1,
+            )
+
     def _apply_window_size(self, width: int, height: int) -> None:
         width = int(max(self.MIN_WIDTH, width))
         height = int(max(self.MIN_HEIGHT, height))
@@ -2271,8 +2398,8 @@ class FloatingMonitorApp:
         height = 18 * len(lines) + 8
         x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
         y = min(max(8, self._tooltip_pos[1] + 14), max(8, H - height - 8))
-        self._draw_rounded_rect(x, y, x + width, y + height, r=6,
-                                fill=Theme.bg_lift, outline=Theme.ag_accent, width=1)
+        self._draw_glass_panel(x, y, x + width, y + height, r=7,
+                               fill=Theme.glass_highlight, outline=Theme.ag_accent, shadow=True)
         for index, line in enumerate(lines):
             self.canvas.create_text(x + 9, y + 7 + index * 18, anchor="nw",
                                     text=line, font=self._fonts["font_micro"], fill=Theme.text_primary)
@@ -2315,7 +2442,8 @@ class FloatingMonitorApp:
     def _draw_pill(self, x: int, y: int, text: str, color: str, max_w: int) -> None:
         label = self._truncate(text, "font_tiny", max_w - 14)
         width = min(max_w, self._text_width(label, "font_tiny") + 14)
-        self._draw_rounded_rect(x, y, x + width, y + 22, r=8, fill=Theme.bg_dark, outline=Theme.border)
+        self._draw_glass_panel(x, y, x + width, y + 22, r=8,
+                               fill=Theme.glass_surface, outline=Theme.border)
         self.canvas.create_text(x + 7, y + 4, anchor="nw", text=label, font=self._fonts["font_tiny"], fill=color)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2340,7 +2468,8 @@ class FloatingMonitorApp:
             return 0
         color = self._health_color(label)
         width = self._text_width(label, "font_micro") + 14
-        self._draw_rounded_rect(x, y, x + width, y + 17, r=7, fill=Theme.bg_dark, outline=color)
+        self._draw_glass_panel(x, y, x + width, y + 17, r=7,
+                               fill=Theme.glass_surface, outline=color, highlight=False)
         self.canvas.create_text(x + 7, y + 2, anchor="nw", text=label, font=self._fonts["font_micro"], fill=color)
         return width
 
@@ -2360,18 +2489,24 @@ class FloatingMonitorApp:
         total_gap = gap * (len(tabs) - 1)
         tab_w = max(62, (col_r - col_l - total_gap) // len(tabs))
         tab_h = 25
+        self._draw_glass_panel(col_l - 2, y - 2, col_r + 2, y + tab_h + 2, r=10,
+                               fill=Theme.ag_bg, outline=Theme.glass_edge)
         for index, (button_name, label, value) in enumerate(tabs):
             x1 = col_l + index * (tab_w + gap)
             x2 = col_r if index == len(tabs) - 1 else x1 + tab_w
             self._btn_rects[button_name] = (x1, y, x2, y + tab_h)
             selected = self._main_tab == value
             hovered = self._hover_btn == button_name
-            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
-            self._draw_rounded_rect(x1, y, x2, y + tab_h, r=7, fill=fill, outline=outline, width=1)
+            fill = Theme.glass_highlight if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            outline = Theme.glass_blue if selected else (Theme.glass_highlight if hovered else Theme.ag_bg)
+            text_color = Theme.ag_accent if selected else (Theme.text_primary if hovered else Theme.ag_muted)
+            self._draw_glass_panel(x1, y, x2, y + tab_h, r=8, fill=fill, outline=outline,
+                                   highlight=selected or hovered)
             self.canvas.create_text((x1 + x2) // 2, y + 12, anchor="center", text=label,
                                     font=self._fonts["font_label_bold"], fill=text_color)
+            if selected:
+                self.canvas.create_line(x1 + 12, y + tab_h - 2, x2 - 12, y + tab_h - 2,
+                                        fill=Theme.ag_accent, width=2)
         return y + tab_h + 10
 
     def _draw_ag_section(self, col_l: int, col_r: int, y: int, title: str, badge: str = "") -> int:
@@ -2379,8 +2514,8 @@ class FloatingMonitorApp:
                                 font=self._fonts["font_section"], fill=Theme.text_primary)
         if badge:
             bw = self._text_width(badge, "font_micro") + 14
-            self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
-                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_glass_panel(col_r - bw, y - 1, col_r, y + 18, r=7,
+                                   fill=Theme.ag_surface, outline=Theme.ag_border)
             self.canvas.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
                                     font=self._fonts["font_micro"], fill=Theme.ag_muted)
         return y + 24
@@ -2407,7 +2542,8 @@ class FloatingMonitorApp:
 
     def _draw_ag_chip(self, x: int, y: int, text: str, dot: str | None = None) -> int:
         width = self._text_width(text, "font_micro") + (24 if dot else 14)
-        self._draw_rounded_rect(x, y, x + width, y + 20, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_glass_panel(x, y, x + width, y + 20, r=8,
+                               fill=Theme.ag_surface, outline=Theme.ag_border)
         tx = x + 7
         if dot:
             self.canvas.create_oval(x + 7, y + 7, x + 13, y + 13, fill=dot, outline="")
@@ -2431,16 +2567,16 @@ class FloatingMonitorApp:
     @staticmethod
     def _activity_color(intensity: float) -> str:
         if intensity <= 0:
-            return "#2D2D32"
+            return "#E3EAF2"
         if intensity < 0.18:
-            return "#3D4C6B"
+            return "#C8DDF0"
         if intensity < 0.38:
-            return "#5276B7"
+            return "#91BCE3"
         if intensity < 0.68:
-            return "#6E9DF8"
+            return "#6095CF"
         if intensity < 0.9:
-            return "#91B4F8"
-        return "#3975E5"
+            return "#3D75B8"
+        return "#24578F"
 
     def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
         if is_today:
@@ -2539,6 +2675,39 @@ class FloatingMonitorApp:
                 "models": {},
             }
         return list(aggregated.values())
+
+    def _history_account_rows(self, range_key: str) -> list[dict[str, Any]]:
+        current_rows = list(self.state.top_accounts or []) if self.state else []
+        current_by_name = {
+            str(row.get("name") or ""): row
+            for row in current_rows
+            if isinstance(row, dict) and row.get("name")
+        }
+        rows: list[dict[str, Any]] = []
+        for provider in self._usage_range_providers(range_key):
+            raw_name = str(provider.get("name") or "Local client")
+            is_gap = raw_name == "Historical detail gap"
+            row = dict(current_by_name.get(raw_name) or {})
+            row.update(
+                {
+                    "name": "历史明细缺口" if is_gap else raw_name,
+                    "requests": int(provider.get("requests") or 0),
+                    "tokens": int(provider.get("tokens") or 0),
+                    "cost": float(provider.get("cost") or 0),
+                    "models": dict(provider.get("models") or {}),
+                    "source_badge": "" if is_gap else str(row.get("source_badge") or "LOCAL"),
+                    "health_badge": "",
+                    "is_history_detail_gap": is_gap,
+                }
+            )
+            rows.append(row)
+        return rows
+
+    def _needs_server_account_30d(self) -> bool:
+        return any(
+            isinstance(row, dict) and str(row.get("source_badge") or "") == "SUB"
+            for row in (self.state.top_accounts or [])
+        ) if self.state else False
 
     def _top_models(self, range_key: str) -> list[tuple[str, int]]:
         totals: dict[str, int] = {}
@@ -2715,14 +2884,14 @@ class FloatingMonitorApp:
         c.create_text(col_l, y, anchor="nw", text="Activity",
                       font=self._fonts["font_section"], fill=Theme.text_primary)
         chip_x = col_l + self._text_width("Activity", "font_section") + 10
-        self._draw_rounded_rect(chip_x, y - 1, chip_x + 78, y + 18, r=6,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_glass_panel(chip_x, y - 1, chip_x + 78, y + 18, r=7,
+                               fill=Theme.ag_surface, outline=Theme.ag_border)
         c.create_text(chip_x + 39, y + 8, anchor="center", text="Contribution",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         badge = f"{summary.get('label', '-') } heatmap"
         bw = self._text_width(badge, "font_micro") + 14
-        self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_glass_panel(col_r - bw, y - 1, col_r, y + 18, r=7,
+                               fill=Theme.ag_surface, outline=Theme.ag_border)
         c.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         y += 28
@@ -2804,7 +2973,7 @@ class FloatingMonitorApp:
                 if tokens > 0:
                     shine_w = max(3, int(cell_w * min(1.0, intensity) * 0.18))
                     self._draw_rounded_rect(x1 + 3, grid_y + 3, x1 + 3 + shine_w, grid_y + 6,
-                                            r=2, fill=Theme.amber_glow, outline="")
+                                            r=2, fill=Theme.glass_highlight, outline="")
                 self._add_tooltip(
                     x1,
                     grid_y,
@@ -2909,7 +3078,8 @@ class FloatingMonitorApp:
         c.create_text(col_l, legend_y + 1, anchor="nw", text="Less",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         legend_x = col_l + 30
-        for idx, color in enumerate(["#2D2D32", "#3D4C6B", "#5276B7", "#6E9DF8", "#3975E5"]):
+        legend_colors = [self._activity_color(value) for value in (0.0, 0.1, 0.3, 0.6, 1.0)]
+        for idx, color in enumerate(legend_colors):
             self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
                                     r=2, fill=color, outline=Theme.ag_border)
         c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
@@ -3130,17 +3300,25 @@ class FloatingMonitorApp:
             name = f"usage_range_{value}"
             selected = self._usage_range == value
             self._btn_rects[name] = (x - 3, y - 4, x + btn_w + 3, y + 24)
-            fill = Theme.bg_hover if selected else Theme.ag_surface
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else Theme.ag_muted
-            self._draw_rounded_rect(x, y - 1, x + btn_w, y + 21, r=6, fill=fill, outline=outline)
+            hovered = self._hover_btn == name
+            fill = Theme.glass_highlight if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
+            outline = Theme.glass_blue if selected else (Theme.glass_highlight if hovered else Theme.ag_border)
+            text_color = Theme.ag_accent if selected else (Theme.text_primary if hovered else Theme.ag_muted)
+            self._draw_glass_panel(x, y - 1, x + btn_w, y + 21, r=7,
+                                   fill=fill, outline=outline, highlight=selected or hovered)
             c.create_text(x + btn_w // 2, y + 10, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)
+            if selected:
+                c.create_line(x + 10, y + 18, x + btn_w - 10, y + 18,
+                              fill=Theme.ag_accent, width=2)
             x += btn_w + gap
         y += 28
 
         hero_h = 78
-        self._draw_rounded_rect(col_l, y, col_r, y + hero_h, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_glass_panel(col_l, y, col_r, y + hero_h, r=12,
+                               fill=Theme.glass_surface, outline=Theme.glass_edge, shadow=True)
+        c.create_line(col_l + 14, y + 3, col_l + 74, y + 3, fill=Theme.glass_blue, width=2)
+        c.create_line(col_l + 76, y + 3, col_l + 102, y + 3, fill=Theme.glass_cyan, width=2)
         c.create_text(col_l + 12, y + 10, anchor="nw", text="Total Tokens",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         c.create_text(col_l + 12, y + 29, anchor="nw", text=compact_number(summary["tokens"]),
@@ -3185,7 +3363,8 @@ class FloatingMonitorApp:
         for index, (label, value_text, color) in enumerate(chip_items):
             cx = col_l + (index % 2) * (chip_w + 8)
             cy = y + (index // 2) * 34
-            self._draw_rounded_rect(cx, cy, cx + chip_w, cy + 27, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_glass_panel(cx, cy, cx + chip_w, cy + 27, r=8,
+                                   fill=Theme.ag_surface, outline=Theme.ag_border)
             c.create_oval(cx + 8, cy + 10, cx + 15, cy + 17, fill=color, outline="")
             c.create_text(cx + 22, cy + 6, anchor="nw", text=label,
                           font=self._fonts["font_micro"], fill=Theme.text_secondary)
@@ -3266,8 +3445,10 @@ class FloatingMonitorApp:
             y += 28
         else:
             max_model_tokens = max(tokens for _model, tokens in models) or 1
-            for model, tokens in models[:5]:
-                self._draw_rounded_rect(col_l, y, col_r, y + 29, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            model_row_limit = max(0, min(5, (H - 56 - y) // 34))
+            for model, tokens in models[:model_row_limit]:
+                self._draw_glass_panel(col_l, y, col_r, y + 29, r=8,
+                                       fill=Theme.ag_surface, outline=Theme.ag_border)
                 c.create_text(col_l + 9, y + 7, anchor="nw",
                               text=self._truncate(model, "font_micro", max(90, col_r - col_l - 124)),
                               font=self._fonts["font_micro"], fill=Theme.text_primary)
@@ -3284,11 +3465,19 @@ class FloatingMonitorApp:
             self._usage_range_providers(self._usage_range),
             key=lambda row: (-float(row.get("cost") or 0), -int(row.get("tokens") or 0), str(row.get("name") or "")),
         )
+        list_bottom = H - 38
+        if y + 24 >= list_bottom:
+            self._scroll_limits["stats"] = 0
+            self._scroll_offsets["stats"] = 0
+            return
         y = self._draw_ag_section(col_l, col_r, y, "Account Cumulative", f"{len(providers)} accounts")
         list_top = y
-        list_bottom = H - 38
         row_h = 48
-        available_rows = max(1, (list_bottom - list_top) // row_h)
+        available_rows = max(0, (list_bottom - list_top) // row_h)
+        if available_rows <= 0:
+            self._scroll_limits["stats"] = 0
+            self._scroll_offsets["stats"] = 0
+            return
         max_start_index = max(0, len(providers) - available_rows)
         max_scroll = max_start_index * row_h
         self._scroll_limits["stats"] = max_scroll
@@ -3302,8 +3491,8 @@ class FloatingMonitorApp:
         visible_providers = providers[first_index:first_index + available_rows]
         for visible_index, provider in enumerate(visible_providers):
             row_y = list_top + visible_index * row_h
-            self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 7, r=6,
-                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_glass_panel(col_l, row_y, col_r, row_y + row_h - 7, r=8,
+                                   fill=Theme.ag_surface, outline=Theme.ag_border)
             name = self._truncate(local_provider_display_name(str(provider.get("name") or "-")),
                                   "font_label", max(90, col_r - col_l - 132))
             tokens = compact_number(provider.get("tokens", 0))
@@ -3337,13 +3526,15 @@ class FloatingMonitorApp:
         COL_L = PAD
         COL_R = W - PAD
 
-        # ── outer card background ──
-        self._draw_rounded_rect(4, 7, W - 2, H - 2, r=18, fill=Theme.shadow, outline="")
-        self._draw_rounded_rect(0, 0, W, H - 5, r=18, fill=Theme.bg_card, outline=Theme.border, width=1)
-
-        # ── subtle top accent lines ──
-        c.create_line(20, 2, W // 2 - 8, 2, fill=Theme.amber, width=2)
-        c.create_line(W // 2 + 8, 2, W - 20, 2, fill=Theme.cyan_dim, width=2)
+        # ── liquid-glass shell: shadow, bright rim and subtle chromatic edge ──
+        self._draw_rounded_rect(5, 8, W - 1, H - 1, r=20, fill=Theme.shadow, outline="")
+        self._draw_glass_panel(1, 1, W - 3, H - 6, r=20,
+                               fill=Theme.bg_card, outline=Theme.glass_edge)
+        self._draw_rounded_rect(3, 3, W - 5, H - 8, r=18,
+                                fill="", outline=Theme.glass_highlight, width=1)
+        c.create_line(24, 2, W // 3, 2, fill=Theme.glass_pink, width=2)
+        c.create_line(W // 3 + 3, 2, W * 2 // 3, 2, fill=Theme.glass_blue, width=2)
+        c.create_line(W * 2 // 3 + 3, 2, W - 24, 2, fill=Theme.glass_cyan, width=2)
 
         # ════════════════════════════════════════════════════════
         #  HEADER  (row y=10..48)
@@ -3351,14 +3542,19 @@ class FloatingMonitorApp:
         y = 16
         title_text = "Token Pulse"
         c.create_text(COL_L, y, anchor="nw", text=title_text,
-                       font=self._fonts["font_title"], fill=Theme.amber_bright)
+                       font=self._fonts["font_title"], fill=Theme.text_primary)
 
         if self._loading:
             brightness = int(128 + 127 * math.sin(self._pulse_phase))
-            dot_color = f"#{brightness // 2:02x}{brightness:02x}{brightness:02x}"
-            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=dot_color, outline="")
+            dot_color = f"#{brightness // 3:02x}{min(255, brightness):02x}{min(255, brightness + 20):02x}"
+            c.create_oval(COL_R - 80, y + 3, COL_R - 66, y + 17,
+                          fill=Theme.bg_lift, outline=Theme.glass_highlight)
+            c.create_oval(COL_R - 77, y + 6, COL_R - 69, y + 14, fill=dot_color, outline="")
         elif self.state:
-            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=Theme.accent_green, outline="")
+            c.create_oval(COL_R - 80, y + 3, COL_R - 66, y + 17,
+                          fill=Theme.quota_green_bg, outline=Theme.glass_highlight)
+            c.create_oval(COL_R - 77, y + 6, COL_R - 69, y + 14,
+                          fill=Theme.accent_green, outline="")
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
         if self._refresh_pending:
@@ -3371,32 +3567,27 @@ class FloatingMonitorApp:
         if self.state and self.state.mode == "local-codex":
             subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
         c.create_text(COL_L, y + 24, anchor="nw", text=subtitle,
-                      font=self._fonts["font_micro"], fill=Theme.amber)
+                      font=self._fonts["font_micro"], fill=Theme.text_secondary)
 
         btn_y = y - 2
         btn_specs = [
-            ("btn_close", "\u00d7", COL_R - 14),
-            ("btn_pin", "\u7f6e" if self._pinned else "\u9876", COL_R - 36),
-            ("btn_refresh", "\u21bb", COL_R - 58),
+            ("btn_close", COL_R - 14),
+            ("btn_pin", COL_R - 36),
+            ("btn_refresh", COL_R - 58),
         ]
         self._btn_rects.clear()
-        for name, glyph, bx in btn_specs:
+        for name, bx in btn_specs:
             bx1, by1, bx2, by2 = bx - 9, btn_y - 2, bx + 9, btn_y + 16
             self._btn_rects[name] = (bx1, by1, bx2, by2)
-            is_hover = self._hover_btn == name
-            bg = Theme.bg_hover if is_hover else ""
-            if bg:
-                self._draw_rounded_rect(bx1, by1, bx2, by2, r=4, fill=bg, outline="")
-            fg = Theme.amber_bright if is_hover else Theme.text_secondary
-            if name == "btn_close":
-                fg = Theme.accent_red if is_hover else Theme.text_secondary
-            elif name == "btn_refresh" and (self._loading or self._refresh_pending):
-                fg = Theme.cyan
-            c.create_text(bx, btn_y + 7, text=glyph, font=self._fonts["font_icon"],
-                           fill=fg, anchor="center")
+            self._draw_window_control(name, bx, btn_y + 7,
+                                      active=name == "btn_pin" and self._pinned)
+        self._add_tooltip(*self._btn_rects["btn_refresh"], "刷新")
+        self._add_tooltip(*self._btn_rects["btn_pin"], "取消置顶" if self._pinned else "置顶")
+        self._add_tooltip(*self._btn_rects["btn_close"], "关闭")
 
         y = 52
-        c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
+        c.create_line(COL_L, y, COL_R, y, fill=Theme.glass_highlight, width=1)
+        c.create_line(COL_L, y + 1, COL_R, y + 1, fill=Theme.border, width=1)
         y += 10
         y = self._draw_main_tabs(COL_L, COL_R, y)
         if self._main_tab == "stats":
@@ -3409,7 +3600,8 @@ class FloatingMonitorApp:
         #  CURRENT CHANNEL HERO
         # ════════════════════════════════════════════════════════
         y += 12
-        self._draw_rounded_rect(COL_L, y, COL_R, y + 72, r=13, fill=Theme.bg_section, outline=Theme.border)
+        self._draw_glass_panel(COL_L, y, COL_R, y + 72, r=13,
+                               fill=Theme.glass_surface, outline=Theme.glass_edge, shadow=True)
         all_active_accounts = list(self.state.active_accounts or []) if self.state else []
         accounts = all_active_accounts
         latest_name = self.state.latest_account_name if self.state else ""
@@ -3423,7 +3615,8 @@ class FloatingMonitorApp:
             hero_name = latest_name or ("\u6b63\u5728\u8bfb\u53d6\u6570\u636e" if self._loading or not self.state else "\u6682\u65e0\u6570\u636e")
             hero_sub = f"\u6700\u8fd1 {status} / {ago}" if status != "-" else ("\u521d\u59cb\u5316\u4e2d" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42")
             hero_color = color if status != "-" else Theme.cyan
-        c.create_rectangle(COL_L + 12, y + 13, COL_L + 58, y + 15, fill=Theme.cyan, outline="")
+        c.create_line(COL_L + 12, y + 13, COL_L + 43, y + 13, fill=Theme.glass_blue, width=2)
+        c.create_line(COL_L + 45, y + 13, COL_L + 58, y + 13, fill=Theme.glass_cyan, width=2)
         c.create_text(COL_L + 12, y + 22, anchor="nw", text=self._truncate(hero_name, "font_label_bold", COL_R - COL_L - 32),
                       font=self._fonts["font_label_bold"], fill=Theme.text_primary)
         self._draw_pill(COL_L + 12, y + 44, hero_sub, hero_color, 170)
@@ -3475,6 +3668,9 @@ class FloatingMonitorApp:
         else:
             active_list_top = y
             active_list_bottom = y + visible_active_rows * active_row_h
+            self._draw_glass_panel(COL_L, active_list_top - 5, COL_R,
+                                   active_list_bottom - 2, r=9,
+                                   fill=Theme.ag_surface, outline=Theme.ag_border)
             self._active_scroll_rect = (
                 COL_L,
                 active_list_top,
@@ -3497,10 +3693,13 @@ class FloatingMonitorApp:
             if name != full_name:
                 self._add_tooltip(name_x, y, pill_left - 8, y + 21, full_name)
             frac_text = f"{compact_number(cur)}/{compact_number(mx)}"
-            self._draw_rounded_rect(COL_R - pill_w, y - 2, COL_R - 4, y + 21, r=8,
-                                    fill=Theme.bg_section, outline=Theme.border)
+            self._draw_glass_panel(COL_R - pill_w, y - 2, COL_R - 4, y + 21, r=8,
+                                   fill=Theme.bg_hover, outline=Theme.glass_blue)
             c.create_text(COL_R - 4 - pill_w / 2, y + 9, anchor="center", text=frac_text,
                            font=self._fonts["font_label_bold"], fill=Theme.accent_green)
+            if acc is not visible_accounts[-1]:
+                c.create_line(COL_L + 8, y + active_row_h - 3, COL_R - 8,
+                              y + active_row_h - 3, fill=Theme.ag_divider, width=1)
             y += active_row_h
 
         if active_scroll_limit > 0 and self._active_scroll_rect is not None:
@@ -3558,6 +3757,8 @@ class FloatingMonitorApp:
                 ("\u6a21\u578b", model),
                 ("\u65f6\u95f4", relative_time(created) if created else "-"),
             ]
+            self._draw_glass_panel(COL_L, y - 5, COL_R, y + len(label_pairs) * 19 + 1,
+                                   r=9, fill=Theme.ag_surface, outline=Theme.ag_border)
             for lbl, val in label_pairs:
                 c.create_text(COL_L + 8, y, anchor="nw", text=lbl,
                                font=self._fonts["font_tiny"], fill=Theme.text_muted)
@@ -3567,6 +3768,8 @@ class FloatingMonitorApp:
                                font=self._fonts["font_label"], fill=value_color)
                 y += 19
         else:
+            self._draw_glass_panel(COL_L, y - 5, COL_R, y + 24,
+                                   r=9, fill=Theme.ag_surface, outline=Theme.ag_border)
             c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u6700\u8fd1\u8bf7\u6c42" if self._loading or not self.state else "\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55"),
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 22
@@ -3594,13 +3797,13 @@ class FloatingMonitorApp:
         y += 24
 
         stats = [
-            ("\u8bf7\u6c42", compact_number(self.state.today_requests) if self.state else "0", Theme.amber_bright),
+            ("\u8bf7\u6c42", compact_number(self.state.today_requests) if self.state else "0", Theme.ag_accent),
             ("Token", compact_number(self.state.today_tokens) if self.state else "0", Theme.cyan),
             ("\u6210\u672c", money(self.state.today_account_cost) if self.state else "$0", Theme.violet),
         ]
         col_w = (COL_R - COL_L) // 3
-        self._draw_rounded_rect(COL_L, y - 5, COL_R, y + 43, r=8,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_glass_panel(COL_L, y - 5, COL_R, y + 43, r=10,
+                               fill=Theme.ag_surface, outline=Theme.ag_border)
         for i, (lbl, val, color) in enumerate(stats):
             cx = COL_L + col_w * i + col_w // 2
             if i:
@@ -3680,7 +3883,10 @@ class FloatingMonitorApp:
             "7d": "7d \u5468\u671f",
             "30d": "\u8fd1 30 \u5929",
         }.get(self._account_range, "\u4eca\u65e5")
-        if range_key:
+        if self._account_range == "30d" and not self._needs_server_account_30d():
+            top = self._history_account_rows("30d")
+            top.sort(key=lambda row: account_usage_sort_key(row, "30d"))
+        elif range_key:
             top = []
             for account in raw_top:
                 if self._account_range in {"5h", "7d"} and account.get("is_pool_aggregate"):
@@ -3741,12 +3947,16 @@ class FloatingMonitorApp:
             self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
             selected = self._account_range == value
             hovered = self._hover_btn == button_name
-            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
-            self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=6, fill=fill, outline=outline, width=1)
+            fill = Theme.glass_highlight if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
+            outline = Theme.glass_blue if selected else (Theme.glass_highlight if hovered else Theme.ag_border)
+            text_color = Theme.ag_accent if selected else (Theme.text_primary if hovered else Theme.ag_muted)
+            self._draw_glass_panel(x1, y - 1, x2, y - 1 + tab_h, r=7,
+                                   fill=fill, outline=outline, highlight=selected or hovered)
             c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)
+            if selected:
+                c.create_line(x1 + 11, y + tab_h - 4, x2 - 11, y + tab_h - 4,
+                              fill=Theme.ag_accent, width=2)
         y += 27
 
         if not top:
@@ -3807,8 +4017,8 @@ class FloatingMonitorApp:
             else:
                 bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
 
-            self._draw_rounded_rect(COL_L, y - 3, COL_R, y + row_h - 5, r=6,
-                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_glass_panel(COL_L, y - 3, COL_R, y + row_h - 5, r=8,
+                                   fill=Theme.ag_surface, outline=Theme.ag_border)
             marker_bottom = y + (42 if window_mode else 23)
             c.create_rectangle(COL_L, y + 2, COL_L + 3, marker_bottom, fill=bar_color, outline="")
             if source_label:
@@ -3937,7 +4147,7 @@ class FloatingMonitorApp:
             else:
                 cost_w = self._text_width(cost, "font_label_bold")
                 c.create_text(COL_R - 4, y, anchor="ne", text=cost,
-                              font=self._fonts["font_label_bold"], fill=Theme.amber_bright)
+                              font=self._fonts["font_label_bold"], fill=Theme.ag_success)
                 c.create_text(COL_R - 12 - cost_w, y, anchor="ne", text=f"{tokens} Token",
                               font=self._fonts["font_label_bold"], fill=bar_color)
 
@@ -4032,11 +4242,7 @@ class FloatingMonitorApp:
             self._resizing = False
             self._usage_range = btn.replace("usage_range_", "")
             self._scroll_offsets["stats"] = 0
-            if self._usage_range == "30d" and not self.client.include_account_30d:
-                self.client.include_account_30d = True
-                self.client.clear_client_usage_cache()
-                self.refresh_async()
-            elif self._usage_range == "all" and not self.client.include_history_details:
+            if self._usage_range == "all" and not self.client.include_history_details:
                 self.client.include_history_details = True
                 self.client.clear_client_usage_cache()
                 self.refresh_async()
@@ -4053,7 +4259,11 @@ class FloatingMonitorApp:
             }[btn]
             self._account_range_user_selected = True
             self._scroll_offsets["accounts"] = 0
-            if self._account_range == "30d" and not self.client.include_account_30d:
+            if (
+                self._account_range == "30d"
+                and self._needs_server_account_30d()
+                and not self.client.include_account_30d
+            ):
                 self.client.include_account_30d = True
                 self.client.clear_client_usage_cache()
                 self.refresh_async()
