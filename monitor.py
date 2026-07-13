@@ -251,6 +251,20 @@ def ranking_account_display_name(account_name: str) -> str:
     return name
 
 
+def balanced_active_row_capacity(
+    window_height: int,
+    default_height: int,
+    row_height: int = 26,
+    base_rows: int = 3,
+) -> int:
+    """Give one third of added page height to the active-account list."""
+    row_height = max(1, int(row_height))
+    base_rows = max(1, int(base_rows))
+    extra_height = max(0, int(window_height) - int(default_height))
+    active_extra_budget = extra_height // 3
+    return base_rows + active_extra_budget // row_height
+
+
 def compact_number(value: float | int | None) -> str:
     number = float(value or 0)
     sign = "-" if number < 0 else ""
@@ -262,6 +276,14 @@ def compact_number(value: float | int | None) -> str:
     if number >= 1_000:
         return f"{sign}{number / 1_000:.1f}K"
     return f"{sign}{int(number):,}"
+
+
+def exact_token_count(value: float | int | None) -> str:
+    try:
+        number = int(float(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        number = 0
+    return f"{number:,}"
 
 
 def money(value: float | int | None) -> str:
@@ -561,6 +583,21 @@ def relative_time(value: str | None) -> str:
     return f"{hours // 24}天前"
 
 
+def usage_sync_label(sync: dict[str, Any] | None) -> str:
+    if not isinstance(sync, dict):
+        return ""
+    state = str(sync.get("state") or "").lower()
+    labels = {
+        "partial": "\u4eca\u65e5\u5df2\u66f4\u65b0 / \u5386\u53f2\u8865\u5f55\u672a\u5b8c\u6210",
+        "timeout": "\u8865\u5f55\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
+        "error": "\u5237\u65b0\u5931\u8d25 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
+        "unavailable": "\u672c\u5730\u91c7\u96c6\u4e0d\u53ef\u7528",
+        "stale": "\u7b49\u5f85\u4eca\u65e5\u6570\u636e",
+        "cached": "\u663e\u793a\u7f13\u5b58\u6570\u636e",
+    }
+    return labels.get(state, "")
+
+
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -794,35 +831,174 @@ def load_client_usage(
     include_30d: bool = False,
     backfill_history_details: bool = False,
 ) -> dict[str, Any] | None:
+    attempted_at = datetime.now(CN_TZ).isoformat(timespec="seconds")
+    before_mtime_ns: int | None = None
+    before_content: bytes | None = None
+    try:
+        before_mtime_ns = CLIENT_USAGE_JSON.stat().st_mtime_ns
+        before_content = CLIENT_USAGE_JSON.read_bytes()
+    except OSError:
+        pass
+    export_state = "cached"
+    export_message = ""
+    export_attempted = False
     if CLIENT_USAGE_EXPORT.exists():
+        export_attempted = True
         try:
             command = [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)]
             if include_30d:
                 command.append("--include-30d")
             if backfill_history_details:
                 command.append("--backfill-history-details")
-            subprocess.run(
+            completed = subprocess.run(
                 command,
                 cwd=str(APP_DIR),
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 timeout=CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-        except Exception:
-            pass
-    if not CLIENT_USAGE_JSON.exists():
-        return None
+            if completed.returncode == 0:
+                export_state = "ok"
+            else:
+                export_state = "error"
+                detail = str(completed.stderr or "").strip().splitlines()
+                export_message = (
+                    detail[-1][:240]
+                    if detail
+                    else f"Exporter exited with code {completed.returncode}"
+                )
+        except subprocess.TimeoutExpired:
+            export_state = "timeout"
+            export_message = f"Exporter timed out after {CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS}s"
+        except OSError as exc:
+            export_state = "error"
+            export_message = f"{type(exc).__name__}: {exc}"[:240]
+        except Exception as exc:
+            export_state = "error"
+            export_message = f"{type(exc).__name__}: {exc}"[:240]
+    elif not CLIENT_USAGE_JSON.exists():
+        export_state = "unavailable"
+        export_message = "Usage exporter and cache are unavailable"
+
+    after_mtime_ns: int | None = None
+    after_content: bytes | None = None
     try:
-        data = json.loads(CLIENT_USAGE_JSON.read_text(encoding="utf-8", errors="ignore"))
+        after_mtime_ns = CLIENT_USAGE_JSON.stat().st_mtime_ns
+        after_content = CLIENT_USAGE_JSON.read_bytes()
+    except OSError:
+        pass
+    output_changed = after_mtime_ns is not None and (
+        after_mtime_ns != before_mtime_ns or after_content != before_content
+    )
+
+    sync_status: dict[str, Any] = {
+        "state": export_state,
+        "message": export_message,
+        "attempted_at": attempted_at,
+        "fresh": False,
+        "cache_used": False,
+    }
+    if not CLIENT_USAGE_JSON.exists():
+        sync_status["cache_used"] = True
+        return {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "providers": [],
+            "active_sessions": [],
+            "latest_request": {},
+            "dashboard": {},
+            "updated_at": "",
+            "date": "",
+            "stale": True,
+            "sync": sync_status,
+        }
+    try:
+        raw_text = (
+            after_content.decode("utf-8", errors="ignore")
+            if after_content is not None
+            else CLIENT_USAGE_JSON.read_text(encoding="utf-8", errors="ignore")
+        )
+        data = json.loads(raw_text)
     except Exception:
-        return None
+        sync_status.update(
+            {
+                "state": "error",
+                "message": "Usage cache is not valid JSON",
+                "cache_used": True,
+            }
+        )
+        return {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "providers": [],
+            "active_sessions": [],
+            "latest_request": {},
+            "dashboard": {},
+            "updated_at": "",
+            "date": "",
+            "stale": True,
+            "sync": sync_status,
+        }
     today = data.get("today") if isinstance(data, dict) else None
     if not isinstance(today, dict):
-        return None
+        sync_status.update(
+            {
+                "state": "error",
+                "message": "Usage cache has no today payload",
+                "cache_used": True,
+            }
+        )
+        return {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "providers": [],
+            "active_sessions": [],
+            "latest_request": {},
+            "dashboard": {},
+            "updated_at": data.get("updated_at") if isinstance(data, dict) else "",
+            "date": str(data.get("date") or "") if isinstance(data, dict) else "",
+            "stale": True,
+            "sync": sync_status,
+        }
     data_date = str(data.get("date") or "").strip()
+    offline_catchup = data.get("offline_catchup")
+    if isinstance(offline_catchup, dict):
+        sync_status["offline_catchup"] = offline_catchup
+    if export_state == "ok" and isinstance(offline_catchup, dict):
+        catchup_state = str(offline_catchup.get("state") or "")
+        if catchup_state == "error":
+            sync_status["state"] = "partial"
+            sync_status["message"] = str(
+                offline_catchup.get("message") or "Historical catch-up failed"
+            )[:240]
+    if export_state in {"timeout", "error"} and output_changed:
+        sync_status["state"] = "partial"
+        sync_status["message"] = (
+            "Today is updated, but historical catch-up did not finish"
+            if export_state == "timeout"
+            else "Today is updated, but post-processing did not finish"
+        )
+    current_date = data_date == today_key()
+    sync_status["fresh"] = bool(current_date and (output_changed or export_state == "ok"))
+    sync_status["cache_used"] = not bool(sync_status["fresh"])
+    sync_status["updated_at"] = data.get("updated_at") or ""
     if data_date and data_date != today_key():
+        sync_status.update(
+            {
+                "state": "stale",
+                "message": f"Cached usage belongs to {data_date}",
+                "fresh": False,
+                "cache_used": True,
+            }
+        )
         return {
             "requests": 0,
             "tokens": 0,
@@ -834,7 +1010,17 @@ def load_client_usage(
             "updated_at": data.get("updated_at") or "",
             "date": data_date,
             "stale": True,
+            "sync": sync_status,
         }
+    if export_attempted and export_state == "ok" and not output_changed:
+        sync_status.update(
+            {
+                "state": "stale",
+                "message": "Exporter finished without updating the cache",
+                "fresh": False,
+                "cache_used": True,
+            }
+        )
     return {
         "requests": int(today.get("requests") or 0),
         "tokens": int(today.get("tokens") or 0),
@@ -845,7 +1031,8 @@ def load_client_usage(
         "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
         "updated_at": data.get("updated_at") or "",
         "date": data_date,
-        "stale": False,
+        "stale": bool(sync_status.get("cache_used")),
+        "sync": sync_status,
     }
 
 
@@ -1311,6 +1498,7 @@ class MonitorState:
     top_accounts: list[dict[str, Any]] | None = None
     client_usage: dict[str, Any] | None = None
     client_usage_history: dict[str, Any] | None = None
+    usage_sync: dict[str, Any] | None = None
 
 
 def build_local_monitor_state(
@@ -1408,6 +1596,7 @@ def build_local_monitor_state(
             )
 
     active_accounts = local_active_accounts_from_client_usage(client_usage)
+    usage_sync = client_usage.get("sync") if isinstance(client_usage.get("sync"), dict) else {}
     return MonitorState(
         loading=False,
         error=error_text,
@@ -1425,6 +1614,7 @@ def build_local_monitor_state(
         top_accounts=top_accounts,
         client_usage=client_usage,
         client_usage_history=summarize_usage_history(load_usage_history()),
+        usage_sync=usage_sync,
     )
 
 
@@ -2033,6 +2223,12 @@ class Sub2APIClient:
             top_accounts=top_accounts,
             client_usage=client_usage,
             client_usage_history=summarize_usage_history(load_usage_history()),
+            usage_sync=(
+                raw_client_usage.get("sync")
+                if isinstance(raw_client_usage, dict)
+                and isinstance(raw_client_usage.get("sync"), dict)
+                else {}
+            ),
         )
 
 
@@ -2136,6 +2332,18 @@ class FloatingMonitorApp:
         self._scroll_offsets = {"accounts": 0, "active": 0, "stats": 0}
         self._scroll_limits = {"accounts": 0, "active": 0, "stats": 0}
         self._active_scroll_rect: tuple[int, int, int, int] | None = None
+        self._list_scrollbar_tracks: dict[str, tuple[int, int, int, int] | None] = {
+            "accounts": None,
+            "active": None,
+            "stats": None,
+        }
+        self._list_scrollbar_thumbs: dict[str, tuple[int, int, int, int] | None] = {
+            "accounts": None,
+            "active": None,
+            "stats": None,
+        }
+        self._list_scrollbar_drag_tab: str | None = None
+        self._list_scrollbar_drag_offset = 0
         self._usage_range = "24h"
         self._account_range = "today"
         self._account_range_user_selected = False
@@ -2349,6 +2557,61 @@ class FloatingMonitorApp:
                                 font=self._fonts["font_tiny"], fill=Theme.text_muted)
         self.canvas.create_line(W - 18, H - 7, W - 7, H - 18, fill=Theme.border, width=1)
         self.canvas.create_line(W - 13, H - 7, W - 7, H - 13, fill=Theme.text_muted, width=1)
+
+    def _draw_list_scrollbar(
+        self,
+        tab: str,
+        track_x: int,
+        track_top: int,
+        track_bottom: int,
+        visible_items: int,
+        total_items: int,
+        max_scroll: int,
+    ) -> None:
+        if max_scroll <= 0 or visible_items <= 0 or total_items <= visible_items:
+            return
+        track_h = max(0, track_bottom - track_top)
+        if track_h < 12:
+            return
+        thumb_h = max(12, int(track_h * visible_items / total_items))
+        thumb_h = min(track_h, thumb_h)
+        thumb_travel = max(0, track_h - thumb_h)
+        offset = max(0, min(max_scroll, int(self._scroll_offsets.get(tab, 0) or 0)))
+        thumb_top = track_top
+        if thumb_travel > 0:
+            thumb_top += int(thumb_travel * offset / max_scroll)
+        thumb_bottom = thumb_top + thumb_h
+
+        self.canvas.create_rectangle(
+            track_x,
+            track_top,
+            track_x + 2,
+            track_bottom,
+            fill=Theme.border,
+            outline="",
+        )
+        self.canvas.create_rectangle(
+            track_x,
+            thumb_top,
+            track_x + 2,
+            thumb_bottom,
+            fill=Theme.amber,
+            outline="",
+        )
+
+        hit_pad = 5
+        self._list_scrollbar_tracks[tab] = (
+            track_x - hit_pad,
+            track_top,
+            track_x + 2 + hit_pad,
+            track_bottom,
+        )
+        self._list_scrollbar_thumbs[tab] = (
+            track_x - hit_pad,
+            thumb_top,
+            track_x + 2 + hit_pad,
+            thumb_bottom,
+        )
 
     def _draw_main_tabs(self, col_l: int, col_r: int, y: int) -> int:
         tabs = [
@@ -2814,7 +3077,7 @@ class FloatingMonitorApp:
                         failure_note += f" at {failure_time}"
                 self._add_tooltip(
                     x1, y1, x1 + cell, y1 + cell,
-                    f"{hour:02d}:00-{(hour + 1) % 24:02d}:00\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}{failure_note}",
+                    f"{hour:02d}:00-{(hour + 1) % 24:02d}:00\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}{failure_note}",
                 )
             legend_y = grid_y + rows_count * (cell + cell_gap) + 8
         elif self._usage_range == "7d":
@@ -2842,7 +3105,7 @@ class FloatingMonitorApp:
                     grid_y,
                     x1 + cell_w,
                     grid_y + cell_h,
-                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                    f"{item.get('date', '-')}\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
                 )
             legend_y = grid_y + cell_h + 9
         elif self._usage_range == "30d":
@@ -2870,7 +3133,7 @@ class FloatingMonitorApp:
                     y1,
                     x1 + cell,
                     y1 + cell,
-                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                    f"{item.get('date', '-')}\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
                 )
             axis_y = grid_y + cell + 3
             c.create_text(grid_x, axis_y, anchor="nw", text="30d ago",
@@ -2934,7 +3197,7 @@ class FloatingMonitorApp:
                                         fill=self._activity_color(intensity), outline=Theme.ag_border)
                 self._add_tooltip(
                     x1, y1, x1 + cell, y1 + cell,
-                    f"{item.get('date', '-')}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                    f"{item.get('date', '-')}\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
                 )
             legend_y = grid_y + rows_count * (cell + cell_gap) + 8
 
@@ -2955,7 +3218,7 @@ class FloatingMonitorApp:
         peak_tokens = int(float(peak.get("tokens") or 0))
         peak_label = f"{int(peak.get('hour')):02d}:00" if self._usage_range == "24h" and peak.get("hour") is not None else str(peak.get("date") or "-")
         c.create_text(col_r, legend_y + 1, anchor="ne",
-                      text=f"Peak: {peak_label} ({compact_number(peak_tokens)})",
+                      text=f"Peak: {peak_label} ({exact_token_count(peak_tokens)})",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         return legend_y + 23
 
@@ -3173,13 +3436,17 @@ class FloatingMonitorApp:
 
         hero_h = 78
         self._draw_rounded_rect(col_l, y, col_r, y + hero_h, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        mid = col_l + (col_r - col_l) // 2
+        total_tokens_text = exact_token_count(summary["tokens"])
+        total_tokens_font = "font_value"
+        if self._text_width(total_tokens_text, total_tokens_font) > mid - col_l - 24:
+            total_tokens_font = "font_value_sm"
         c.create_text(col_l + 12, y + 10, anchor="nw", text="Total Tokens",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
-        c.create_text(col_l + 12, y + 29, anchor="nw", text=compact_number(summary["tokens"]),
-                      font=self._fonts["font_value"], fill=Theme.ag_accent)
+        c.create_text(col_l + 12, y + 29, anchor="nw", text=total_tokens_text,
+                      font=self._fonts[total_tokens_font], fill=Theme.ag_accent)
         c.create_text(col_l + 12, y + 56, anchor="nw", text=f"{compact_number(summary['requests'])} calls",
                       font=self._fonts["font_micro"], fill=Theme.text_secondary)
-        mid = col_l + (col_r - col_l) // 2
         c.create_line(mid, y + 12, mid, y + hero_h - 12, fill=Theme.ag_divider, width=1)
         c.create_text(mid + 14, y + 10, anchor="nw", text="Estimated Cost",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
@@ -3199,15 +3466,15 @@ class FloatingMonitorApp:
         cache_base = mix["input"] + mix["cached"] + mix["cache_create"]
         cache_hit_text = f"{mix['cached'] * 100 / cache_base:.1f}%" if cache_base > 0 else "-"
         chip_items = [
-            ("Input", compact_number(mix["input"]), Theme.ag_input),
-            ("Cache Read", compact_number(mix["cached"]), Theme.ag_cache),
+            ("Input", exact_token_count(mix["input"]), Theme.ag_input),
+            ("Cache Read", exact_token_count(mix["cached"]), Theme.ag_cache),
             ("Cache Hit", cache_hit_text, Theme.ag_success),
-            ("Cache Write", compact_number(mix["cache_create"]), Theme.ag_reason),
-            ("Output", compact_number(mix["output"]), Theme.ag_output),
+            ("Cache Write", exact_token_count(mix["cache_create"]), Theme.ag_reason),
+            ("Output", exact_token_count(mix["output"]), Theme.ag_output),
         ]
         if mix.get("unknown", 0) > 0:
             token_items.append(("Untracked", mix["unknown"], Theme.ag_muted))
-            chip_items.append(("Untracked", compact_number(mix["unknown"]), Theme.ag_muted))
+            chip_items.append(("Untracked", exact_token_count(mix["unknown"]), Theme.ag_muted))
         mix_total = sum(value for _label, value, _color in token_items)
         chip_badge = f"{summary['label']} mix"
         if mix.get("unknown", 0) > 0:
@@ -3228,12 +3495,21 @@ class FloatingMonitorApp:
         bar_w = col_r - col_l
         self._draw_rounded_rect(bar_x, y, bar_x + bar_w, y + 8, r=3, fill=Theme.ag_bg, outline="")
         cursor = bar_x
-        for _label, value, color in token_items:
+        for label, value, color in token_items:
             if mix_total <= 0 or value <= 0:
                 continue
             seg_w = int(bar_w * value / mix_total)
-            c.create_rectangle(cursor, y, min(bar_x + bar_w, cursor + seg_w), y + 8, fill=color, outline="")
-            cursor += seg_w
+            segment_end = min(bar_x + bar_w, cursor + seg_w)
+            c.create_rectangle(cursor, y, segment_end, y + 8, fill=color, outline="")
+            if segment_end > cursor:
+                self._add_tooltip(
+                    cursor,
+                    y,
+                    segment_end,
+                    y + 8,
+                    f"{label}\n{exact_token_count(value)}",
+                )
+            cursor = segment_end
         y += 22
 
         series = summary.get("series") if isinstance(summary, dict) else []
@@ -3274,7 +3550,7 @@ class FloatingMonitorApp:
                     y1,
                     x1 + cell,
                     y1 + cell,
-                    f"{tip_title}\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
+                    f"{tip_title}\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
                 )
             heatmap_rows = max(1, math.ceil(len(visible) / cols))
             if self._usage_range == "24h":
@@ -3304,12 +3580,19 @@ class FloatingMonitorApp:
                               text=self._truncate(model, "font_micro", max(90, col_r - col_l - 124)),
                               font=self._fonts["font_micro"], fill=Theme.text_primary)
                 pct = int(tokens * 100 / max_model_tokens)
-                c.create_text(col_r - 9, y + 7, anchor="ne", text=f"{compact_number(tokens)} tok",
+                c.create_text(col_r - 9, y + 7, anchor="ne", text=exact_token_count(tokens),
                               font=self._fonts["font_micro"], fill=Theme.text_secondary)
                 self._draw_rounded_rect(col_l + 9, y + 22, col_r - 9, y + 25, r=1, fill=Theme.ag_bg, outline="")
                 fill_w = int((col_r - col_l - 18) * pct / 100)
                 self._draw_rounded_rect(col_l + 9, y + 22, col_l + 9 + fill_w, y + 25, r=1,
                                         fill=Theme.ag_accent, outline="")
+                self._add_tooltip(
+                    col_l + 9,
+                    y + 20,
+                    col_r - 9,
+                    y + 27,
+                    f"{model}\n{exact_token_count(tokens)}",
+                )
                 y += 34
 
         providers = sorted(
@@ -3336,21 +3619,38 @@ class FloatingMonitorApp:
             row_y = list_top + visible_index * row_h
             self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 7, r=6,
                                     fill=Theme.ag_surface, outline=Theme.ag_border)
-            name = self._truncate(local_provider_display_name(str(provider.get("name") or "-")),
-                                  "font_label", max(90, col_r - col_l - 132))
-            tokens = compact_number(provider.get("tokens", 0))
+            provider_name = local_provider_display_name(str(provider.get("name") or "-"))
+            name = self._truncate(provider_name, "font_label", max(90, col_r - col_l - 132))
+            tokens = exact_token_count(provider.get("tokens", 0))
             cost_value = float(provider.get("cost") or 0)
             requests_count = compact_number(provider.get("requests", 0))
             c.create_text(col_l + 9, row_y + 6, anchor="nw", text=name,
                           font=self._fonts["font_label"], fill=Theme.text_primary)
             c.create_text(col_r - 9, row_y + 6, anchor="ne", text=money(cost_value),
                           font=self._fonts["font_label_bold"], fill=Theme.ag_success)
-            c.create_text(col_l + 9, row_y + 24, anchor="nw", text=f"{tokens} tok  \u00b7  {requests_count} calls",
+            c.create_text(col_l + 9, row_y + 24, anchor="nw", text=f"{tokens}  \u00b7  {requests_count} calls",
                           font=self._fonts["font_micro"], fill=Theme.ag_muted)
             bar_w = int((col_r - col_l - 18) * min(1.0, cost_value / max_provider_cost))
             if bar_w > 0:
                 c.create_rectangle(col_l + 9, row_y + 38, col_l + 9 + bar_w, row_y + 40,
                                    fill=Theme.ag_bar, outline="")
+                self._add_tooltip(
+                    col_l + 9,
+                    row_y + 35,
+                    col_r - 9,
+                    row_y + 43,
+                    f"{provider_name}\n{tokens}\n{money(cost_value)}",
+                )
+
+        self._draw_list_scrollbar(
+            "stats",
+            col_r - 1,
+            list_top,
+            min(list_bottom - 2, list_top + len(visible_providers) * row_h - 7),
+            len(visible_providers),
+            len(providers),
+            max_scroll,
+        )
 
     def _draw(self) -> None:
         if self.closed:
@@ -3359,6 +3659,8 @@ class FloatingMonitorApp:
         c.delete("all")
         self._tooltip_rects = []
         self._active_scroll_rect = None
+        self._list_scrollbar_tracks = {"accounts": None, "active": None, "stats": None}
+        self._list_scrollbar_thumbs = {"accounts": None, "active": None, "stats": None}
         self._scroll_limits["active"] = 0
         W, H = self.WIDTH, self.HEIGHT
         actual_w = self.root.winfo_width()
@@ -3385,20 +3687,30 @@ class FloatingMonitorApp:
         c.create_text(COL_L, y, anchor="nw", text=title_text,
                        font=self._fonts["font_title"], fill=Theme.amber_bright)
 
+        sync_state = str((self.state.usage_sync or {}).get("state") or "") if self.state else ""
         if self._loading:
             brightness = int(128 + 127 * math.sin(self._pulse_phase))
             dot_color = f"#{brightness // 2:02x}{brightness:02x}{brightness:02x}"
             c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=dot_color, outline="")
         elif self.state:
-            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=Theme.accent_green, outline="")
+            if sync_state in {"timeout", "error", "unavailable", "stale"}:
+                status_color = Theme.accent_red
+            elif sync_state == "partial":
+                status_color = Theme.ag_warn
+            else:
+                status_color = Theme.accent_green
+            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=status_color, outline="")
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
         if self._refresh_pending:
             updated = "\u5237\u65b0\u5df2\u6392\u961f"
         else:
             updated = "\u6b63\u5728\u5237\u65b0" if self._loading else "\u7b49\u5f85\u5237\u65b0"
-        if self.state and self.state.updated_at:
+        if self.state and self.state.updated_at and not self._loading and not self._refresh_pending:
             updated = relative_time(datetime.fromtimestamp(self.state.updated_at, timezone.utc).isoformat())
+        sync_label = usage_sync_label(self.state.usage_sync if self.state else None)
+        if sync_label and not self._loading and not self._refresh_pending:
+            updated = sync_label
         subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
         if self.state and self.state.mode == "local-codex":
             subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
@@ -3472,8 +3784,11 @@ class FloatingMonitorApp:
 
         y += 24
         active_row_h = 26
-        extra_active_rows = max(0, (H - int(type(self).HEIGHT)) // active_row_h)
-        active_capacity = max(3, 3 + extra_active_rows)
+        active_capacity = balanced_active_row_capacity(
+            H,
+            int(type(self).HEIGHT),
+            active_row_h,
+        )
         visible_active_rows = min(len(accounts), active_capacity)
         max_active_start = max(0, len(accounts) - visible_active_rows)
         active_scroll_limit = max_active_start * active_row_h
@@ -3536,29 +3851,14 @@ class FloatingMonitorApp:
             y += active_row_h
 
         if active_scroll_limit > 0 and self._active_scroll_rect is not None:
-            track_x = COL_R - 1
-            track_top = self._active_scroll_rect[1]
-            track_bottom = self._active_scroll_rect[3] - 3
-            track_h = max(1, track_bottom - track_top)
-            thumb_h = max(12, int(track_h * visible_active_rows / len(accounts)))
-            thumb_y = track_top + int(
-                (track_h - thumb_h) * first_active_index / max_active_start
-            )
-            c.create_rectangle(
-                track_x,
-                track_top,
-                track_x + 2,
-                track_bottom,
-                fill=Theme.border,
-                outline="",
-            )
-            c.create_rectangle(
-                track_x,
-                thumb_y,
-                track_x + 2,
-                thumb_y + thumb_h,
-                fill=Theme.amber,
-                outline="",
+            self._draw_list_scrollbar(
+                "active",
+                COL_R - 1,
+                self._active_scroll_rect[1],
+                self._active_scroll_rect[3] - 3,
+                visible_active_rows,
+                len(accounts),
+                active_scroll_limit,
             )
 
         y += 4
@@ -3686,7 +3986,7 @@ class FloatingMonitorApp:
                     bar_y,
                     x2,
                     bar_y + bar_h,
-                    f"{item.get('date', '-')}\n{compact_number(int(cost))} token\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
+                    f"{item.get('date', '-')}\n{exact_token_count(cost)}\n{compact_number(item.get('requests', 0))} calls · {money(item.get('cost', 0))}",
                 )
             y += 72
         else:
@@ -3783,6 +4083,7 @@ class FloatingMonitorApp:
             c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
                           font=self._fonts["font_micro"], fill=text_color)
         y += 27
+        rank_list_top = y
 
         if not top:
             if self._loading or not self.state:
@@ -3985,6 +4286,16 @@ class FloatingMonitorApp:
                 c.create_line(COL_L + 8, y + 27, COL_R - 4, y + 27, fill=Theme.border, width=1)
             y += row_h
 
+        self._draw_list_scrollbar(
+            "accounts",
+            COL_R - 1,
+            rank_list_top - 3,
+            min(H - 44, rank_list_top + len(display_top) * row_h - 5),
+            len(display_top),
+            len(top),
+            max_scroll,
+        )
+
         self._draw_footer(W, H)
         self._draw_tooltip(W, H)
 
@@ -4013,6 +4324,41 @@ class FloatingMonitorApp:
     #  DRAG
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    @staticmethod
+    def _point_in_rect(x: int, y: int, rect: tuple[int, int, int, int] | None) -> bool:
+        if rect is None:
+            return False
+        x1, y1, x2, y2 = rect
+        return x1 <= x <= x2 and y1 <= y <= y2
+
+    def _scrollbar_tab_at(self, x: int, y: int) -> str | None:
+        if self._main_tab == "accounts":
+            candidates = ("active", "accounts")
+        elif self._main_tab == "stats":
+            candidates = ("stats",)
+        else:
+            candidates = ()
+        for tab in candidates:
+            if self._point_in_rect(x, y, self._list_scrollbar_tracks.get(tab)):
+                return tab
+        return None
+
+    def _set_list_scroll_from_thumb(self, tab: str, thumb_top: int) -> None:
+        track = self._list_scrollbar_tracks.get(tab)
+        thumb = self._list_scrollbar_thumbs.get(tab)
+        limit = int(self._scroll_limits.get(tab, 0) or 0)
+        if track is None or thumb is None or limit <= 0:
+            return
+        _x1, track_top, _x2, track_bottom = track
+        thumb_h = max(1, thumb[3] - thumb[1])
+        travel = max(0, track_bottom - track_top - thumb_h)
+        if travel <= 0:
+            self._scroll_offsets[tab] = 0
+            return
+        clamped_top = max(track_top, min(track_bottom - thumb_h, int(thumb_top)))
+        ratio = (clamped_top - track_top) / travel
+        self._scroll_offsets[tab] = max(0, min(limit, int(round(limit * ratio))))
+
     def _hit_button(self, x: int, y: int) -> str | None:
         for name, (x1, y1, x2, y2) in self._btn_rects.items():
             if name.startswith("main_") and x1 - 6 <= x <= x2 + 6 and y1 - 8 <= y <= y2 + 8:
@@ -4025,6 +4371,21 @@ class FloatingMonitorApp:
         return x >= self.WIDTH - 24 and y >= self.HEIGHT - 24
 
     def _on_press(self, event: tk.Event) -> None:
+        scrollbar_tab = self._scrollbar_tab_at(event.x, event.y)
+        if scrollbar_tab:
+            self._resizing = False
+            self._list_scrollbar_drag_tab = scrollbar_tab
+            thumb = self._list_scrollbar_thumbs.get(scrollbar_tab)
+            if self._point_in_rect(event.x, event.y, thumb) and thumb is not None:
+                self._list_scrollbar_drag_offset = int(event.y - thumb[1])
+            elif thumb is not None:
+                self._list_scrollbar_drag_offset = max(0, (thumb[3] - thumb[1]) // 2)
+                self._set_list_scroll_from_thumb(
+                    scrollbar_tab,
+                    int(event.y - self._list_scrollbar_drag_offset),
+                )
+                self._draw()
+            return
         btn = self._hit_button(event.x, event.y)
         if btn == "btn_close":
             self._resizing = False
@@ -4105,8 +4466,18 @@ class FloatingMonitorApp:
 
     def _on_release(self, _event: tk.Event) -> None:
         self._resizing = False
+        if self._list_scrollbar_drag_tab is not None:
+            self._list_scrollbar_drag_tab = None
+            self._draw()
 
     def _on_drag(self, event: tk.Event) -> None:
+        if self._list_scrollbar_drag_tab is not None:
+            self._set_list_scroll_from_thumb(
+                self._list_scrollbar_drag_tab,
+                int(event.y - self._list_scrollbar_drag_offset),
+            )
+            self._draw()
+            return
         if self._resizing:
             new_w = max(self.MIN_WIDTH, self._resize_data["w"] + event.x_root - self._resize_data["x"])
             new_h = max(self.MIN_HEIGHT, self._resize_data["h"] + event.y_root - self._resize_data["y"])
@@ -4120,7 +4491,11 @@ class FloatingMonitorApp:
         self.root.geometry(f"+{x}+{y}")
 
     def _on_motion(self, event: tk.Event) -> None:
-        if self._hit_resize_handle(event.x, event.y):
+        if self._list_scrollbar_drag_tab is not None or self._scrollbar_tab_at(
+            event.x, event.y
+        ) is not None:
+            self.canvas.configure(cursor="sb_v_double_arrow")
+        elif self._hit_resize_handle(event.x, event.y):
             self.canvas.configure(cursor="size_nw_se")
         else:
             self.canvas.configure(cursor="")
@@ -4235,7 +4610,7 @@ class FloatingMonitorApp:
             self._refresh_lock.release()
         except RuntimeError:
             pass
-        self.error = error
+        self.error = error or (result.error if result is not None else None)
         if result is not None:
             try:
                 result.cost_history = update_usage_history(result)

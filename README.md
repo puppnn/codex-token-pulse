@@ -101,11 +101,20 @@ CLIENT_USAGE_CODEX_DEFAULT_MODEL=gpt-5.5
 CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS=2000000
 CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT=
 CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS=86400
+CLIENT_USAGE_OFFLINE_BACKFILL_MAX_DAYS=31
+SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS=90
 SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
+
+悬浮窗关闭期间，Codex/Claude 仍会独立写入本地日志。重新打开后，导出器会先完整重建
+当天统计，再依据历史文件中的最后成功观测时间补录已经结束的日期。默认最多回看 31 天，
+可通过 `CLIENT_USAGE_OFFLINE_BACKFILL_MAX_DAYS` 调整；设为 `0` 可关闭跨天补录。补录只复用
+现有日志解析、去重、账号归属和计费规则，并对已有历史总量保留高水位，不会因一次日志暂缺
+把旧数据降下来。导出失败或超时时，界面会明确提示正在显示上次缓存；如果今日数据已经写入、
+只是历史补录未完成，则今日统计仍会正常更新。
 
 遇到本地价格表未收录的新模型时，导出器会从结构化在线价格源查询并写入
 `client_usage_model_prices.json`。缓存默认有效 24 小时；网络不可用或在线源未收录该模型时，

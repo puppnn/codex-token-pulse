@@ -20,6 +20,11 @@ class CompactNumberTests(unittest.TestCase):
     def test_values_below_one_billion_keep_m_suffix(self) -> None:
         self.assertEqual(monitor.compact_number(999_900_000), "999.9M")
 
+    def test_exact_token_count_never_uses_compact_suffixes(self) -> None:
+        self.assertEqual(monitor.exact_token_count(1_260_000_000), "1,260,000,000")
+        self.assertEqual(monitor.exact_token_count(999_900_000), "999,900,000")
+        self.assertEqual(monitor.exact_token_count(None), "0")
+
 
 class ModelPricingFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -2402,6 +2407,265 @@ class CodexSessionModelTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
 
+class OfflineHistoryCatchupTests(unittest.TestCase):
+    def history_row(self, day: date, tokens: int, provider: str = "account@example.com") -> dict:
+        return {
+            "date": day.isoformat(),
+            "source": "local",
+            "requests": max(0, tokens // 100),
+            "tokens": tokens,
+            "input_tokens": tokens,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "cost": round(tokens / 1_000_000, 6),
+            "models": {"gpt-test": tokens} if tokens else {},
+            "providers": [
+                {
+                    "name": f"Codex local - {provider}",
+                    "requests": max(0, tokens // 100),
+                    "tokens": tokens,
+                    "input_tokens": tokens,
+                    "cached_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost": round(tokens / 1_000_000, 6),
+                    "models": {"gpt-test": tokens} if tokens else {},
+                }
+            ] if tokens else [],
+            "detail_tokens": tokens,
+            "updated_at": f"{day.isoformat()}T12:00:00+08:00",
+            "source_date": day.isoformat(),
+        }
+
+    def test_reconcile_dates_cover_partial_last_day_and_closed_days(self) -> None:
+        last_seen = date(2026, 7, 10)
+        now = datetime(2026, 7, 13, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                last_seen.isoformat(): self.history_row(last_seen, 100),
+            },
+        }
+
+        targets = client_usage_export.offline_history_dates_to_reconcile(
+            history,
+            now,
+            max_days=31,
+        )
+
+        self.assertEqual(
+            targets,
+            [date(2026, 7, 10), date(2026, 7, 11), date(2026, 7, 12)],
+        )
+
+    def test_reconcile_never_reduces_existing_high_water(self) -> None:
+        day = date(2026, 7, 10)
+        existing = self.history_row(day, 1_000)
+        rebuilt = self.history_row(day, 400)
+
+        merged, changed = client_usage_export.merge_rebuilt_history_day(
+            existing,
+            rebuilt,
+            "2026-07-13T09:00:00+08:00",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(merged["tokens"], 1_000)
+        self.assertEqual(merged["providers"][0]["tokens"], 1_000)
+
+    def test_reconcile_can_enrich_details_without_reducing_total(self) -> None:
+        day = date(2026, 7, 10)
+        existing = self.history_row(day, 1_000)
+        existing["providers"] = []
+        existing["models"] = {}
+        existing["detail_tokens"] = 0
+        rebuilt = self.history_row(day, 400)
+
+        merged, changed = client_usage_export.merge_rebuilt_history_day(
+            existing,
+            rebuilt,
+            "2026-07-13T09:00:00+08:00",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(merged["tokens"], 1_000)
+        self.assertEqual(merged["providers"][0]["tokens"], 400)
+
+    def test_backfill_replaces_partial_day_and_is_idempotent(self) -> None:
+        first_day = date(2026, 7, 10)
+        second_day = date(2026, 7, 11)
+        now = datetime(2026, 7, 12, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                first_day.isoformat(): self.history_row(first_day, 100),
+            },
+        }
+        rebuilt = {
+            first_day.isoformat(): self.history_row(first_day, 250),
+            second_day.isoformat(): self.history_row(second_day, 500),
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                client_usage_export,
+                "USAGE_HISTORY_PATH",
+                Path(directory) / "usage_history.json",
+            ),
+            patch.object(
+                client_usage_export,
+                "build_historical_usage_rows",
+                return_value=rebuilt,
+            ),
+        ):
+            first = client_usage_export.backfill_offline_usage_history(
+                Path(directory),
+                Path(directory) / "sessions",
+                now,
+                {},
+                history=history,
+                target_days=[first_day, second_day],
+            )
+            saved_once = json.loads(
+                client_usage_export.USAGE_HISTORY_PATH.read_text(encoding="utf-8")
+            )
+            second = client_usage_export.backfill_offline_usage_history(
+                Path(directory),
+                Path(directory) / "sessions",
+                now,
+                {},
+                history=saved_once,
+                target_days=[first_day, second_day],
+            )
+            saved_twice = json.loads(
+                client_usage_export.USAGE_HISTORY_PATH.read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(first["updated_days"], 2)
+        self.assertEqual(second["updated_days"], 0)
+        self.assertEqual(saved_twice["days"][first_day.isoformat()]["tokens"], 250)
+        self.assertEqual(saved_twice["days"][second_day.isoformat()]["tokens"], 500)
+        self.assertEqual(saved_twice["offline_sync"]["state"], "complete")
+
+    def test_claude_daily_buckets_keep_days_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "claude.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-07-10T10:00:00+08:00",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "usage": {"input_tokens": 100, "output_tokens": 20},
+                    },
+                },
+                {
+                    "timestamp": "2026-07-11T10:00:00+08:00",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "usage": {"input_tokens": 200, "output_tokens": 30},
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+            buckets = client_usage_export.scan_claude_daily_buckets(
+                root,
+                datetime(2026, 7, 10),
+                datetime(2026, 7, 12),
+            )
+
+        self.assertEqual(buckets[date(2026, 7, 10)].total_tokens, 120)
+        self.assertEqual(buckets[date(2026, 7, 11)].total_tokens, 230)
+
+
+class ClientUsageSyncStatusTests(unittest.TestCase):
+    def payload(self, tokens: int) -> dict:
+        return {
+            "date": monitor.today_key(),
+            "today": {"requests": 1, "tokens": tokens, "cost": 0.1},
+            "providers": [],
+            "active_sessions": [],
+            "latest_request": {},
+            "dashboard": {},
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def test_timeout_keeps_same_day_cache_and_marks_it_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_path = root / "export.py"
+            usage_path = root / "usage.json"
+            export_path.write_text("# fixture", encoding="utf-8")
+            usage_path.write_text(json.dumps(self.payload(100)), encoding="utf-8")
+            with (
+                patch.object(monitor, "CLIENT_USAGE_EXPORT", export_path),
+                patch.object(monitor, "CLIENT_USAGE_JSON", usage_path),
+                patch.object(
+                    monitor.subprocess,
+                    "run",
+                    side_effect=monitor.subprocess.TimeoutExpired(["python"], 90),
+                ),
+            ):
+                usage = monitor.load_client_usage()
+
+        self.assertEqual(usage["tokens"], 100)
+        self.assertEqual(usage["sync"]["state"], "timeout")
+        self.assertTrue(usage["sync"]["cache_used"])
+        self.assertTrue(usage["stale"])
+
+    def test_timeout_after_current_output_write_is_only_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_path = root / "export.py"
+            usage_path = root / "usage.json"
+            export_path.write_text("# fixture", encoding="utf-8")
+            usage_path.write_text(json.dumps(self.payload(100)), encoding="utf-8")
+
+            def write_then_timeout(*_args, **_kwargs):
+                usage_path.write_text(json.dumps(self.payload(250)), encoding="utf-8")
+                raise monitor.subprocess.TimeoutExpired(["python"], 90)
+
+            with (
+                patch.object(monitor, "CLIENT_USAGE_EXPORT", export_path),
+                patch.object(monitor, "CLIENT_USAGE_JSON", usage_path),
+                patch.object(monitor.subprocess, "run", side_effect=write_then_timeout),
+            ):
+                usage = monitor.load_client_usage()
+
+        self.assertEqual(usage["tokens"], 250)
+        self.assertEqual(usage["sync"]["state"], "partial")
+        self.assertTrue(usage["sync"]["fresh"])
+        self.assertFalse(usage["stale"])
+
+    def test_successful_export_reports_fresh_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_path = root / "export.py"
+            usage_path = root / "usage.json"
+            export_path.write_text("# fixture", encoding="utf-8")
+            usage_path.write_text(json.dumps(self.payload(100)), encoding="utf-8")
+
+            def write_success(*args, **_kwargs):
+                usage_path.write_text(json.dumps(self.payload(300)), encoding="utf-8")
+                return monitor.subprocess.CompletedProcess(args[0], 0, stderr="")
+
+            with (
+                patch.object(monitor, "CLIENT_USAGE_EXPORT", export_path),
+                patch.object(monitor, "CLIENT_USAGE_JSON", usage_path),
+                patch.object(monitor.subprocess, "run", side_effect=write_success),
+            ):
+                usage = monitor.load_client_usage()
+
+        self.assertEqual(usage["tokens"], 300)
+        self.assertEqual(usage["sync"]["state"], "ok")
+        self.assertTrue(usage["sync"]["fresh"])
+        self.assertFalse(usage["stale"])
+
+
 class AttributionLedgerTests(unittest.TestCase):
     def test_stable_event_id_wins_when_route_time_changes(self) -> None:
         event = client_usage_export.UsageEvent(
@@ -2451,6 +2715,96 @@ class AttributionLedgerTests(unittest.TestCase):
 
         self.assertIn("Codex local - account@example.com", attributed)
         self.assertEqual(ledger[stable_id], "Codex local - account@example.com")
+
+
+class ListScrollbarTests(unittest.TestCase):
+    def test_added_height_is_shared_with_account_usage_rows(self) -> None:
+        default_height = monitor.FloatingMonitorApp.HEIGHT
+        enlarged_height = default_height + 260
+
+        active_capacity = monitor.balanced_active_row_capacity(
+            enlarged_height,
+            default_height,
+        )
+        active_growth = (active_capacity - 3) * 26
+        usage_growth = (enlarged_height - default_height) - active_growth
+
+        self.assertEqual(active_capacity, 6)
+        self.assertGreater(usage_growth, active_growth)
+        self.assertGreaterEqual(usage_growth, 2 * 64)
+
+    def test_small_height_increase_expands_both_sections(self) -> None:
+        default_height = monitor.FloatingMonitorApp.HEIGHT
+        enlarged_height = default_height + 100
+
+        active_capacity = monitor.balanced_active_row_capacity(
+            enlarged_height,
+            default_height,
+        )
+        usage_growth = 100 - (active_capacity - 3) * 26
+
+        self.assertEqual(active_capacity, 4)
+        self.assertGreaterEqual(usage_growth, 64)
+
+    def test_active_scrollbar_is_selected_independently(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._main_tab = "accounts"
+        app._list_scrollbar_tracks = {
+            "active": (0, 10, 12, 80),
+            "accounts": (0, 100, 12, 200),
+            "stats": None,
+        }
+
+        self.assertEqual(app._scrollbar_tab_at(5, 40), "active")
+        self.assertEqual(app._scrollbar_tab_at(5, 140), "accounts")
+        self.assertIsNone(app._scrollbar_tab_at(30, 40))
+
+    def test_thumb_position_maps_to_stats_scroll_range(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._list_scrollbar_tracks = {"accounts": None, "stats": (0, 10, 12, 110)}
+        app._list_scrollbar_thumbs = {"accounts": None, "stats": (0, 10, 12, 30)}
+        app._scroll_limits = {"accounts": 0, "stats": 480}
+        app._scroll_offsets = {"accounts": 0, "stats": 0}
+
+        app._set_list_scroll_from_thumb("stats", -100)
+        self.assertEqual(app._scroll_offsets["stats"], 0)
+        app._set_list_scroll_from_thumb("stats", 50)
+        self.assertEqual(app._scroll_offsets["stats"], 240)
+        app._set_list_scroll_from_thumb("stats", 999)
+        self.assertEqual(app._scroll_offsets["stats"], 480)
+
+    def test_thumb_position_maps_to_account_scroll_range(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._list_scrollbar_tracks = {"accounts": (0, 20, 12, 100), "stats": None}
+        app._list_scrollbar_thumbs = {"accounts": (0, 20, 12, 40), "stats": None}
+        app._scroll_limits = {"accounts": 390, "stats": 0}
+        app._scroll_offsets = {"accounts": 0, "stats": 0}
+
+        app._set_list_scroll_from_thumb("accounts", 999)
+
+        self.assertEqual(app._scroll_offsets["accounts"], 390)
+
+    def test_thumb_position_maps_to_active_scroll_range(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._list_scrollbar_tracks = {"active": (0, 20, 12, 100)}
+        app._list_scrollbar_thumbs = {"active": (0, 20, 12, 40)}
+        app._scroll_limits = {"active": 156}
+        app._scroll_offsets = {"active": 0}
+
+        app._set_list_scroll_from_thumb("active", 999)
+
+        self.assertEqual(app._scroll_offsets["active"], 156)
+
+    def test_thumb_without_travel_stays_at_top(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._list_scrollbar_tracks = {"accounts": None, "stats": (0, 10, 12, 30)}
+        app._list_scrollbar_thumbs = {"accounts": None, "stats": (0, 10, 12, 30)}
+        app._scroll_limits = {"stats": 48}
+        app._scroll_offsets = {"stats": 48}
+
+        app._set_list_scroll_from_thumb("stats", 20)
+
+        self.assertEqual(app._scroll_offsets["stats"], 0)
 
 
 if __name__ == "__main__":

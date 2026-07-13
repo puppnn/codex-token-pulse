@@ -86,6 +86,10 @@ CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS = int(
 ACCOUNT_30D_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_ACCOUNT_30D_CACHE_SECONDS", "300"))
 QUOTA_WINDOW_START_TOLERANCE_SECONDS = int(os.environ.get("CLIENT_USAGE_QUOTA_WINDOW_START_TOLERANCE_SECONDS", "10"))
 LATEST_REQUEST_LOOKBACK_DAYS = int(os.environ.get("CLIENT_USAGE_LATEST_REQUEST_LOOKBACK_DAYS", "7"))
+OFFLINE_HISTORY_BACKFILL_MAX_DAYS = max(
+    0,
+    int(os.environ.get("CLIENT_USAGE_OFFLINE_BACKFILL_MAX_DAYS", "31")),
+)
 UNASSIGNED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_UNASSIGNED_CODEX_LABEL", "Unassigned local")
 CODEX_FAST_COST_MULTIPLIER = env_float("CLIENT_USAGE_CODEX_FAST_COST_MULTIPLIER", 2.0)
 CODEX_FORCE_SPEED = os.environ.get("CLIENT_USAGE_CODEX_FORCE_SPEED", "").strip().lower()
@@ -3355,6 +3359,414 @@ def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, A
     return aggregate
 
 
+def load_usage_history_for_backfill() -> dict[str, Any]:
+    try:
+        history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema": 2, "days": {}}
+    if not isinstance(history, dict):
+        return {"schema": 2, "days": {}}
+    if not isinstance(history.get("days"), dict):
+        history["days"] = {}
+    return history
+
+
+def latest_history_observation(history: dict[str, Any]) -> datetime | None:
+    candidates: list[datetime] = []
+    offline_sync = history.get("offline_sync")
+    if isinstance(offline_sync, dict):
+        for key in ("last_successful_at", "completed_at"):
+            parsed = parse_dt(offline_sync.get(key))
+            if parsed is not None:
+                candidates.append(parsed)
+    days = history.get("days")
+    if isinstance(days, dict):
+        for row in days.values():
+            if not isinstance(row, dict):
+                continue
+            parsed = parse_dt(row.get("updated_at"))
+            if parsed is not None:
+                candidates.append(parsed)
+    return max(candidates) if candidates else None
+
+
+def offline_history_dates_to_reconcile(
+    history: dict[str, Any],
+    now: datetime,
+    max_days: int = OFFLINE_HISTORY_BACKFILL_MAX_DAYS,
+) -> list[date]:
+    max_days = max(0, int(max_days or 0))
+    if max_days <= 0:
+        return []
+    today = now.date()
+    last_complete_day = today - timedelta(days=1)
+    floor = today - timedelta(days=max_days)
+    raw_days = history.get("days")
+    days = raw_days if isinstance(raw_days, dict) else {}
+    known_dates: list[date] = []
+    for key in days:
+        try:
+            parsed = date.fromisoformat(str(key))
+        except ValueError:
+            continue
+        if parsed < today:
+            known_dates.append(parsed)
+
+    targets: set[date] = set()
+    observed_at = latest_history_observation(history)
+    if observed_at is not None and observed_at.date() < today:
+        cursor = max(floor, observed_at.date())
+        while cursor <= last_complete_day:
+            targets.add(cursor)
+            cursor += timedelta(days=1)
+    elif known_dates:
+        targets.add(max(floor, max(known_dates)))
+    else:
+        targets.add(last_complete_day)
+
+    if known_dates:
+        cursor = max(floor, min(known_dates))
+        while cursor <= last_complete_day:
+            if cursor.isoformat() not in days:
+                targets.add(cursor)
+            cursor += timedelta(days=1)
+    return sorted(day for day in targets if floor <= day < today)
+
+
+def scan_claude_daily_buckets(
+    root: Path,
+    start: datetime,
+    end: datetime,
+) -> dict[date, UsageBucket]:
+    buckets: dict[date, UsageBucket] = {}
+    for path in iter_recent_jsonl(root, start):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            when = parse_dt(row.get("timestamp"))
+            if when is None or when < start or when >= end:
+                continue
+            message = row.get("message") or {}
+            if message.get("role") != "assistant":
+                continue
+            usage = message.get("usage") or {}
+            if not usage:
+                continue
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+            if total_tokens <= 0:
+                continue
+            model = str(message.get("model") or row.get("model") or "claude")
+            bucket = buckets.setdefault(when.date(), UsageBucket())
+            bucket.requests += 1
+            bucket.input_tokens += input_tokens
+            bucket.output_tokens += output_tokens
+            bucket.cache_creation_input_tokens += cache_creation
+            bucket.cache_read_input_tokens += cache_read
+            bucket.cost += estimate_cost(
+                model,
+                input_tokens,
+                cache_read,
+                output_tokens,
+                cache_creation_tokens=cache_creation,
+            )
+            bucket.add_model(model, total_tokens)
+            bucket.mark_latest(when, model)
+    return buckets
+
+
+def build_historical_usage_rows(
+    home: Path,
+    sessions_root: Path,
+    target_days: list[date],
+    attribution_ledger: dict[str, str],
+    now: datetime,
+) -> dict[str, dict[str, Any]]:
+    if not target_days:
+        return {}
+    wanted = {item.isoformat() for item in target_days}
+    start = datetime.combine(min(target_days), datetime.min.time())
+    end = datetime.combine(max(target_days) + timedelta(days=1), datetime.min.time())
+    events = scan_all_codex_events(home, sessions_root, start, end)
+    apply_codex_speed_fallback(events, codex_speed_history(home, start, end))
+    account_markers = scan_cockpit_codex_account_markers(home, start, end)
+    markers = scan_cockpit_codex_switch_markers(home, start, end)
+    markers.extend(load_account_timeline())
+    markers.extend(account_markers)
+    attributed = attribute_codex_events_by_account(
+        events,
+        markers,
+        attribution_ledger,
+        current_codex_account_label(home),
+        now,
+    )
+    attributed, _fallback_events = merge_missing_cockpit_account_events(
+        attributed,
+        account_markers,
+    )
+    resolved, _session_accounts, _unresolved = resolve_api_service_event_accounts(
+        attributed,
+        account_markers,
+    )
+    speed_by_account = cockpit_codex_speed_by_label(home)
+    multipliers = {
+        label: float(meta.get("cost_multiplier") or 1.0)
+        for label, meta in speed_by_account.items()
+    }
+    codex_by_day: dict[str, dict[str, UsageBucket]] = {}
+    for label, account_events in resolved.items():
+        for event in account_events:
+            event_time = usage_event_attribution_time(event)
+            key = event_time.date().isoformat()
+            if key not in wanted:
+                continue
+            bucket = codex_by_day.setdefault(key, {}).setdefault(label, UsageBucket())
+            add_codex_event_to_bucket(
+                bucket,
+                event,
+                multipliers.get(label, 1.0),
+                bucket_time=event_time,
+            )
+
+    claude_by_day = scan_claude_daily_buckets(home / ".claude" / "projects", start, end)
+    updated_at = now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+    rows: dict[str, dict[str, Any]] = {}
+    for target_day in target_days:
+        key = target_day.isoformat()
+        account_buckets = codex_by_day.get(key, {})
+        providers = [
+            bucket_to_dict(label, bucket)
+            for label, bucket in sorted(
+                account_buckets.items(),
+                key=lambda item: (-item[1].total_tokens, item[0]),
+            )
+            if bucket.total_tokens > 0 or bucket.requests > 0
+        ]
+        total = UsageBucket()
+        for bucket in account_buckets.values():
+            add_bucket(total, bucket)
+        claude = claude_by_day.get(target_day, UsageBucket())
+        if claude.total_tokens > 0 or claude.requests > 0:
+            providers.append(bucket_to_dict("Claude local", claude))
+            add_bucket(total, claude)
+        temporary_output = {
+            "today": bucket_to_dict("Client local", total),
+            "providers": providers,
+        }
+        collapse_api_service_mirror_providers(temporary_output)
+        providers = temporary_output["providers"]
+        providers.sort(
+            key=lambda provider: (
+                -int(provider.get("tokens") or 0),
+                str(provider.get("name") or ""),
+            )
+        )
+        models: dict[str, int] = {}
+        for provider in providers:
+            provider_models = provider.get("models")
+            if not isinstance(provider_models, dict):
+                continue
+            for model, tokens in provider_models.items():
+                name = str(model or "unknown")
+                models[name] = models.get(name, 0) + int(tokens or 0)
+        total_row = temporary_output["today"]
+        rows[key] = {
+            "date": key,
+            "source": "local-backfill",
+            "requests": int(total_row.get("requests") or 0),
+            "tokens": int(total_row.get("tokens") or 0),
+            "input_tokens": int(total_row.get("input_tokens") or 0),
+            "cached_input_tokens": int(total_row.get("cached_input_tokens") or 0),
+            "cache_creation_input_tokens": int(
+                total_row.get("cache_creation_input_tokens") or 0
+            ),
+            "output_tokens": int(total_row.get("output_tokens") or 0),
+            "cost": round(float(total_row.get("cost") or 0), 6),
+            "models": models,
+            "providers": providers,
+            "detail_tokens": sum(int(provider.get("tokens") or 0) for provider in providers),
+            "updated_at": updated_at,
+            "source_date": key,
+        }
+    return rows
+
+
+def history_row_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row.get("requests") or 0),
+        int(row.get("tokens") or 0),
+        int(row.get("input_tokens") or 0),
+        int(row.get("cached_input_tokens") or 0),
+        int(row.get("cache_creation_input_tokens") or 0),
+        int(row.get("output_tokens") or 0),
+        round(float(row.get("cost") or 0), 6),
+        json.dumps(row.get("models") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(row.get("providers") or [], ensure_ascii=False, sort_keys=True),
+    )
+
+
+def merge_rebuilt_history_day(
+    existing: dict[str, Any] | None,
+    rebuilt: dict[str, Any],
+    reconciled_at: str,
+) -> tuple[dict[str, Any], bool]:
+    if not isinstance(existing, dict):
+        merged = dict(rebuilt)
+        merged["offline_reconciled_at"] = reconciled_at
+        return merged, True
+
+    existing_tokens = int(existing.get("tokens") or 0)
+    rebuilt_tokens = int(rebuilt.get("tokens") or 0)
+    existing_detail = sum(
+        int(provider.get("tokens") or 0)
+        for provider in (existing.get("providers") or [])
+        if isinstance(provider, dict)
+    )
+    rebuilt_detail = int(rebuilt.get("detail_tokens") or 0)
+    use_rebuilt = rebuilt_tokens > existing_tokens or (
+        rebuilt_tokens == existing_tokens and rebuilt_detail > existing_detail
+    )
+    merged = dict(rebuilt if use_rebuilt else existing)
+    merged["date"] = str(existing.get("date") or rebuilt.get("date") or "")
+    merged["source"] = str(existing.get("source") or rebuilt.get("source") or "local-backfill")
+    merged["source_date"] = str(
+        existing.get("source_date") or rebuilt.get("source_date") or merged["date"]
+    )
+    merged["requests"] = max(
+        int(existing.get("requests") or 0),
+        int(rebuilt.get("requests") or 0),
+    )
+    merged["tokens"] = max(existing_tokens, rebuilt_tokens)
+    merged["cost"] = round(
+        max(float(existing.get("cost") or 0), float(rebuilt.get("cost") or 0)),
+        6,
+    )
+    if rebuilt_detail > existing_detail and isinstance(rebuilt.get("providers"), list):
+        merged["providers"] = rebuilt["providers"]
+        merged["models"] = rebuilt.get("models") or {}
+        merged["detail_tokens"] = rebuilt_detail
+    else:
+        if not isinstance(merged.get("providers"), list) and isinstance(rebuilt.get("providers"), list):
+            merged["providers"] = rebuilt["providers"]
+        if not isinstance(merged.get("models"), dict) and isinstance(rebuilt.get("models"), dict):
+            merged["models"] = rebuilt["models"]
+        if "detail_tokens" not in merged:
+            merged["detail_tokens"] = rebuilt_detail
+    before = history_row_signature(existing)
+    after = history_row_signature(merged)
+    if before != after:
+        merged["updated_at"] = rebuilt.get("updated_at") or reconciled_at
+        merged["offline_reconciled_at"] = reconciled_at
+    return merged, before != after
+
+
+def backfill_offline_usage_history(
+    home: Path,
+    sessions_root: Path,
+    now: datetime,
+    attribution_ledger: dict[str, str],
+    history: dict[str, Any] | None = None,
+    target_days: list[date] | None = None,
+) -> dict[str, Any]:
+    started_at = now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+    if OFFLINE_HISTORY_BACKFILL_MAX_DAYS <= 0:
+        return {"state": "disabled", "started_at": started_at, "scanned_days": 0}
+    history = history if isinstance(history, dict) else load_usage_history_for_backfill()
+    days = history.setdefault("days", {})
+    if not isinstance(days, dict):
+        days = {}
+        history["days"] = days
+    targets = (
+        list(target_days)
+        if target_days is not None
+        else offline_history_dates_to_reconcile(history, now)
+    )
+    if not targets:
+        return {"state": "idle", "started_at": started_at, "scanned_days": 0}
+
+    result = {
+        "state": "running",
+        "started_at": started_at,
+        "from": min(targets).isoformat(),
+        "through": max(targets).isoformat(),
+        "scanned_days": len(targets),
+        "updated_days": 0,
+    }
+    try:
+        rebuilt_rows = build_historical_usage_rows(
+            home,
+            sessions_root,
+            targets,
+            attribution_ledger,
+            now,
+        )
+        changed = 0
+        for target_day in targets:
+            key = target_day.isoformat()
+            rebuilt = rebuilt_rows.get(key)
+            if not isinstance(rebuilt, dict):
+                continue
+            merged, row_changed = merge_rebuilt_history_day(
+                days.get(key) if isinstance(days.get(key), dict) else None,
+                rebuilt,
+                started_at,
+            )
+            days[key] = merged
+            changed += int(row_changed)
+        completed_at = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        result.update(
+            {
+                "state": "complete",
+                "updated_days": changed,
+                "completed_at": completed_at,
+            }
+        )
+        history["schema"] = max(2, int(history.get("schema") or 1))
+        history["offline_sync"] = {
+            "state": "complete",
+            "last_successful_at": completed_at,
+            "from": result["from"],
+            "through": result["through"],
+            "scanned_days": result["scanned_days"],
+            "updated_days": changed,
+        }
+        write_json_atomic(USAGE_HISTORY_PATH, history)
+        return result
+    except Exception as exc:
+        completed_at = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        previous_sync = history.get("offline_sync")
+        sync = dict(previous_sync) if isinstance(previous_sync, dict) else {}
+        sync.update(
+            {
+                "state": "error",
+                "last_attempt_at": completed_at,
+                "error": f"{type(exc).__name__}: {exc}"[:240],
+            }
+        )
+        history["offline_sync"] = sync
+        try:
+            write_json_atomic(USAGE_HISTORY_PATH, history)
+        except OSError:
+            pass
+        result.update(
+            {
+                "state": "error",
+                "completed_at": completed_at,
+                "message": sync["error"],
+            }
+        )
+        return result
+
+
 def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day: date) -> None:
     """Keep same-day local totals monotonic across account switches.
 
@@ -4267,6 +4679,12 @@ def main() -> int:
         "source": "client-jsonl",
         "updated_at": now.isoformat(timespec="seconds"),
         "date": day.isoformat(),
+        "scan_status": {
+            "state": "complete",
+            "from": start.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+            "through": min(now, end).replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+            "source": "local-logs",
+        },
         "today": bucket_to_dict("Client local", total),
         "providers": providers,
         "latest_request": {
@@ -4284,6 +4702,18 @@ def main() -> int:
             "hourly_today": hourly_today,
         },
     }
+    offline_history: dict[str, Any] | None = None
+    offline_days: list[date] = []
+    if not args.date and day == now.date() and OFFLINE_HISTORY_BACKFILL_MAX_DAYS > 0:
+        offline_history = load_usage_history_for_backfill()
+        offline_days = offline_history_dates_to_reconcile(offline_history, now)
+        output["offline_catchup"] = {
+            "state": "running" if offline_days else "idle",
+            "started_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+            "from": min(offline_days).isoformat() if offline_days else "",
+            "through": max(offline_days).isoformat() if offline_days else "",
+            "scanned_days": len(offline_days),
+        }
     if args.include_30d:
         output["account_30d_updated_at"] = (
             now.isoformat(timespec="seconds")
@@ -4296,6 +4726,19 @@ def main() -> int:
     restore_today_from_usage_history(output, day)
     add_unattributed_provider_gap(output)
     write_json_atomic(out, output)
+    if offline_history is not None:
+        catchup = backfill_offline_usage_history(
+            home,
+            codex_sessions_root,
+            now,
+            attribution_ledger,
+            history=offline_history,
+            target_days=offline_days,
+        )
+        output["offline_catchup"] = catchup
+        if offline_days or catchup.get("state") == "error":
+            write_json_atomic(out, output)
+        save_attribution_ledger(attribution_ledger, datetime.now())
     if args.backfill_history_details:
         backfill_usage_history_details(home, codex_sessions_root)
     print(json.dumps(output["today"], ensure_ascii=False))
