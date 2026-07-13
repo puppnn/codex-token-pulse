@@ -952,6 +952,55 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 1_000_000)
         self.assertEqual(current["latest_request"]["model"], "gpt-test")
 
+    def test_high_water_never_restores_cached_failure_annotations(self) -> None:
+        for previous_tokens, current_tokens in ((0, 0), (1_000_000, 100_000)):
+            with self.subTest(
+                previous_tokens=previous_tokens,
+                current_tokens=current_tokens,
+            ):
+                previous = self.snapshot(self.day, previous_tokens)
+                current = self.snapshot(self.day, current_tokens)
+                previous["dashboard"]["hourly_today"][0].update(
+                    {
+                        "failure": True,
+                        "failure_count": 1,
+                        "failure_at": f"{self.day.isoformat()}T08:59:53+08:00",
+                        "failure_kind": "desktop_network",
+                    }
+                )
+                self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+                client_usage_export.same_day_output_high_water(
+                    current,
+                    self.output_path,
+                    self.day,
+                )
+
+                hourly = current["dashboard"]["hourly_today"][0]
+                self.assertFalse(hourly.get("failure"))
+                self.assertNotIn("failure_count", hourly)
+                self.assertNotIn("failure_at", hourly)
+                self.assertNotIn("failure_kind", hourly)
+
+    def test_high_water_preserves_failure_from_current_scan(self) -> None:
+        previous = self.snapshot(self.day, 0)
+        current = self.snapshot(self.day, 0)
+        current["dashboard"]["hourly_today"][0].update(
+            {
+                "failure": True,
+                "failure_count": 1,
+                "failure_at": f"{self.day.isoformat()}T08:59:53+08:00",
+                "failure_kind": "desktop_network",
+            }
+        )
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+
+        hourly = current["dashboard"]["hourly_today"][0]
+        self.assertTrue(hourly["failure"])
+        self.assertEqual(hourly["failure_kind"], "desktop_network")
+
     def test_high_water_preserves_totals_but_keeps_newer_latest_timestamp(self) -> None:
         previous = self.snapshot(self.day, 1_000_000)
         current = self.snapshot(self.day, 100_000)
@@ -1912,6 +1961,385 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(app.client.clear_calls, 1)
         app._refresh_lock.release()
+
+
+class CodexSessionModelTests(unittest.TestCase):
+    def write_session(self, root: Path, name: str, rows: list[dict]) -> None:
+        session_dir = root / "2026" / "07" / "12"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / name).write_text(
+            "\n".join(json.dumps(row) for row in rows),
+            encoding="utf-8",
+        )
+
+    def token_count(self, timestamp: str, input_tokens: int, output_tokens: int) -> dict:
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 0,
+                        "output_tokens": output_tokens,
+                    },
+                },
+            },
+        }
+
+    def test_token_count_inherits_model_from_turn_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-session-1.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "session-1"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.6-sol"},
+                    },
+                    self.token_count("2026-07-12T10:01:00", 100, 10),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].model, "gpt-5.6-sol")
+
+    def test_model_switch_only_applies_to_later_token_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.token_count("2026-07-12T10:01:00", 100, 10)
+            second = self.token_count("2026-07-12T10:03:00", 200, 20)
+            second["payload"]["info"]["total_token_usage"].update(
+                {"input_tokens": 300, "output_tokens": 30}
+            )
+            self.write_session(
+                root,
+                "rollout-session-2.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "session-2"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.6-sol"},
+                    },
+                    first,
+                    {
+                        "timestamp": "2026-07-12T10:02:00",
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-5.4"},
+                    },
+                    second,
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual([event.model for event in events], ["gpt-5.6-sol", "gpt-5.4"])
+
+    def test_only_terminal_turn_errors_are_collected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-failures.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T02:50:00",
+                        "type": "session_meta",
+                        "payload": {"id": "failure-session"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:00:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "retry-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:05:00",
+                        "type": "event_msg",
+                        "payload": {"type": "stream_error", "message": "retrying"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:06:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "retry-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:10:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "interrupted-turn"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:11:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "turn_aborted",
+                            "turn_id": "interrupted-turn",
+                            "reason": "interrupted",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:20:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "legacy-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:21:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "error",
+                            "message": "stream disconnected",
+                            "codex_error_info": {
+                                "response_stream_disconnected": {"http_status_code": 502}
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:22:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "legacy-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:30:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "terminal-error"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T03:31:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "terminal-error",
+                            "error": {
+                                "message": "server failed",
+                                "codex_error_info": "internal_server_error",
+                            },
+                        },
+                    },
+                ],
+            )
+            failures: list[client_usage_export.CodexFailureEvent] = []
+
+            client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 2, 0),
+                datetime(2026, 7, 12, 4, 0),
+                failure_events=failures,
+            )
+
+        self.assertEqual([failure.turn_id for failure in failures], ["legacy-error", "terminal-error"])
+        self.assertEqual([failure.when.minute for failure in failures], [22, 31])
+
+    def test_error_marks_only_the_adjacent_observed_zero_hour(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3].update({"requests": 137, "tokens": 23_100_000})
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="failed-turn",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 4, 20),
+        )
+
+        self.assertTrue(hourly[4]["failure"])
+        self.assertEqual(hourly[4]["failure_count"], 1)
+        self.assertFalse(any(row.get("failure") for row in hourly[5:]))
+
+    def test_error_marker_waits_for_the_hour_and_clears_when_activity_resumes(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3]["tokens"] = 100
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="failed-turn",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 3, 59),
+        )
+        self.assertFalse(any(row.get("failure") for row in hourly))
+
+        hourly[4]["tokens"] = 50
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 30),
+        )
+        self.assertFalse(any(row.get("failure") for row in hourly))
+
+    def test_repeated_desktop_network_failures_mark_adjacent_idle_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_root = Path(directory)
+            log_dir = log_root / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:16.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            failures = client_usage_export.scan_codex_desktop_failure_events(
+                log_root,
+                datetime(2026, 7, 12),
+                datetime(2026, 7, 13),
+            )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].when, datetime(2026, 7, 12, 3, 59, 53))
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        hourly[3]["tokens"] = 23_100_000
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 0),
+        )
+        self.assertTrue(hourly[4]["failure"])
+        self.assertEqual(hourly[4]["failure_kind"], "desktop_network")
+
+    def test_desktop_log_roots_discover_msix_app_data_and_install_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local_app_data = root / "LocalAppData"
+            roaming_app_data = root / "RoamingAppData"
+            program_files = root / "Program Files"
+            package_logs = (
+                local_app_data
+                / "Packages"
+                / "OpenAI.Codex_2p2nqsd0c76g0"
+                / "LocalCache"
+                / "Local"
+                / "Codex"
+                / "Logs"
+            )
+            install_logs = (
+                program_files
+                / "WindowsApps"
+                / "OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0"
+                / "app"
+                / "Logs"
+            )
+            package_logs.mkdir(parents=True)
+            log_dir = install_logs / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:16.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "LOCALAPPDATA": str(local_app_data),
+                    "APPDATA": str(roaming_app_data),
+                    "PROGRAMFILES": str(program_files),
+                    "CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT": "",
+                },
+                clear=False,
+            ):
+                log_roots = client_usage_export.default_codex_desktop_log_roots()
+                failures = client_usage_export.scan_codex_desktop_failure_events(
+                    log_roots,
+                    datetime(2026, 7, 12),
+                    datetime(2026, 7, 13),
+                )
+
+        self.assertIn(package_logs.resolve(), log_roots)
+        self.assertIn(install_logs.resolve(), log_roots)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].kind, "desktop_network")
+
+    def test_transient_or_unrelated_desktop_errors_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_root = Path(directory)
+            log_dir = log_root / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z error [desktop-notifications][global-error] "
+                        "ResizeObserver loop completed with undelivered notifications.",
+                        "2026-07-11T20:00:16.000Z error [windows-store-updater] "
+                        "Failed to check for updates errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            failures = client_usage_export.scan_codex_desktop_failure_events(
+                log_root,
+                datetime(2026, 7, 12),
+                datetime(2026, 7, 13),
+            )
+
+        self.assertEqual(failures, [])
 
 
 class AttributionLedgerTests(unittest.TestCase):

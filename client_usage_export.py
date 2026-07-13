@@ -93,6 +93,16 @@ CODEX_SPEED_OVERRIDES = os.environ.get("CLIENT_USAGE_CODEX_SPEED_OVERRIDES", "")
 LOCAL_TZ = timezone(timedelta(hours=8))
 JSON_DECODER = json.JSONDecoder()
 LOG_FIELD_RE = re.compile(r'(?<![A-Za-z0-9_.-])(?P<key>[A-Za-z0-9_.-]+)=(?P<value>"[^"]*"|\S+)')
+DESKTOP_LOG_LINE_RE = re.compile(r"^(?P<timestamp>\S+)\s+\S+\s+(?P<body>.*)$")
+DESKTOP_NETWORK_ERROR_CODES = (
+    "net::ERR_CONNECTION_CLOSED",
+    "net::ERR_CONNECTION_RESET",
+    "net::ERR_INTERNET_DISCONNECTED",
+    "net::ERR_NETWORK_CHANGED",
+    "net::ERR_TIMED_OUT",
+)
+DESKTOP_NETWORK_FAILURE_MIN_COUNT = 3
+DESKTOP_NETWORK_FAILURE_CLUSTER_GAP = timedelta(minutes=5)
 INTERNAL_SERVICE_TIER_RE = re.compile(
     r'service_tier:\s*Some\((?:Some\()?\"(?P<tier>[^\"]+)\"'
 )
@@ -195,6 +205,14 @@ class SessionLifecycle:
     when: datetime
     turn_id: str = ""
     file_activity_at: datetime | None = None
+
+
+@dataclass
+class CodexFailureEvent:
+    when: datetime
+    session_id: str = ""
+    turn_id: str = ""
+    kind: str = "task"
 
 
 @dataclass
@@ -561,6 +579,33 @@ def codex_model_name(model: str) -> str:
     return name
 
 
+NON_TURN_ERROR_KINDS = {"active_turn_not_steerable", "thread_rollback_failed"}
+
+
+def codex_error_kind(error: Any) -> str:
+    if not isinstance(error, dict):
+        return ""
+    info = error.get("codex_error_info")
+    if isinstance(info, str):
+        return re.sub(r"[^a-z0-9]+", "_", info.lower()).strip("_")
+    if not isinstance(info, dict):
+        return ""
+    for key in ("type", "kind", "code"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    if len(info) == 1:
+        value = str(next(iter(info))).strip()
+        return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return ""
+
+
+def codex_error_affects_turn(error: Any) -> bool:
+    if not error:
+        return False
+    return codex_error_kind(error) not in NON_TURN_ERROR_KINDS
+
+
 def usage_int(usage: dict[str, Any], key: str) -> int:
     try:
         return int(usage.get(key) or 0)
@@ -814,13 +859,149 @@ def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
     return paths
 
 
+def default_codex_desktop_log_roots() -> list[Path]:
+    """Find desktop log roots for standalone and MSIX Codex installs."""
+    configured = os.environ.get("CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT", "").strip()
+    if configured:
+        configured_roots = [
+            Path(value.strip())
+            for value in configured.split(os.pathsep)
+            if value.strip()
+        ]
+        return configured_roots
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_existing(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+            is_directory = resolved.is_dir()
+        except OSError:
+            return
+        if not is_directory or resolved in seen:
+            return
+        seen.add(resolved)
+        roots.append(resolved)
+
+    def add_package_roots(base: Path, relatives: tuple[Path, ...]) -> None:
+        try:
+            packages = list(base.glob("OpenAI.Codex_*"))
+        except OSError:
+            return
+        for package in packages:
+            for relative in relatives:
+                add_existing(package / relative)
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        local_root = Path(local_app_data)
+        add_existing(local_root / "Codex" / "Logs")
+        add_existing(local_root / "Programs" / "Codex" / "Logs")
+        add_existing(local_root / "Programs" / "Codex" / "app" / "Logs")
+        add_package_roots(
+            local_root / "Packages",
+            (
+                Path("LocalCache") / "Local" / "Codex" / "Logs",
+                Path("LocalCache") / "Roaming" / "Codex" / "Logs",
+                Path("LocalState") / "Codex" / "Logs",
+                Path("LocalState") / "Logs",
+            ),
+        )
+
+    roaming_app_data = os.environ.get("APPDATA", "").strip()
+    if roaming_app_data:
+        add_existing(Path(roaming_app_data) / "Codex" / "Logs")
+
+    install_relatives = (
+        Path("Logs"),
+        Path("logs"),
+        Path("app") / "Logs",
+        Path("app") / "logs",
+    )
+    for variable in ("PROGRAMFILES", "ProgramW6432", "PROGRAMFILES(X86)"):
+        program_files = os.environ.get(variable, "").strip()
+        if program_files:
+            add_package_roots(Path(program_files) / "WindowsApps", install_relatives)
+    return roots
+
+
+def iter_codex_desktop_logs(root: Path, start: datetime, end: datetime) -> list[Path]:
+    if not root.exists():
+        return []
+    utc_start = start.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+    utc_end = end.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+    current_day = utc_start.date()
+    end_day = utc_end.date()
+    paths: list[Path] = []
+    while current_day <= end_day:
+        day_dir = root / f"{current_day.year:04d}" / f"{current_day.month:02d}" / f"{current_day.day:02d}"
+        if day_dir.exists():
+            paths.extend(sorted(day_dir.glob("codex-desktop-*.log")))
+        current_day += timedelta(days=1)
+    return paths
+
+
+def scan_codex_desktop_failure_events(
+    roots: Path | list[Path] | tuple[Path, ...],
+    start: datetime,
+    end: datetime,
+) -> list[CodexFailureEvent]:
+    network_failures: list[datetime] = []
+    log_roots = (roots,) if isinstance(roots, Path) else tuple(roots)
+    for root in log_roots:
+        for path in iter_codex_desktop_logs(root, start, end):
+            try:
+                lines = path.open(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            with lines:
+                for line in lines:
+                    match = DESKTOP_LOG_LINE_RE.match(line)
+                    if match is None:
+                        continue
+                    body = match.group("body")
+                    if "sa_server_request_failed" not in body:
+                        continue
+                    if not any(code in body for code in DESKTOP_NETWORK_ERROR_CODES):
+                        continue
+                    when = parse_dt(match.group("timestamp"))
+                    if when is not None and start <= when < end:
+                        network_failures.append(when)
+
+    failures: list[CodexFailureEvent] = []
+    cluster: list[datetime] = []
+
+    def finish_cluster() -> None:
+        if len(cluster) < DESKTOP_NETWORK_FAILURE_MIN_COUNT:
+            return
+        failures.append(
+            CodexFailureEvent(
+                when=cluster[0],
+                session_id="codex-desktop",
+                kind="desktop_network",
+            )
+        )
+
+    for when in sorted(set(network_failures)):
+        if cluster and when - cluster[-1] > DESKTOP_NETWORK_FAILURE_CLUSTER_GAP:
+            finish_cluster()
+            cluster = []
+        cluster.append(when)
+    finish_cluster()
+    return failures
+
+
 def scan_codex_events(
     root: Path,
     start: datetime,
     end: datetime,
     session_lifecycle: dict[str, SessionLifecycle] | None = None,
+    *,
+    failure_events: list[CodexFailureEvent] | None = None,
 ) -> list[UsageEvent]:
     events: list[UsageEvent] = []
+    failures_by_turn: dict[tuple[str, str], CodexFailureEvent] = {}
     seen_events: set[tuple[str, str, int, int, int, int]] = set()
     seen_totals: set[tuple[str, int, int, int, int]] = set()
     for path in iter_recent_jsonl(root, start):
@@ -829,6 +1010,7 @@ def scan_codex_events(
         except OSError:
             file_activity_at = None
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        current_model = CODEX_DEFAULT_MODEL
         seen: set[tuple[int, int, int, int]] = set()
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -846,15 +1028,24 @@ def scan_codex_events(
             session_id = str(meta_payload.get("id") or "").strip()
             break
         fork_replay_cutoff = codex_fork_replay_cutoff(lines)
+        session_key = session_id or str(path)
+        active_turn_id = ""
         for line in lines:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("type") != "event_msg":
-                continue
+            row_type = row.get("type")
             payload = row.get("payload") or {}
+            if row_type == "turn_context":
+                context_model = str(row.get("model") or payload.get("model") or "").strip()
+                if context_model:
+                    current_model = codex_model_name(context_model)
+                continue
+            if row_type != "event_msg":
+                continue
             payload_type = str(payload.get("type") or "")
+            event_ts = parse_dt(row.get("timestamp"))
             if (
                 session_lifecycle is not None
                 and session_id
@@ -872,11 +1063,53 @@ def scan_codex_events(
                     existing_lifecycle = session_lifecycle.get(session_id)
                     if existing_lifecycle is None or candidate.when >= existing_lifecycle.when:
                         session_lifecycle[session_id] = candidate
+            if payload_type in {"task_started", "turn_started"}:
+                active_turn_id = str(payload.get("turn_id") or "").strip()
+                if not active_turn_id:
+                    active_turn_id = f"started:{row.get('timestamp') or ''}"
+                continue
+            if payload_type == "error":
+                if (
+                    active_turn_id
+                    and event_ts is not None
+                    and (fork_replay_cutoff is None or event_ts > fork_replay_cutoff)
+                    and codex_error_affects_turn(payload)
+                ):
+                    key = (session_key, active_turn_id)
+                    failures_by_turn[key] = CodexFailureEvent(
+                        when=event_ts,
+                        session_id=session_id,
+                        turn_id=active_turn_id,
+                    )
+                continue
+            if payload_type in {"task_complete", "turn_complete"}:
+                turn_id = str(payload.get("turn_id") or active_turn_id).strip()
+                key = (session_key, turn_id)
+                valid_event = (
+                    event_ts is not None
+                    and (fork_replay_cutoff is None or event_ts > fork_replay_cutoff)
+                )
+                if valid_event and codex_error_affects_turn(payload.get("error")):
+                    failures_by_turn[key] = CodexFailureEvent(
+                        when=event_ts,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                elif valid_event and key in failures_by_turn:
+                    failures_by_turn[key].when = event_ts
+                if not turn_id or turn_id == active_turn_id:
+                    active_turn_id = ""
+                continue
+            if payload_type == "turn_aborted":
+                turn_id = str(payload.get("turn_id") or active_turn_id).strip()
+                if not turn_id or turn_id == active_turn_id:
+                    active_turn_id = ""
+                continue
             if payload_type != "token_count":
                 continue
             info = payload.get("info") or {}
             total = info.get("total_token_usage") or {}
-            ts = parse_dt(row.get("timestamp"))
+            ts = event_ts
             current = {
                 "input_tokens": usage_int(total, "input_tokens"),
                 "cached_input_tokens": usage_int(total, "cached_input_tokens"),
@@ -896,7 +1129,8 @@ def scan_codex_events(
                 continue
             if ts >= end:
                 continue
-            model = codex_model_name(str(row.get("model") or payload.get("model") or "codex"))
+            explicit_model = str(row.get("model") or payload.get("model") or "").strip()
+            model = codex_model_name(explicit_model) if explicit_model else current_model
             total_key = (
                 model,
                 current["input_tokens"],
@@ -972,6 +1206,17 @@ def scan_codex_events(
                     events.append(event)
             last_total = current
     events.sort(key=lambda event: event.when)
+    if failure_events is not None:
+        failure_events.extend(
+            sorted(
+                (
+                    failure
+                    for failure in failures_by_turn.values()
+                    if start <= failure.when < end
+                ),
+                key=lambda failure: failure.when,
+            )
+        )
     return events
 
 
@@ -1266,12 +1511,15 @@ def scan_all_codex_events(
     start: datetime,
     end: datetime,
     session_lifecycle: dict[str, SessionLifecycle] | None = None,
+    *,
+    failure_events: list[CodexFailureEvent] | None = None,
 ) -> list[UsageEvent]:
     events = scan_codex_events(
         sessions_root,
         start,
         end,
         session_lifecycle=session_lifecycle,
+        failure_events=failure_events,
     )
     events.extend(scan_codex_logs2_events(home, start, end))
     route_markers = scan_codex_route_markers(home, start, end)
@@ -2609,6 +2857,54 @@ def merge_hourly_buckets(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]
     return merged
 
 
+def mark_codex_failure_hours(
+    buckets: list[dict[str, Any]],
+    failures: list[CodexFailureEvent],
+    day: date,
+    as_of: datetime,
+) -> None:
+    by_hour = {
+        max(0, min(23, int(bucket.get("hour") or 0))): bucket
+        for bucket in buckets
+        if isinstance(bucket, dict)
+    }
+    for bucket in by_hour.values():
+        bucket.pop("failure", None)
+        bucket.pop("failure_count", None)
+        bucket.pop("failure_at", None)
+        bucket.pop("failure_kind", None)
+
+    if as_of.date() < day:
+        return
+    last_observed_hour = as_of.hour if as_of.date() == day else 23
+    for failure in failures:
+        if failure.when.date() != day:
+            continue
+        candidate_hour = failure.when.hour
+        candidate = by_hour.get(candidate_hour)
+        if candidate is None:
+            continue
+        if int(candidate.get("tokens") or 0) > 0:
+            candidate_hour += 1
+            candidate = by_hour.get(candidate_hour)
+        if (
+            candidate is None
+            or candidate_hour <= 0
+            or candidate_hour > last_observed_hour
+            or int(candidate.get("tokens") or 0) > 0
+        ):
+            continue
+        previous = by_hour.get(candidate_hour - 1)
+        if previous is None or int(previous.get("tokens") or 0) <= 0:
+            continue
+        candidate["failure"] = True
+        candidate["failure_count"] = int(candidate.get("failure_count") or 0) + 1
+        failure_at = failure.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        if failure_at > str(candidate.get("failure_at") or ""):
+            candidate["failure_at"] = failure_at
+            candidate["failure_kind"] = failure.kind
+
+
 def latest_at_text(bucket: UsageBucket) -> str:
     if bucket.latest_at is None:
         return ""
@@ -3131,6 +3427,7 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             output["latest_request"] = previous
 
     def merge_hourly_today() -> None:
+        failure_keys = ("failure", "failure_count", "failure_at", "failure_kind")
         current_dashboard = output.get("dashboard")
         previous_dashboard = existing.get("dashboard")
         if not isinstance(current_dashboard, dict) or not isinstance(previous_dashboard, dict):
@@ -3150,11 +3447,24 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             hour = max(0, min(23, int(previous_row.get("hour") or 0)))
             current_row = current_by_hour.get(hour)
             if current_row is None:
-                current_hourly.append(previous_row)
-                current_by_hour[hour] = previous_row
+                restored_row = dict(previous_row)
+                for key in failure_keys:
+                    restored_row.pop(key, None)
+                current_hourly.append(restored_row)
+                current_by_hour[hour] = restored_row
                 continue
+            current_failure = {
+                key: current_row[key]
+                for key in failure_keys
+                if key in current_row
+            }
             if tokens_of(previous_row) > tokens_of(current_row):
                 current_row.update(previous_row)
+            # Failure annotations are live scan results, not cumulative high-water data.
+            for key in failure_keys:
+                current_row.pop(key, None)
+            if tokens_of(current_row) <= 0 and current_failure.get("failure"):
+                current_row.update(current_failure)
 
     existing_today = existing.get("today")
     current_today = output.get("today")
@@ -3775,13 +4085,20 @@ def main() -> int:
         for label, meta in speed_by_account.items()
     }
     session_lifecycle: dict[str, SessionLifecycle] = {}
+    codex_failures: list[CodexFailureEvent] = []
     codex_events = scan_all_codex_events(
         home,
         codex_sessions_root,
         start,
         end,
         session_lifecycle=session_lifecycle,
+        failure_events=codex_failures,
     )
+    desktop_log_roots = default_codex_desktop_log_roots()
+    if desktop_log_roots:
+        codex_failures.extend(
+            scan_codex_desktop_failure_events(desktop_log_roots, start, end)
+        )
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)
     markers = scan_cockpit_codex_switch_markers(home, start, end)
@@ -3835,6 +4152,7 @@ def main() -> int:
         ),
         scan_claude_hourly(claude_root, start, end),
     )
+    mark_codex_failure_hours(hourly_today, codex_failures, day, now)
     if args.include_30d and cached_30d_valid:
         expected_30d_accounts = {
             name

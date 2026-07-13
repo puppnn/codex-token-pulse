@@ -2756,14 +2756,33 @@ class FloatingMonitorApp:
                 col = index % cols
                 tokens = float(item.get("tokens") or 0)
                 intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
+                failed = bool(item.get("failure")) and tokens <= 0
                 x1 = grid_x + col * (cell + cell_gap)
                 y1 = grid_y + row * (cell + cell_gap)
+                fill = Theme.ag_crit if failed else self._activity_color(intensity)
+                outline = Theme.ag_crit if failed else Theme.ag_border
                 self._draw_rounded_rect(x1, y1, x1 + cell, y1 + cell, r=3,
-                                        fill=self._activity_color(intensity), outline=Theme.ag_border)
+                                        fill=fill, outline=outline)
                 hour = int(item.get("hour") if item.get("hour") is not None else index)
+                failure_note = ""
+                if failed:
+                    failure_count = max(1, int(item.get("failure_count") or 1))
+                    failure_at = str(item.get("failure_at") or "")
+                    failure_time = failure_at[11:16] if len(failure_at) >= 16 else ""
+                    if item.get("failure_kind") == "desktop_network":
+                        if failure_count == 1:
+                            failure_note = "\nCodex network outage detected"
+                        else:
+                            failure_note = f"\n{failure_count} Codex network outages detected"
+                    elif failure_count == 1:
+                        failure_note = "\nCodex task error detected"
+                    else:
+                        failure_note = f"\n{failure_count} Codex task errors detected"
+                    if failure_time:
+                        failure_note += f" at {failure_time}"
                 self._add_tooltip(
                     x1, y1, x1 + cell, y1 + cell,
-                    f"{hour:02d}:00-{(hour + 1) % 24:02d}:00\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
+                    f"{hour:02d}:00-{(hour + 1) % 24:02d}:00\n{compact_number(int(tokens))} token\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}{failure_note}",
                 )
             legend_y = grid_y + rows_count * (cell + cell_gap) + 8
         elif self._usage_range == "7d":
@@ -2895,6 +2914,12 @@ class FloatingMonitorApp:
                                     r=2, fill=color, outline=Theme.ag_border)
         c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
+        if self._usage_range == "24h" and any(item.get("failure") for item in visible):
+            error_x = legend_x + 112
+            self._draw_rounded_rect(error_x, legend_y, error_x + 10, legend_y + 10,
+                                    r=2, fill=Theme.ag_crit, outline=Theme.ag_crit)
+            c.create_text(error_x + 14, legend_y + 1, anchor="nw", text="Error",
+                          font=self._fonts["font_micro"], fill=Theme.ag_muted)
         peak_tokens = int(float(peak.get("tokens") or 0))
         peak_label = f"{int(peak.get('hour')):02d}:00" if self._usage_range == "24h" and peak.get("hour") is not None else str(peak.get("date") or "-")
         c.create_text(col_r, legend_y + 1, anchor="ne",
