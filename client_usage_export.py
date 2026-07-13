@@ -868,14 +868,71 @@ def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
     return paths
 
 
-def default_codex_desktop_log_root() -> Path | None:
+def default_codex_desktop_log_roots() -> list[Path]:
+    """Find desktop log roots for standalone and MSIX Codex installs."""
     configured = os.environ.get("CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT", "").strip()
     if configured:
-        return Path(configured)
+        configured_roots = [
+            Path(value.strip())
+            for value in configured.split(os.pathsep)
+            if value.strip()
+        ]
+        return configured_roots
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_existing(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+            is_directory = resolved.is_dir()
+        except OSError:
+            return
+        if not is_directory or resolved in seen:
+            return
+        seen.add(resolved)
+        roots.append(resolved)
+
+    def add_package_roots(base: Path, relatives: tuple[Path, ...]) -> None:
+        try:
+            packages = list(base.glob("OpenAI.Codex_*"))
+        except OSError:
+            return
+        for package in packages:
+            for relative in relatives:
+                add_existing(package / relative)
+
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if not local_app_data:
-        return None
-    return Path(local_app_data) / "Codex" / "Logs"
+    if local_app_data:
+        local_root = Path(local_app_data)
+        add_existing(local_root / "Codex" / "Logs")
+        add_existing(local_root / "Programs" / "Codex" / "Logs")
+        add_existing(local_root / "Programs" / "Codex" / "app" / "Logs")
+        add_package_roots(
+            local_root / "Packages",
+            (
+                Path("LocalCache") / "Local" / "Codex" / "Logs",
+                Path("LocalCache") / "Roaming" / "Codex" / "Logs",
+                Path("LocalState") / "Codex" / "Logs",
+                Path("LocalState") / "Logs",
+            ),
+        )
+
+    roaming_app_data = os.environ.get("APPDATA", "").strip()
+    if roaming_app_data:
+        add_existing(Path(roaming_app_data) / "Codex" / "Logs")
+
+    install_relatives = (
+        Path("Logs"),
+        Path("logs"),
+        Path("app") / "Logs",
+        Path("app") / "logs",
+    )
+    for variable in ("PROGRAMFILES", "ProgramW6432", "PROGRAMFILES(X86)"):
+        program_files = os.environ.get(variable, "").strip()
+        if program_files:
+            add_package_roots(Path(program_files) / "WindowsApps", install_relatives)
+    return roots
 
 
 def iter_codex_desktop_logs(root: Path, start: datetime, end: datetime) -> list[Path]:
@@ -895,29 +952,31 @@ def iter_codex_desktop_logs(root: Path, start: datetime, end: datetime) -> list[
 
 
 def scan_codex_desktop_failure_events(
-    root: Path,
+    roots: Path | list[Path] | tuple[Path, ...],
     start: datetime,
     end: datetime,
 ) -> list[CodexFailureEvent]:
     network_failures: list[datetime] = []
-    for path in iter_codex_desktop_logs(root, start, end):
-        try:
-            lines = path.open(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        with lines:
-            for line in lines:
-                match = DESKTOP_LOG_LINE_RE.match(line)
-                if match is None:
-                    continue
-                body = match.group("body")
-                if "sa_server_request_failed" not in body:
-                    continue
-                if not any(code in body for code in DESKTOP_NETWORK_ERROR_CODES):
-                    continue
-                when = parse_dt(match.group("timestamp"))
-                if when is not None and start <= when < end:
-                    network_failures.append(when)
+    log_roots = (roots,) if isinstance(roots, Path) else tuple(roots)
+    for root in log_roots:
+        for path in iter_codex_desktop_logs(root, start, end):
+            try:
+                lines = path.open(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            with lines:
+                for line in lines:
+                    match = DESKTOP_LOG_LINE_RE.match(line)
+                    if match is None:
+                        continue
+                    body = match.group("body")
+                    if "sa_server_request_failed" not in body:
+                        continue
+                    if not any(code in body for code in DESKTOP_NETWORK_ERROR_CODES):
+                        continue
+                    when = parse_dt(match.group("timestamp"))
+                    if when is not None and start <= when < end:
+                        network_failures.append(when)
 
     failures: list[CodexFailureEvent] = []
     cluster: list[datetime] = []
@@ -3334,6 +3393,7 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             output["latest_request"] = previous
 
     def merge_hourly_today() -> None:
+        failure_keys = ("failure", "failure_count", "failure_at", "failure_kind")
         current_dashboard = output.get("dashboard")
         previous_dashboard = existing.get("dashboard")
         if not isinstance(current_dashboard, dict) or not isinstance(previous_dashboard, dict):
@@ -3353,27 +3413,24 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             hour = max(0, min(23, int(previous_row.get("hour") or 0)))
             current_row = current_by_hour.get(hour)
             if current_row is None:
-                current_hourly.append(previous_row)
-                current_by_hour[hour] = previous_row
+                restored_row = dict(previous_row)
+                for key in failure_keys:
+                    restored_row.pop(key, None)
+                current_hourly.append(restored_row)
+                current_by_hour[hour] = restored_row
                 continue
+            current_failure = {
+                key: current_row[key]
+                for key in failure_keys
+                if key in current_row
+            }
             if tokens_of(previous_row) > tokens_of(current_row):
                 current_row.update(previous_row)
-            if tokens_of(current_row) <= 0 and previous_row.get("failure"):
-                current_row["failure"] = True
-                current_row["failure_count"] = max(
-                    int(current_row.get("failure_count") or 0),
-                    int(previous_row.get("failure_count") or 0),
-                )
-                previous_failure_at = str(previous_row.get("failure_at") or "")
-                current_failure_at = str(current_row.get("failure_at") or "")
-                if previous_failure_at and previous_failure_at >= current_failure_at:
-                    current_row["failure_at"] = previous_failure_at
-                if (
-                    previous_row.get("failure_kind")
-                    and previous_failure_at
-                    and previous_failure_at >= current_failure_at
-                ):
-                    current_row["failure_kind"] = previous_row["failure_kind"]
+            # Failure annotations are live scan results, not cumulative high-water data.
+            for key in failure_keys:
+                current_row.pop(key, None)
+            if tokens_of(current_row) <= 0 and current_failure.get("failure"):
+                current_row.update(current_failure)
 
     existing_today = existing.get("today")
     current_today = output.get("today")
@@ -3925,10 +3982,10 @@ def main() -> int:
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
-    desktop_log_root = default_codex_desktop_log_root()
-    if desktop_log_root is not None:
+    desktop_log_roots = default_codex_desktop_log_roots()
+    if desktop_log_roots:
         codex_failures.extend(
-            scan_codex_desktop_failure_events(desktop_log_root, start, end)
+            scan_codex_desktop_failure_events(desktop_log_roots, start, end)
         )
     speed_markers = codex_speed_history(home, start, end)
     apply_codex_speed_fallback(codex_events, speed_markers)

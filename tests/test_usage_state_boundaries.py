@@ -912,6 +912,55 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 1_000_000)
         self.assertEqual(current["latest_request"]["model"], "gpt-test")
 
+    def test_high_water_never_restores_cached_failure_annotations(self) -> None:
+        for previous_tokens, current_tokens in ((0, 0), (1_000_000, 100_000)):
+            with self.subTest(
+                previous_tokens=previous_tokens,
+                current_tokens=current_tokens,
+            ):
+                previous = self.snapshot(self.day, previous_tokens)
+                current = self.snapshot(self.day, current_tokens)
+                previous["dashboard"]["hourly_today"][0].update(
+                    {
+                        "failure": True,
+                        "failure_count": 1,
+                        "failure_at": f"{self.day.isoformat()}T08:59:53+08:00",
+                        "failure_kind": "desktop_network",
+                    }
+                )
+                self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+                client_usage_export.same_day_output_high_water(
+                    current,
+                    self.output_path,
+                    self.day,
+                )
+
+                hourly = current["dashboard"]["hourly_today"][0]
+                self.assertFalse(hourly.get("failure"))
+                self.assertNotIn("failure_count", hourly)
+                self.assertNotIn("failure_at", hourly)
+                self.assertNotIn("failure_kind", hourly)
+
+    def test_high_water_preserves_failure_from_current_scan(self) -> None:
+        previous = self.snapshot(self.day, 0)
+        current = self.snapshot(self.day, 0)
+        current["dashboard"]["hourly_today"][0].update(
+            {
+                "failure": True,
+                "failure_count": 1,
+                "failure_at": f"{self.day.isoformat()}T08:59:53+08:00",
+                "failure_kind": "desktop_network",
+            }
+        )
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+
+        hourly = current["dashboard"]["hourly_today"][0]
+        self.assertTrue(hourly["failure"])
+        self.assertEqual(hourly["failure_kind"], "desktop_network")
+
     def test_high_water_preserves_totals_but_keeps_newer_latest_timestamp(self) -> None:
         previous = self.snapshot(self.day, 1_000_000)
         current = self.snapshot(self.day, 100_000)
@@ -1746,6 +1795,67 @@ class CodexSessionModelTests(unittest.TestCase):
         )
         self.assertTrue(hourly[4]["failure"])
         self.assertEqual(hourly[4]["failure_kind"], "desktop_network")
+
+    def test_desktop_log_roots_discover_msix_app_data_and_install_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local_app_data = root / "LocalAppData"
+            roaming_app_data = root / "RoamingAppData"
+            program_files = root / "Program Files"
+            package_logs = (
+                local_app_data
+                / "Packages"
+                / "OpenAI.Codex_2p2nqsd0c76g0"
+                / "LocalCache"
+                / "Local"
+                / "Codex"
+                / "Logs"
+            )
+            install_logs = (
+                program_files
+                / "WindowsApps"
+                / "OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0"
+                / "app"
+                / "Logs"
+            )
+            package_logs.mkdir(parents=True)
+            log_dir = install_logs / "2026" / "07" / "11"
+            log_dir.mkdir(parents=True)
+            (log_dir / "codex-desktop-fixture.log").write_text(
+                "\n".join(
+                    [
+                        "2026-07-11T19:59:53.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:01.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_NETWORK_CHANGED",
+                        "2026-07-11T20:00:16.000Z warning [electron-message-handler] "
+                        "sa_server_request_failed errorMessage=net::ERR_CONNECTION_CLOSED",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "LOCALAPPDATA": str(local_app_data),
+                    "APPDATA": str(roaming_app_data),
+                    "PROGRAMFILES": str(program_files),
+                    "CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT": "",
+                },
+                clear=False,
+            ):
+                log_roots = client_usage_export.default_codex_desktop_log_roots()
+                failures = client_usage_export.scan_codex_desktop_failure_events(
+                    log_roots,
+                    datetime(2026, 7, 12),
+                    datetime(2026, 7, 13),
+                )
+
+        self.assertIn(package_logs.resolve(), log_roots)
+        self.assertIn(install_logs.resolve(), log_roots)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].kind, "desktop_network")
 
     def test_transient_or_unrelated_desktop_errors_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
