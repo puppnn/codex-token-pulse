@@ -112,6 +112,10 @@ THREAD_ID_RE = re.compile(r'\bthread\.id=(?P<key>[A-Za-z0-9_-]+)')
 TURN_ID_RE = re.compile(r'\b(?:turn\.id|turn_id)=(?P<key>[A-Za-z0-9_-]+)')
 CONVERSATION_ID_RE = re.compile(r'\bconversation\.id=(?P<key>[A-Za-z0-9_-]+)')
 SESSION_LOOP_THREAD_ID_RE = re.compile(r'\bsession_loop\{thread_id=(?P<key>[A-Za-z0-9_-]+)\}')
+CODEX_SESSION_FILE_ID_RE = re.compile(
+    r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+    re.IGNORECASE,
+)
 SUB2API_ROUTED_CODEX_LABEL = os.environ.get("CLIENT_USAGE_SUB2API_ROUTED_CODEX_LABEL", "Codex via Sub2API")
 HIGH_WATER_UNATTRIBUTED_LABEL = os.environ.get(
     "CLIENT_USAGE_HIGH_WATER_UNATTRIBUTED_LABEL",
@@ -809,7 +813,7 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
     )
 
 
-def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
+def codex_session_header(lines: list[str]) -> tuple[str, str]:
     for line in lines[:20]:
         try:
             row = json.loads(line)
@@ -818,29 +822,97 @@ def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
         if row.get("type") != "session_meta":
             continue
         payload = row.get("payload") or {}
-        if payload.get("forked_from_id"):
+        return (
+            str(payload.get("id") or payload.get("session_id") or "").strip(),
+            str(payload.get("forked_from_id") or "").strip(),
+        )
+    return "", ""
+
+
+def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
+    _session_id, parent_id = codex_session_header(lines)
+    if not parent_id:
+        return None
+    for line in lines[:20]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("type") == "session_meta":
             started = parse_dt(row.get("timestamp"))
-            if started is None:
-                return None
-            return started + timedelta(seconds=2)
+            return started + timedelta(seconds=2) if started is not None else None
     return None
 
 
-def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
+CODEX_TOKEN_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def codex_token_count_signature(payload: dict[str, Any]) -> tuple[int, ...]:
+    info = payload.get("info") or {}
+    total = info.get("total_token_usage") or {}
+    last = info.get("last_token_usage") or {}
+    return (
+        int(bool(info.get("last_token_usage"))),
+        *(usage_int(total, field) for field in CODEX_TOKEN_USAGE_FIELDS),
+        *(usage_int(last, field) for field in CODEX_TOKEN_USAGE_FIELDS),
+    )
+
+
+def codex_token_count_signatures_from_path(path: Path) -> list[tuple[int, ...]]:
+    signatures: list[tuple[int, ...]] = []
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "event_msg":
+                    continue
+                payload = row.get("payload") or {}
+                if payload.get("type") == "token_count":
+                    signatures.append(codex_token_count_signature(payload))
+    except OSError:
+        return []
+    return signatures
+
+
+def iter_recent_jsonl(
+    root: Path,
+    start: datetime,
+    *,
+    session_paths: dict[str, Path] | None = None,
+) -> list[Path]:
     if not root.exists():
         return []
     paths: list[Path] = []
     seen: set[Path] = set()
 
-    def add_path(path: Path) -> None:
+    def resolve_path(path: Path) -> Path | None:
         try:
             resolved = path.resolve()
         except OSError:
-            return
+            return None
         if resolved in seen:
-            return
+            return resolved
         parts = {part.lower() for part in resolved.parts}
         if any(part.startswith("backup-") for part in parts) or ".tmp" in parts:
+            return None
+        if session_paths is not None:
+            match = CODEX_SESSION_FILE_ID_RE.search(resolved.name)
+            if match is not None:
+                session_paths.setdefault(match.group("id").lower(), resolved)
+        return resolved
+
+    def add_path(path: Path) -> None:
+        resolved = resolve_path(path)
+        if resolved is None or resolved in seen:
             return
         seen.add(resolved)
         paths.append(resolved)
@@ -850,13 +922,63 @@ def iter_recent_jsonl(root: Path, start: datetime) -> list[Path]:
         for path in day_dir.glob("*.jsonl"):
             add_path(path)
     for path in root.rglob("*.jsonl"):
+        resolved = resolve_path(path)
+        if resolved is None:
+            continue
         try:
-            modified = datetime.fromtimestamp(path.stat().st_mtime)
+            modified = datetime.fromtimestamp(resolved.stat().st_mtime)
         except OSError:
             continue
         if modified >= start - timedelta(hours=2):
-            add_path(path)
+            add_path(resolved)
     return paths
+
+
+def codex_session_headers(paths: list[Path]) -> dict[Path, tuple[str, str]]:
+    headers: dict[Path, tuple[str, str]] = {}
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                lines = []
+                for _ in range(20):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+        except OSError:
+            headers[path] = ("", "")
+            continue
+        headers[path] = codex_session_header(lines)
+    return headers
+
+
+def order_codex_session_paths(
+    paths: list[Path],
+    headers: dict[Path, tuple[str, str]],
+    session_paths: dict[str, Path],
+) -> list[Path]:
+    path_set = set(paths)
+    ordered: list[Path] = []
+    visiting: set[Path] = set()
+    visited: set[Path] = set()
+
+    def visit(path: Path) -> None:
+        if path in visited:
+            return
+        if path in visiting:
+            return
+        visiting.add(path)
+        _session_id, parent_id = headers.get(path, ("", ""))
+        parent_path = session_paths.get(parent_id.lower()) if parent_id else None
+        if parent_path in path_set:
+            visit(parent_path)
+        visiting.remove(path)
+        visited.add(path)
+        ordered.append(path)
+
+    for path in paths:
+        visit(path)
+    return ordered
 
 
 def default_codex_desktop_log_roots() -> list[Path]:
@@ -1003,30 +1125,39 @@ def scan_codex_events(
     events: list[UsageEvent] = []
     failures_by_turn: dict[tuple[str, str], CodexFailureEvent] = {}
     seen_events: set[tuple[str, str, int, int, int, int]] = set()
-    seen_totals: set[tuple[str, int, int, int, int]] = set()
-    for path in iter_recent_jsonl(root, start):
+    seen_totals: set[tuple[Any, ...]] = set()
+    session_paths: dict[str, Path] = {}
+    paths = iter_recent_jsonl(root, start, session_paths=session_paths)
+    headers = codex_session_headers(paths)
+    for path, (session_id, _parent_id) in headers.items():
+        if session_id:
+            session_paths.setdefault(session_id.lower(), path)
+    paths = order_codex_session_paths(paths, headers, session_paths)
+    signature_cache: dict[str, list[tuple[int, ...]]] = {}
+    for path in paths:
         try:
             file_activity_at = datetime.fromtimestamp(path.stat().st_mtime)
         except OSError:
             file_activity_at = None
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
         current_model = CODEX_DEFAULT_MODEL
-        seen: set[tuple[int, int, int, int]] = set()
+        seen: set[tuple[int, ...]] = set()
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
             continue
-        session_id = ""
-        for meta_line in lines[:20]:
-            try:
-                meta_row = json.loads(meta_line)
-            except json.JSONDecodeError:
-                continue
-            if meta_row.get("type") != "session_meta":
-                continue
-            meta_payload = meta_row.get("payload") or {}
-            session_id = str(meta_payload.get("id") or "").strip()
-            break
+        session_id, parent_id = headers.get(path) or codex_session_header(lines)
+        parent_signatures: list[tuple[int, ...]] = []
+        if parent_id:
+            parent_signatures = signature_cache.get(parent_id.lower(), [])
+            if not parent_signatures:
+                parent_path = session_paths.get(parent_id.lower())
+                if parent_path is not None:
+                    parent_signatures = codex_token_count_signatures_from_path(parent_path)
+                    signature_cache[parent_id.lower()] = parent_signatures
+        session_signatures: list[tuple[int, ...]] = []
+        parent_prefix_index = 0
+        parent_prefix_open = bool(parent_signatures)
         fork_replay_cutoff = codex_fork_replay_cutoff(lines)
         session_key = session_id or str(path)
         active_turn_id = ""
@@ -1110,20 +1241,32 @@ def scan_codex_events(
             info = payload.get("info") or {}
             total = info.get("total_token_usage") or {}
             ts = event_ts
+            signature = codex_token_count_signature(payload)
+            session_signatures.append(signature)
+            inherited_replay = False
+            if parent_prefix_open:
+                if (
+                    parent_prefix_index < len(parent_signatures)
+                    and signature == parent_signatures[parent_prefix_index]
+                ):
+                    inherited_replay = True
+                    parent_prefix_index += 1
+                else:
+                    parent_prefix_open = False
             current = {
                 "input_tokens": usage_int(total, "input_tokens"),
                 "cached_input_tokens": usage_int(total, "cached_input_tokens"),
                 "output_tokens": usage_int(total, "output_tokens"),
             }
-            key = (
-                current["input_tokens"],
-                current["cached_input_tokens"],
-                current["output_tokens"],
-                usage_int(total, "reasoning_output_tokens"),
-            )
+            key = signature
             if key in seen:
+                if inherited_replay:
+                    last_total = current
                 continue
             seen.add(key)
+            if inherited_replay:
+                last_total = current
+                continue
             if ts is None or ts < start:
                 last_total = current
                 continue
@@ -1131,14 +1274,12 @@ def scan_codex_events(
                 continue
             explicit_model = str(row.get("model") or payload.get("model") or "").strip()
             model = codex_model_name(explicit_model) if explicit_model else current_model
-            total_key = (
-                model,
-                current["input_tokens"],
-                current["cached_input_tokens"],
-                current["output_tokens"],
-                usage_int(total, "reasoning_output_tokens"),
-            )
-            if fork_replay_cutoff is not None and ts <= fork_replay_cutoff:
+            total_key = (model, *signature)
+            if (
+                parent_prefix_index == 0
+                and fork_replay_cutoff is not None
+                and ts <= fork_replay_cutoff
+            ):
                 seen_totals.add(total_key)
                 last_total = current
                 continue
@@ -1205,6 +1346,8 @@ def scan_codex_events(
                 if event is not None:
                     events.append(event)
             last_total = current
+        if session_id:
+            signature_cache[session_id.lower()] = session_signatures
     events.sort(key=lambda event: event.when)
     if failure_events is not None:
         failure_events.extend(
