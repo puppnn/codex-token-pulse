@@ -434,20 +434,12 @@ def normalize_pricing_tier(value: Any) -> str:
     return "standard"
 
 
-def token_price_for_request(profile: dict[str, float], base_field: str, tier: str, above_272k: bool) -> float:
+def token_price_for_request(profile: dict[str, float], base_field: str, tier: str) -> float:
     tier_suffix = {"priority": "priority", "flex": "flex", "batch": "batches"}.get(tier, "")
-    if above_272k and tier_suffix:
-        combined = profile.get(f"{base_field}_above_272k_tokens_{tier_suffix}")
-        if combined:
-            return combined
     if tier_suffix:
         tier_price = profile.get(f"{base_field}_{tier_suffix}")
         if tier_price:
             return tier_price
-    if above_272k:
-        long_context_price = profile.get(f"{base_field}_above_272k_tokens")
-        if long_context_price:
-            return long_context_price
     return float(profile.get(base_field) or 0)
 
 
@@ -465,11 +457,10 @@ def estimate_cost(
     cached_count = max(0, cached_tokens)
     cache_creation_count = max(0, cache_creation_tokens)
     output_count = max(0, output_tokens)
-    above_272k = input_count + cached_count + cache_creation_count > 272_000
-    input_price = token_price_for_request(profile, "input_cost_per_token", tier, above_272k)
-    cache_price = token_price_for_request(profile, "cache_read_input_token_cost", tier, above_272k)
-    cache_creation_price = token_price_for_request(profile, "cache_creation_input_token_cost", tier, above_272k)
-    output_price = token_price_for_request(profile, "output_cost_per_token", tier, above_272k)
+    input_price = token_price_for_request(profile, "input_cost_per_token", tier)
+    cache_price = token_price_for_request(profile, "cache_read_input_token_cost", tier)
+    cache_creation_price = token_price_for_request(profile, "cache_creation_input_token_cost", tier)
+    output_price = token_price_for_request(profile, "output_cost_per_token", tier)
     if cache_price <= 0:
         cache_price = input_price
     if cache_creation_price <= 0:
@@ -1822,10 +1813,12 @@ def quota_window_payload(
     stale: bool,
     window_minutes: int | None = None,
 ) -> dict[str, Any]:
+    resets_at = epoch_seconds_to_local_iso(reset_at)
+    missing_reset = percent_remaining is not None and not resets_at
     window: dict[str, Any] = {
-        "quota_available": percent_remaining is not None,
-        "quota_stale": stale,
-        "resets_at": epoch_seconds_to_local_iso(reset_at),
+        "quota_available": percent_remaining is not None and not missing_reset,
+        "quota_stale": stale or missing_reset or percent_remaining is None,
+        "resets_at": resets_at,
     }
     if window_minutes:
         window["window_minutes"] = int(window_minutes)
@@ -1837,6 +1830,7 @@ def quota_window_payload(
             window["utilization"] = 100.0 - remaining
         except (TypeError, ValueError):
             window["quota_available"] = False
+            window["quota_stale"] = True
     return window
 
 
@@ -1863,38 +1857,52 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
             str(account.get("api_provider_name") or account.get("name") or ""),
         )
         stale = bool(account.get("quota_error"))
-        five_hour_value = quota.get("hourly_percentage")
+        plan_type = str(account.get("plan_type") or quota.get("plan_type") or "").strip().lower()
+        primary_present = bool(quota.get("hourly_window_present"))
+        primary_value = quota.get("hourly_percentage") if primary_present else None
         weekly_value = quota.get("weekly_percentage")
-        weekly_available = bool(quota.get("weekly_window_present")) and weekly_value is not None
+        weekly_present = bool(quota.get("weekly_window_present"))
         try:
             hourly_window_minutes = int(quota.get("hourly_window_minutes") or 5 * 60)
         except (TypeError, ValueError):
             hourly_window_minutes = 5 * 60
-        is_cycle_window = hourly_window_minutes > 7 * 24 * 60
+        if hourly_window_minutes <= 0:
+            hourly_window_minutes = 5 * 60
+        seven_day_minutes = 7 * 24 * 60
+        five_hour: dict[str, Any] = {"quota_available": False, "quota_stale": stale}
+        seven_day: dict[str, Any] = {"quota_available": False, "quota_stale": stale}
+        cycle: dict[str, Any] = {"quota_available": False, "quota_stale": stale}
+        primary_is_7d = primary_present and hourly_window_minutes == seven_day_minutes
+        short_window_present = primary_present and hourly_window_minutes < seven_day_minutes
 
-        if is_cycle_window:
-            five_hour = {"quota_available": False, "quota_stale": stale}
-            cycle = quota_window_payload(
-                five_hour_value,
+        if primary_present:
+            primary_window = quota_window_payload(
+                primary_value,
                 quota.get("hourly_reset_time"),
                 stale,
                 hourly_window_minutes,
             )
-        else:
-            five_hour = quota_window_payload(
-                five_hour_value,
-                quota.get("hourly_reset_time"),
-                stale,
-                hourly_window_minutes,
-            )
-            cycle = {"quota_available": False, "quota_stale": stale}
+            if hourly_window_minutes < seven_day_minutes:
+                five_hour = primary_window
+            elif hourly_window_minutes == seven_day_minutes:
+                seven_day = primary_window
+            else:
+                cycle = primary_window
 
-        seven_day = quota_window_payload(
-            weekly_value if weekly_available else None,
-            quota.get("weekly_reset_time"),
-            stale,
-            7 * 24 * 60 if weekly_available else None,
-        )
+        if weekly_present and not primary_is_7d:
+            seven_day = quota_window_payload(
+                weekly_value,
+                quota.get("weekly_reset_time"),
+                stale,
+                seven_day_minutes,
+            )
+
+        if plan_type == "plus" and not short_window_present and (primary_is_7d or weekly_present):
+            five_hour = {
+                "quota_available": False,
+                "quota_stale": False,
+                "quota_unlimited": True,
+            }
 
         result[label] = {
             "window_5h": five_hour,
@@ -1912,10 +1920,23 @@ def quota_window_start(
     if not window.get("quota_available") or window.get("quota_stale"):
         return None
     reset_at = parse_dt(window.get("resets_at"))
-    if reset_at is None or reset_at <= now or reset_at > now + duration:
+    if reset_at is None or reset_at > now + duration:
         return None
-    start_at = reset_at - duration - timedelta(seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS))
+    if reset_at <= now:
+        # A stale upstream snapshot may still expose the previous reset time.
+        # That timestamp is also the lower bound of the newly reset window;
+        # using it prevents old-cycle usage from leaking into a rolling window.
+        return reset_at if now - reset_at <= duration else None
+    start_at = reset_at - duration
     return start_at if start_at <= now else None
+
+
+def quota_window_duration(window: dict[str, Any], fallback: timedelta) -> timedelta:
+    try:
+        minutes = int(window.get("window_minutes") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return timedelta(minutes=minutes) if minutes > 0 else fallback
 
 
 def add_cockpit_usage_to_bucket(
@@ -2050,8 +2071,18 @@ def scan_cockpit_codex_quota_windows(
     starts_7d: dict[str, datetime] = {}
     starts_cycle: dict[str, datetime] = {}
     for label, quota in quota_by_account.items():
-        start_5h = quota_window_start(quota.get("window_5h") or {}, now, timedelta(hours=5))
-        start_7d = quota_window_start(quota.get("window_7d") or {}, now, timedelta(days=7))
+        five_hour_window = quota.get("window_5h") or {}
+        seven_day_window = quota.get("window_7d") or {}
+        start_5h = quota_window_start(
+            five_hour_window,
+            now,
+            quota_window_duration(five_hour_window, timedelta(hours=5)),
+        )
+        start_7d = quota_window_start(
+            seven_day_window,
+            now,
+            quota_window_duration(seven_day_window, timedelta(days=7)),
+        )
         cycle_window = quota.get("window_cycle") or {}
         try:
             cycle_minutes = int(cycle_window.get("window_minutes") or 0)
@@ -2072,8 +2103,11 @@ def scan_cockpit_codex_quota_windows(
     if not all_starts:
         return {}, {}, {}, starts_5h, starts_7d, starts_cycle, {}
 
+    query_start = min(all_starts) - timedelta(
+        seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS)
+    )
     speed_by_label = cockpit_codex_speed_by_label(root)
-    speed_markers = codex_speed_history(root, min(all_starts), end)
+    speed_markers = codex_speed_history(root, query_start, end)
     buckets_5h = {label: UsageBucket() for label in starts_5h}
     buckets_7d = {label: UsageBucket() for label in starts_7d}
     buckets_cycle = {label: UsageBucket() for label in starts_cycle}
@@ -2096,7 +2130,7 @@ def scan_cockpit_codex_quota_windows(
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
             """,
-            (local_epoch_ms(min(all_starts)), local_epoch_ms(end)),
+            (local_epoch_ms(query_start), local_epoch_ms(end)),
         ).fetchall()
         con.close()
     except sqlite3.Error:
@@ -2754,8 +2788,6 @@ def build_active_session_rows(
             session_id = (event.session_id or event.request_key or codex_event_id(event)).strip()
             if not session_id:
                 continue
-            if not is_api_service_mirror_label(label):
-                labels_by_session[session_id] = label
             previous = latest_by_session.get(session_id)
             if previous is None or usage_event_attribution_time(event) > usage_event_attribution_time(previous[1]):
                 latest_by_session[session_id] = (label, event)
@@ -2772,9 +2804,11 @@ def build_active_session_rows(
         started_at: datetime | None = None,
     ) -> None:
         nonlocal unresolved
-        resolved_label = labels_by_session.get(session_id, "") or label
-        if is_api_service_mirror_label(resolved_label):
-            resolved_label = ""
+        resolved_label = label if label and not is_api_service_mirror_label(label) else ""
+        if not resolved_label:
+            resolved_label = labels_by_session.get(session_id, "")
+            if is_api_service_mirror_label(resolved_label):
+                resolved_label = ""
         if not resolved_label and current_label and not is_api_service_mirror_label(current_label):
             resolved_label = current_label
         if not resolved_label:
@@ -3339,22 +3373,81 @@ def bucket_to_window_dict(bucket: UsageBucket, start: datetime, end: datetime) -
     return result
 
 
-def apply_5h_countdown_state(window: dict[str, Any]) -> None:
+def apply_quota_countdown_state(
+    window: dict[str, Any],
+    now: datetime,
+    idle_until_first_use: bool,
+) -> None:
+    if window.get("quota_unlimited"):
+        window["quota_idle"] = False
+        window["countdown_active"] = False
+        return
     try:
         remaining = float(window.get("remaining_percent"))
     except (TypeError, ValueError):
         remaining = -1.0
+    reset_at = parse_dt(window.get("resets_at"))
+    quota_available = bool(window.get("quota_available"))
+    has_usage = (
+        int(window.get("requests") or 0) > 0
+        or int(window.get("tokens") or 0) > 0
+        or float(window.get("cost") or 0) > 0
+    )
+    if quota_available and reset_at is not None and reset_at <= now:
+        window["quota_snapshot_expired"] = True
+        duration = quota_window_duration(
+            window,
+            timedelta(hours=5) if idle_until_first_use else timedelta(days=7),
+        )
+        next_reset = reset_at + duration if now - reset_at <= duration else None
+        if next_reset is None:
+            window["quota_stale"] = True
+            window["remaining_percent"] = None
+            window["utilization"] = None
+            window["quota_idle"] = False
+            window["countdown_active"] = False
+            return
+        if not has_usage:
+            window["quota_stale"] = False
+            window["remaining_percent"] = 100.0
+            window["utilization"] = 0.0
+            window["quota_idle"] = idle_until_first_use
+            window["countdown_active"] = not idle_until_first_use and next_reset is not None
+            window["resets_at"] = (
+                ""
+                if idle_until_first_use or next_reset is None
+                else next_reset.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+            )
+        else:
+            # Usage is already from the new boundary, but the upstream quota
+            # percentage still describes the expired window.
+            window["quota_stale"] = True
+            window["remaining_percent"] = None
+            window["utilization"] = None
+            window["quota_idle"] = False
+            window["countdown_active"] = True
+            if next_reset is not None:
+                window["resets_at"] = next_reset.replace(tzinfo=LOCAL_TZ).isoformat(
+                    timespec="seconds"
+                )
+        return
     # The upstream quota snapshot commonly reports a reset/full window as 99%.
-    quota_idle = (
-        bool(window.get("quota_available"))
+    full_unused = (
+        quota_available
         and not bool(window.get("quota_stale"))
         and remaining >= 99.0
-        and int(window.get("requests") or 0) <= 0
-        and int(window.get("tokens") or 0) <= 0
-        and float(window.get("cost") or 0) <= 0
+        and not has_usage
     )
+    if full_unused:
+        window["remaining_percent"] = 100.0
+        window["utilization"] = 0.0
+    quota_idle = full_unused and idle_until_first_use
     window["quota_idle"] = quota_idle
-    window["countdown_active"] = bool(window.get("quota_available")) and not quota_idle
+    window["countdown_active"] = quota_available and not quota_idle
+
+
+def apply_5h_countdown_state(window: dict[str, Any], now: datetime | None = None) -> None:
+    apply_quota_countdown_state(window, now or datetime.now(), idle_until_first_use=True)
 
 
 def prefer_more_complete_usage_buckets(
@@ -3519,7 +3612,9 @@ def build_codex_window_stats(
     rolling_7d_buckets = dict(direct_7d)
     scan_starts = aligned_starts + [window_7d_start]
     if scan_starts:
-        aligned_scan_start = min(scan_starts)
+        aligned_scan_start = min(scan_starts) - timedelta(
+            seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS)
+        )
         aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
         speed_markers = codex_speed_history(home, aligned_scan_start, window_end)
         apply_codex_speed_fallback(aligned_events, speed_markers)
@@ -3584,13 +3679,30 @@ def build_codex_window_stats(
         | set(quota_by_account)
     )
     for label in labels:
+        quota = quota_by_account.get(label) or {}
+        quota_5h = quota.get("window_5h") or {}
+        quota_7d = quota.get("window_7d") or {}
+        quota_cycle = quota.get("window_cycle") or {}
+        bucket_5h = buckets_5h.get(label, UsageBucket())
+        bucket_7d = buckets_7d.get(label, UsageBucket())
+        bucket_cycle = buckets_cycle.get(label, UsageBucket())
+        if (
+            quota_5h.get("window_minutes")
+            and not quota_5h.get("quota_unlimited")
+            and label not in aligned_starts_5h
+        ):
+            bucket_5h = UsageBucket()
+        if quota_7d.get("window_minutes") and label not in aligned_starts_7d:
+            bucket_7d = UsageBucket()
+        if quota_cycle.get("window_minutes") and label not in aligned_starts_cycle:
+            bucket_cycle = UsageBucket()
         window_5h = bucket_to_window_dict(
-            buckets_5h.get(label, UsageBucket()),
+            bucket_5h,
             aligned_starts_5h.get(label, window_5h_start),
             now,
         )
         window_7d = bucket_to_window_dict(
-            buckets_7d.get(label, UsageBucket()),
+            bucket_7d,
             aligned_starts_7d.get(label, window_7d_start),
             now,
         )
@@ -3605,15 +3717,15 @@ def build_codex_window_stats(
             now,
         )
         window_cycle = bucket_to_window_dict(
-            buckets_cycle.get(label, UsageBucket()),
+            bucket_cycle,
             aligned_starts_cycle.get(label, now),
             now,
         )
-        quota = quota_by_account.get(label) or {}
-        window_5h.update(quota.get("window_5h") or {})
-        window_7d.update(quota.get("window_7d") or {})
-        window_cycle.update(quota.get("window_cycle") or {})
-        apply_5h_countdown_state(window_5h)
+        window_5h.update(quota_5h)
+        window_7d.update(quota_7d)
+        window_cycle.update(quota_cycle)
+        apply_5h_countdown_state(window_5h, now)
+        apply_quota_countdown_state(window_7d, now, idle_until_first_use=False)
         result[label] = {
             "window_5h": window_5h,
             "window_7d": window_7d,

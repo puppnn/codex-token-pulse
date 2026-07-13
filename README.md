@@ -111,8 +111,9 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 才会使用本地模型家族价格回退。可通过 `CLIENT_USAGE_MODEL_PRICE_URL` 替换价格源。
 
 成本估算会优先使用在线价格表中的完整 Token 规则：标准、Priority、Flex、Batch、
-超过 272K 输入上下文、缓存读取、缓存写入和输出价格。日志包含 service tier 时按实际 tier
-计费；日志未提供 tier 或缓存写入明细时，只按能够观测到的字段估算，不补造缺失用量。
+缓存读取、缓存写入和输出价格。超过 272K 输入上下文时仍沿用当前 tier 的普通价格，
+不应用在线价格表中的长上下文加价字段。日志包含 service tier 时按实际 tier 计费；日志
+未提供 tier 或缓存写入明细时，只按能够观测到的字段估算，不补造缺失用量。
 
 ## 统计来源
 

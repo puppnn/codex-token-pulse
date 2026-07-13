@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,16 @@ from unittest.mock import patch
 
 import client_usage_export
 import monitor
+
+
+class CompactNumberTests(unittest.TestCase):
+    def test_billions_use_b_suffix(self) -> None:
+        self.assertEqual(monitor.compact_number(1_000_000_000), "1.0B")
+        self.assertEqual(monitor.compact_number(1_260_000_000), "1.3B")
+        self.assertEqual(monitor.compact_number(-2_500_000_000), "-2.5B")
+
+    def test_values_below_one_billion_keep_m_suffix(self) -> None:
+        self.assertEqual(monitor.compact_number(999_900_000), "999.9M")
 
 
 class ModelPricingFallbackTests(unittest.TestCase):
@@ -63,7 +74,7 @@ class ModelPricingFallbackTests(unittest.TestCase):
 
         self.assertEqual(prices["gpt-new"], (6.0, 0.6, 36.0))
 
-    def test_complete_online_pricing_rules(self) -> None:
+    def test_complete_online_pricing_rules_ignore_long_context_surcharge(self) -> None:
         profile = {
             "input_cost_per_token": 5.0,
             "input_cost_per_token_above_272k_tokens": 10.0,
@@ -106,7 +117,7 @@ class ModelPricingFallbackTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             client_usage_export.estimate_cost("gpt-new", 200_000, 100_000, 10_000),
-            2.55,
+            1.35,
         )
 
     def test_priority_event_is_not_multiplied_twice(self) -> None:
@@ -426,6 +437,35 @@ class LocalActiveAccountTests(unittest.TestCase):
         }
 
         self.assertEqual(monitor.local_active_accounts_from_client_usage(usage), [])
+
+    def test_latest_request_provider_is_first_when_it_is_still_active(self) -> None:
+        now = datetime.now(timezone.utc)
+        usage = {
+            "latest_request": {
+                "provider": "Codex local - hails@example.com",
+                "created_at": now.isoformat(timespec="seconds"),
+            },
+            "active_sessions": [
+                {
+                    "session_id": "session-ginny",
+                    "provider": "Codex local - ginny@example.com",
+                    "latest_at": now.isoformat(timespec="seconds"),
+                    "active": True,
+                },
+                {
+                    "session_id": "session-hails",
+                    "provider": "Codex local - hails@example.com",
+                    "latest_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+                    "active": True,
+                },
+            ],
+            "providers": [],
+        }
+
+        active = monitor.local_active_accounts_from_client_usage(usage)
+
+        self.assertEqual(len(active), 2)
+        self.assertIn("hails@example.com", active[0]["name"])
 
     def test_recent_provider_without_recent_session_is_not_active(self) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1068,6 +1108,253 @@ class LocalExportHighWaterTests(unittest.TestCase):
 
 
 class WindowSemanticsTests(unittest.TestCase):
+    def test_unlimited_5h_window_is_not_counted_as_quota_pressure(self) -> None:
+        app = object.__new__(monitor.FloatingMonitorApp)
+        app.state = monitor.MonitorState(
+            top_accounts=[
+                {
+                    "name": "Codex local - plus@example.com",
+                    "tokens": 500,
+                    "requests": 2,
+                    "active_now": True,
+                    "window_5h": {
+                        "tokens": 500,
+                        "requests": 2,
+                        "cost": 0.5,
+                        "quota_available": False,
+                        "quota_unlimited": True,
+                    },
+                }
+            ]
+        )
+
+        rows = app._budget_rows()
+
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["has_quota"])
+        self.assertTrue(rows[0]["windows"][0]["quota_unlimited"])
+        self.assertFalse(rows[0]["windows"][0]["pressure_active"])
+
+    def write_quota_account(
+        self,
+        root: Path,
+        *,
+        plan_type: str,
+        hourly_minutes: int,
+        hourly_percentage: int = 80,
+        hourly_present: bool = True,
+        weekly_percentage: int = 70,
+        weekly_present: bool = False,
+    ) -> str:
+        accounts_dir = root / ".antigravity_cockpit" / "codex_accounts"
+        accounts_dir.mkdir(parents=True)
+        reset_5h = datetime(2026, 7, 13, 18, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        reset_7d = datetime(2026, 7, 19, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        email = f"{plan_type}@example.com"
+        payload = {
+            "id": f"{plan_type}-account",
+            "email": email,
+            "plan_type": plan_type,
+            "quota": {
+                "hourly_percentage": hourly_percentage,
+                "hourly_reset_time": int(
+                    (reset_7d if hourly_minutes == 7 * 24 * 60 else reset_5h).timestamp()
+                ),
+                "hourly_window_minutes": hourly_minutes,
+                "hourly_window_present": hourly_present,
+                "weekly_percentage": weekly_percentage,
+                "weekly_reset_time": int(reset_7d.timestamp()),
+                "weekly_window_present": weekly_present,
+            },
+        }
+        (accounts_dir / "account.json").write_text(json.dumps(payload), encoding="utf-8")
+        return f"Codex local - {email}"
+
+    def write_request_log(
+        self,
+        root: Path,
+        email: str,
+        events: list[tuple[datetime, int]],
+    ) -> None:
+        db_dir = root / ".antigravity_cockpit"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(db_dir / "codex_local_access_logs.sqlite")
+        con.execute(
+            """
+            CREATE TABLE request_logs (
+                timestamp INTEGER,
+                account_id TEXT,
+                email TEXT,
+                api_key_label TEXT,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                cached_tokens INTEGER,
+                estimated_cost_usd REAL
+            )
+            """
+        )
+        con.executemany(
+            "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    client_usage_export.local_epoch_ms(when),
+                    "account-id",
+                    email,
+                    "",
+                    "gpt-5.4",
+                    tokens,
+                    0,
+                    tokens,
+                    0,
+                    0.0,
+                )
+                for when, tokens in events
+            ],
+        )
+        con.commit()
+        con.close()
+
+    def test_plus_primary_7d_maps_to_official_7d_and_unlimited_5h(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            label = self.write_quota_account(
+                root,
+                plan_type="plus",
+                hourly_minutes=7 * 24 * 60,
+            )
+
+            quota = client_usage_export.cockpit_codex_quota_by_label(root)[label]
+
+        self.assertTrue(quota["window_5h"]["quota_unlimited"])
+        self.assertFalse(quota["window_5h"]["quota_available"])
+        self.assertTrue(quota["window_7d"]["quota_available"])
+        self.assertEqual(quota["window_7d"]["window_minutes"], 7 * 24 * 60)
+        self.assertEqual(quota["window_7d"]["remaining_percent"], 80.0)
+        self.assertFalse(quota["window_cycle"]["quota_available"])
+
+    def test_plus_restored_5h_recovers_both_official_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            label = self.write_quota_account(
+                root,
+                plan_type="plus",
+                hourly_minutes=300,
+                weekly_present=True,
+            )
+
+            quota = client_usage_export.cockpit_codex_quota_by_label(root)[label]
+
+        self.assertTrue(quota["window_5h"]["quota_available"])
+        self.assertNotIn("quota_unlimited", quota["window_5h"])
+        self.assertEqual(quota["window_5h"]["window_minutes"], 300)
+        self.assertTrue(quota["window_7d"]["quota_available"])
+
+    def test_k12_primary_5h_and_weekly_7d_stay_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            label = self.write_quota_account(
+                root,
+                plan_type="k12",
+                hourly_minutes=300,
+                weekly_present=True,
+            )
+
+            quota = client_usage_export.cockpit_codex_quota_by_label(root)[label]
+
+        self.assertEqual(quota["window_5h"]["remaining_percent"], 80.0)
+        self.assertEqual(quota["window_7d"]["remaining_percent"], 70.0)
+        self.assertFalse(quota["window_cycle"]["quota_available"])
+
+    def test_official_quota_without_reset_is_unavailable_and_stale(self) -> None:
+        window = client_usage_export.quota_window_payload(
+            50,
+            None,
+            False,
+            7 * 24 * 60,
+        )
+
+        self.assertFalse(window["quota_available"])
+        self.assertTrue(window["quota_stale"])
+        self.assertEqual(window["resets_at"], "")
+
+    def test_quota_scanner_filters_events_at_exact_cycle_start(self) -> None:
+        now = datetime(2026, 7, 13, 12, 0, 0)
+        reset_at = datetime(2026, 7, 14, 12, 0, 0)
+        cycle_start = reset_at - timedelta(days=7)
+        label = "Codex local - plus@example.com"
+        quota = {
+            label: {
+                "window_5h": {"quota_available": False, "quota_unlimited": True},
+                "window_7d": {
+                    "quota_available": True,
+                    "quota_stale": False,
+                    "resets_at": reset_at.replace(
+                        tzinfo=client_usage_export.LOCAL_TZ
+                    ).isoformat(timespec="seconds"),
+                    "window_minutes": 7 * 24 * 60,
+                },
+                "window_cycle": {"quota_available": False},
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.write_request_log(
+                root,
+                "plus@example.com",
+                [(cycle_start - timedelta(seconds=5), 100), (cycle_start, 200)],
+            )
+
+            _, buckets_7d, _, _, starts_7d, _, _ = (
+                client_usage_export.scan_cockpit_codex_quota_windows(
+                    root,
+                    quota,
+                    now,
+                    now + timedelta(seconds=1),
+                )
+            )
+
+        self.assertEqual(starts_7d[label], cycle_start)
+        self.assertEqual(buckets_7d[label].total_tokens, 200)
+
+    def test_manual_reset_moves_boundary_and_excludes_old_cycle(self) -> None:
+        now = datetime(2026, 7, 13, 12, 0, 0)
+        reset_at = datetime(2026, 7, 20, 11, 0, 0)
+        cycle_start = reset_at - timedelta(days=7)
+        label = "Codex local - plus@example.com"
+        quota = {
+            label: {
+                "window_7d": {
+                    "quota_available": True,
+                    "quota_stale": False,
+                    "resets_at": reset_at.replace(
+                        tzinfo=client_usage_export.LOCAL_TZ
+                    ).isoformat(timespec="seconds"),
+                    "window_minutes": 7 * 24 * 60,
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.write_request_log(
+                root,
+                "plus@example.com",
+                [(cycle_start - timedelta(hours=1), 900), (cycle_start + timedelta(minutes=1), 100)],
+            )
+
+            _, buckets_7d, _, _, starts_7d, _, _ = (
+                client_usage_export.scan_cockpit_codex_quota_windows(
+                    root,
+                    quota,
+                    now,
+                    now + timedelta(seconds=1),
+                )
+            )
+
+        self.assertEqual(starts_7d[label], cycle_start)
+        self.assertEqual(buckets_7d[label].total_tokens, 100)
+
     def test_window_dict_preserves_model_and_token_breakdown(self) -> None:
         bucket = client_usage_export.UsageBucket(
             requests=2,
@@ -1154,6 +1441,7 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertTrue(window_30d["start_at"].startswith("2026-05-24T12:00:00"))
 
     def test_full_unused_5h_quota_waits_for_first_request(self) -> None:
+        now = datetime(2026, 6, 23, 12, 0, 0)
         window = {
             "requests": 0,
             "tokens": 0,
@@ -1165,19 +1453,19 @@ class WindowSemanticsTests(unittest.TestCase):
             "resets_at": "2026-06-23T17:00:00+08:00",
         }
 
-        client_usage_export.apply_5h_countdown_state(window)
+        client_usage_export.apply_5h_countdown_state(window, now)
 
         self.assertTrue(window["quota_idle"])
         self.assertFalse(window["countdown_active"])
 
         window["requests"] = 1
         window["tokens"] = 100
-        client_usage_export.apply_5h_countdown_state(window)
+        client_usage_export.apply_5h_countdown_state(window, now)
 
         self.assertFalse(window["quota_idle"])
         self.assertTrue(window["countdown_active"])
 
-    def test_quota_window_start_allows_small_clock_skew(self) -> None:
+    def test_quota_window_start_uses_exact_official_boundary(self) -> None:
         now = datetime(2026, 6, 29, 11, 0, 0)
         window = {
             "quota_available": True,
@@ -1189,7 +1477,89 @@ class WindowSemanticsTests(unittest.TestCase):
 
         self.assertIsNotNone(start)
         assert start is not None
-        self.assertTrue(start <= datetime(2026, 6, 29, 9, 22, 51))
+        self.assertEqual(start, datetime(2026, 6, 29, 9, 22, 53))
+
+    def test_full_unused_7d_quota_keeps_official_countdown(self) -> None:
+        now = datetime(2026, 7, 13, 12, 0, 0)
+        window = {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "quota_available": True,
+            "quota_stale": False,
+            "remaining_percent": 99.0,
+            "utilization": 1.0,
+            "resets_at": "2026-07-19T12:00:00+08:00",
+            "window_minutes": 7 * 24 * 60,
+        }
+
+        client_usage_export.apply_quota_countdown_state(
+            window,
+            now,
+            idle_until_first_use=False,
+        )
+
+        self.assertEqual(window["remaining_percent"], 100.0)
+        self.assertEqual(window["utilization"], 0.0)
+        self.assertFalse(window["quota_idle"])
+        self.assertTrue(window["countdown_active"])
+        self.assertEqual(window["resets_at"], "2026-07-19T12:00:00+08:00")
+
+    def test_expired_quota_reset_becomes_new_window_boundary(self) -> None:
+        now = datetime(2026, 7, 12, 19, 18, 0)
+        reset_at = datetime(2026, 7, 12, 19, 16, 47)
+        window = {
+            "quota_available": True,
+            "quota_stale": False,
+            "resets_at": "2026-07-12T19:16:47+08:00",
+        }
+
+        start = client_usage_export.quota_window_start(window, now, timedelta(hours=5))
+
+        self.assertEqual(start, reset_at)
+
+    def test_expired_unused_5h_window_becomes_idle_and_full(self) -> None:
+        now = datetime(2026, 7, 12, 19, 18, 0)
+        window = {
+            "requests": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "quota_available": True,
+            "quota_stale": False,
+            "remaining_percent": 0.0,
+            "utilization": 100.0,
+            "resets_at": "2026-07-12T19:16:47+08:00",
+        }
+
+        client_usage_export.apply_5h_countdown_state(window, now)
+
+        self.assertTrue(window["quota_snapshot_expired"])
+        self.assertTrue(window["quota_idle"])
+        self.assertFalse(window["countdown_active"])
+        self.assertEqual(window["remaining_percent"], 100.0)
+        self.assertEqual(window["utilization"], 0.0)
+
+    def test_expired_used_5h_window_hides_old_quota_percentage(self) -> None:
+        now = datetime(2026, 7, 12, 19, 18, 0)
+        window = {
+            "requests": 2,
+            "tokens": 200_000,
+            "cost": 0.2,
+            "quota_available": True,
+            "quota_stale": False,
+            "remaining_percent": 0.0,
+            "utilization": 100.0,
+            "resets_at": "2026-07-12T19:16:47+08:00",
+        }
+
+        client_usage_export.apply_5h_countdown_state(window, now)
+
+        self.assertTrue(window["quota_snapshot_expired"])
+        self.assertTrue(window["quota_stale"])
+        self.assertFalse(window["quota_idle"])
+        self.assertTrue(window["countdown_active"])
+        self.assertIsNone(window["remaining_percent"])
+        self.assertIsNone(window["utilization"])
 
     def test_quota_windows_use_quota_cycle_boundaries(self) -> None:
         now = datetime(2026, 6, 22, 12, 0, 0)
@@ -1299,6 +1669,49 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(window_7d["tokens"], 66_000_000)
         self.assertTrue(window_7d["start_at"].startswith("2026-06-15T12:00:00"))
 
+    def test_unavailable_official_7d_keeps_tokens_only_in_rolling_window(self) -> None:
+        now = datetime(2026, 6, 22, 12, 0, 0)
+        label = "Codex local - plus@example.com"
+        rolling_7d = client_usage_export.UsageBucket(
+            requests=70,
+            input_tokens=66_000_000,
+            cost=62.0,
+        )
+        quota = {
+            label: {
+                "window_5h": {"quota_available": False, "quota_unlimited": True},
+                "window_7d": {
+                    "quota_available": False,
+                    "quota_stale": True,
+                    "resets_at": "",
+                    "window_minutes": 7 * 24 * 60,
+                },
+            }
+        }
+
+        def scan_accounts(_home: Path, _start: datetime, _end: datetime):
+            return {label: rolling_7d}
+
+        aligned = ({}, {}, {}, {}, {}, {}, {})
+        with (
+            patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value=quota),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_accounts", side_effect=scan_accounts),
+            patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+            patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+        ):
+            result = client_usage_export.build_codex_window_stats(
+                Path("."),
+                Path("."),
+                now,
+                {},
+                label,
+            )
+
+        self.assertEqual(result[label]["window_7d"]["tokens"], 0)
+        self.assertTrue(result[label]["window_7d"]["quota_stale"])
+        self.assertEqual(result[label]["window_rolling_7d"]["tokens"], 66_000_000)
+
 
 class ActiveSessionLifecycleTests(unittest.TestCase):
     def test_running_lifecycle_wins_over_old_token_activity(self) -> None:
@@ -1367,6 +1780,50 @@ class ActiveSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(active_by_label, {})
         self.assertEqual(sessions_by_label, {})
+        self.assertEqual(unresolved, 0)
+
+    def test_latest_session_event_label_cannot_be_overwritten_by_older_provider_group(self) -> None:
+        now = datetime(2026, 7, 12, 20, 0, 0)
+        latest_label = "Codex local - hails@example.com"
+        older_label = "Codex local - ginny@example.com"
+        latest_event = client_usage_export.UsageEvent(
+            when=now - timedelta(seconds=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        older_event = client_usage_export.UsageEvent(
+            when=now - timedelta(minutes=1),
+            model="gpt-test",
+            input_tokens=90,
+            cached_tokens=180,
+            output_tokens=9,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_started",
+            when=now - timedelta(minutes=2),
+            file_activity_at=now,
+        )
+
+        rows, active_by_label, _sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {
+                    latest_label: [latest_event],
+                    older_label: [older_event],
+                },
+                {"session-1": older_label},
+                {"session-1": lifecycle},
+                older_label,
+                now,
+            )
+        )
+
+        self.assertEqual(rows[0]["provider"], latest_label)
+        self.assertEqual(active_by_label, {latest_label: 1})
         self.assertEqual(unresolved, 0)
 
     def test_scanner_keeps_latest_task_lifecycle_event(self) -> None:

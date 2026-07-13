@@ -255,6 +255,8 @@ def compact_number(value: float | int | None) -> str:
     number = float(value or 0)
     sign = "-" if number < 0 else ""
     number = abs(number)
+    if number >= 1_000_000_000:
+        return f"{sign}{number / 1_000_000_000:.1f}B"
     if number >= 1_000_000:
         return f"{sign}{number / 1_000_000:.1f}M"
     if number >= 1_000:
@@ -616,6 +618,9 @@ def local_active_accounts_from_client_usage(
     providers = client_usage.get("providers")
     providers = providers if isinstance(providers, list) else []
     active_sessions = client_usage.get("active_sessions")
+    client_latest = client_usage.get("latest_request")
+    client_latest = client_latest if isinstance(client_latest, dict) else {}
+    latest_provider_name = str(client_latest.get("provider") or "")
     if isinstance(active_sessions, list):
         active_by_provider: dict[str, dict[str, Any]] = {}
         for index, session in enumerate(active_sessions):
@@ -633,6 +638,7 @@ def local_active_accounts_from_client_usage(
                 row = {
                     "id": f"local-session-{index}",
                     "name": f"LOCAL - {local_provider_display_name(provider_name)}",
+                    "provider": provider_name,
                     "current": 0,
                     "max": 0,
                     "model": session.get("model") or "-",
@@ -650,7 +656,14 @@ def local_active_accounts_from_client_usage(
                 row["model"] = session.get("model") or row.get("model") or "-"
         active = list(active_by_provider.values())
         if active:
-            active.sort(key=lambda row: _parse_time(str(row.get("latest_at") or "")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            active.sort(
+                key=lambda row: (
+                    str(row.get("provider") or "") == latest_provider_name,
+                    _parse_time(str(row.get("latest_at") or ""))
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                ),
+                reverse=True,
+            )
             return active
 
     active: list[dict[str, Any]] = []
@@ -672,6 +685,7 @@ def local_active_accounts_from_client_usage(
             {
                 "id": f"local-{index}",
                 "name": f"LOCAL - {local_provider_display_name(provider_name)}",
+                "provider": provider_name,
                 "current": recent_sessions,
                 "max": recent_sessions,
                 "model": provider.get("latest_model") or "-",
@@ -684,8 +698,7 @@ def local_active_accounts_from_client_usage(
         active.sort(key=lambda row: _parse_time(str(row.get("latest_at") or "")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         return active
 
-    client_latest = client_usage.get("latest_request")
-    if not isinstance(client_latest, dict) or not client_latest.get("created_at"):
+    if not client_latest.get("created_at"):
         return []
     if not is_recent_activity(str(client_latest.get("created_at") or "")):
         return []
@@ -2640,6 +2653,7 @@ class FloatingMonitorApp:
                 if not isinstance(window, dict) or not window:
                     continue
                 quota_available = bool(window.get("quota_available", window.get("utilization") is not None))
+                quota_unlimited = bool(window.get("quota_unlimited"))
                 try:
                     utilization = float(window.get("utilization") or 0)
                 except (TypeError, ValueError):
@@ -2651,6 +2665,7 @@ class FloatingMonitorApp:
                     {
                         "label": label,
                         "quota_available": quota_available,
+                        "quota_unlimited": quota_unlimited,
                         "quota_stale": bool(window.get("quota_stale")),
                         "quota_idle": bool(window.get("quota_idle")) if key == "window_5h" else False,
                         "utilization": utilization,
@@ -2658,7 +2673,11 @@ class FloatingMonitorApp:
                         "resets_at": str(window.get("resets_at") or ""),
                         "tokens": int(window.get("tokens") or 0),
                         "cost": float(window.get("cost") or 0),
-                        "pressure_active": pressure_active and not bool(window.get("quota_idle")),
+                        "pressure_active": (
+                            pressure_active
+                            and not bool(window.get("quota_idle"))
+                            and not quota_unlimited
+                        ),
                     }
                 )
             if not windows:
@@ -2965,6 +2984,7 @@ class FloatingMonitorApp:
                     "count": len(all_windows),
                     "quota_count": len(quota_windows),
                     "active_count": len(pressure_windows),
+                    "unlimited_count": sum(1 for window in all_windows if window.get("quota_unlimited")),
                     "tokens": sum(int(window.get("tokens") or 0) for window in all_windows),
                     "cost": sum(float(window.get("cost") or 0) for window in all_windows),
                     "used": avg_used,
@@ -2985,7 +3005,11 @@ class FloatingMonitorApp:
                               font=self._fonts["font_micro"], fill=Theme.ag_muted)
             c.create_text(col_r - 62, y + 10, anchor="ne", text=money(cat["cost"]),
                           font=self._fonts["font_micro"], fill=Theme.ag_muted)
-            pct_text = f"{cat['used']:.0f}%"
+            pct_text = (
+                "无限"
+                if cat["unlimited_count"] > 0 and cat["quota_count"] <= 0
+                else f"{cat['used']:.0f}%"
+            )
             self._draw_rounded_rect(col_r - 54, y + 8, col_r - 10, y + 27, r=6,
                                     fill=Theme.ag_bg, outline=color)
             c.create_text(col_r - 32, y + 17, anchor="center", text=pct_text,
@@ -3026,7 +3050,13 @@ class FloatingMonitorApp:
                 x2 = col_l + 10 + (win_index + 1) * ((col_r - col_l - 28) // 3) - 5
                 wy = row_y + 35
                 label = str(window["label"])
-                if window["quota_available"]:
+                quota_unlimited = bool(window.get("quota_unlimited"))
+                if quota_unlimited:
+                    utilization = 0.0
+                    color = Theme.ag_success
+                    detail = "无5h限制"
+                    reset = f"{compact_number(window.get('tokens', 0))} tok · {money(window.get('cost', 0))}"
+                elif window["quota_available"]:
                     utilization = float(window.get("utilization") or 0)
                     color = self._ag_quota_color(utilization)
                     remaining = window.get("remaining")
@@ -3053,11 +3083,13 @@ class FloatingMonitorApp:
                 c.create_text(x1 + 24, wy, anchor="nw", text=self._truncate(detail, "font_micro", max(30, x2 - x1 - 24)),
                               font=self._fonts["font_micro"], fill=color)
                 bar_y = wy + 20
-                self._draw_rounded_rect(x1, bar_y, x2, bar_y + 5, r=2, fill=Theme.ag_bg, outline="")
-                if window["quota_available"]:
+                if not quota_unlimited:
+                    self._draw_rounded_rect(x1, bar_y, x2, bar_y + 5, r=2, fill=Theme.ag_bg, outline="")
+                if window["quota_available"] and not quota_unlimited:
                     fill_w = int((x2 - x1) * max(0.02, min(1.0, utilization / 100.0)))
                     self._draw_rounded_rect(x1, bar_y, x1 + fill_w, bar_y + 5, r=2, fill=color, outline="")
-                c.create_text(x1, bar_y + 9, anchor="nw", text=self._truncate(reset, "font_micro", max(40, x2 - x1)),
+                reset_y = bar_y + (1 if quota_unlimited else 9)
+                c.create_text(x1, reset_y, anchor="nw", text=self._truncate(reset, "font_micro", max(40, x2 - x1)),
                               font=self._fonts["font_micro"], fill=Theme.ag_muted)
 
     def _draw_usage_stats_page(self, col_l: int, col_r: int, y: int, H: int) -> None:
@@ -3635,7 +3667,14 @@ class FloatingMonitorApp:
                 window_requests = int(window.get("requests") or 0)
                 window_cost = float(window.get("cost") or 0)
                 has_quota = bool(window.get("quota_available", window.get("utilization") is not None))
-                if window_tokens <= 0 and window_requests <= 0 and window_cost <= 0 and not has_quota:
+                quota_unlimited = bool(window.get("quota_unlimited"))
+                if (
+                    window_tokens <= 0
+                    and window_requests <= 0
+                    and window_cost <= 0
+                    and not has_quota
+                    and not quota_unlimited
+                ):
                     continue
                 item = dict(account)
                 item["tokens"] = window_tokens
@@ -3647,6 +3686,7 @@ class FloatingMonitorApp:
                 item["latest_at"] = window.get("latest_at") or account.get("latest_at") or ""
                 item["latest_model"] = window.get("latest_model") or account.get("latest_model") or ""
                 item["quota_available"] = has_quota
+                item["quota_unlimited"] = quota_unlimited
                 item["quota_stale"] = bool(window.get("quota_stale"))
                 item["quota_idle"] = bool(window.get("quota_idle")) if self._account_range == "5h" else False
                 top.append(item)
@@ -3730,11 +3770,14 @@ class FloatingMonitorApp:
                 except (TypeError, ValueError):
                     remaining_percent = None
             quota_available = bool(acc.get("quota_available")) if window_mode else False
+            quota_unlimited = bool(acc.get("quota_unlimited")) if window_mode else False
             quota_stale = bool(acc.get("quota_stale")) if window_mode else False
             quota_idle = bool(acc.get("quota_idle")) if window_mode else False
             cycle_window = acc.get("window_cycle") if isinstance(acc.get("window_cycle"), dict) else {}
             has_cycle_quota = bool(cycle_window.get("quota_available"))
-            if window_mode and quota_available:
+            if window_mode and quota_unlimited:
+                bar_color = Theme.accent_green
+            elif window_mode and quota_available:
                 bar_color = quota_color(utilization)
             else:
                 bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
@@ -3752,7 +3795,9 @@ class FloatingMonitorApp:
                           font=self._fonts["font_label"], fill=Theme.text_primary)
 
             if window_mode:
-                if quota_idle:
+                if quota_unlimited:
+                    percentage_text = "无5h限制"
+                elif quota_idle:
                     percentage_text = "\u6ee1\u989d"
                 elif quota_available:
                     try:
@@ -3764,10 +3809,17 @@ class FloatingMonitorApp:
                     percentage_text = "\u5468\u671f\u8d26\u53f7"
                 else:
                     percentage_text = "\u6682\u65e0\u989d\u5ea6"
-                percentage_color = Theme.text_muted if quota_stale or not quota_available else bar_color
+                percentage_color = (
+                    Theme.accent_green
+                    if quota_unlimited
+                    else (Theme.text_muted if quota_stale or not quota_available else bar_color)
+                )
                 if has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
                     percentage_color = Theme.amber_bright
-                if quota_stale or not quota_available:
+                if quota_unlimited:
+                    percentage_fill = Theme.quota_green_bg
+                    percentage_outline = Theme.accent_green
+                elif quota_stale or not quota_available:
                     percentage_fill = Theme.bg_lift
                     percentage_outline = Theme.border
                 elif percentage_color == Theme.accent_red:
@@ -3793,6 +3845,9 @@ class FloatingMonitorApp:
                 if health_badge:
                     right_detail = health_badge
                     right_color = self._health_color(health_badge)
+                elif quota_unlimited:
+                    right_detail = f"最近 5h · {reqs} 次"
+                    right_color = Theme.accent_green
                 elif quota_stale:
                     right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
                     right_color = Theme.amber_bright
@@ -3815,7 +3870,9 @@ class FloatingMonitorApp:
                 c.create_text(COL_R - 4, y + 20, anchor="ne", text=right_detail,
                               font=self._fonts["font_micro"], fill=right_color)
 
-                if quota_available:
+                if quota_unlimited:
+                    reset_text = "无5h限制 · 最近5小时分析"
+                elif quota_available:
                     if quota_idle:
                         reset_text = "\u9996\u6b21\u4f7f\u7528\u540e\u5f00\u59cb 5h \u5012\u8ba1\u65f6"
                     else:
@@ -3836,9 +3893,10 @@ class FloatingMonitorApp:
                 progress_x1 = name_x
                 progress_x2 = max(progress_x1 + 42, COL_R - reset_w - 14)
                 progress_y = y + 41
-                self._draw_rounded_rect(progress_x1, progress_y, progress_x2, progress_y + 4,
-                                        r=2, fill=Theme.bg_lift, outline="")
-                if quota_available:
+                if not quota_unlimited:
+                    self._draw_rounded_rect(progress_x1, progress_y, progress_x2, progress_y + 4,
+                                            r=2, fill=Theme.bg_lift, outline="")
+                if quota_available and not quota_unlimited:
                     try:
                         ratio = 0.0 if quota_idle else max(0.0, min(1.0, float(utilization) / 100.0))
                     except (TypeError, ValueError):
