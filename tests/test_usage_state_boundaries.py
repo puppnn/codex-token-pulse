@@ -2261,7 +2261,17 @@ class CodexSessionModelTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def token_count(self, timestamp: str, input_tokens: int, output_tokens: int) -> dict:
+    def token_count(
+        self,
+        timestamp: str,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        cached_tokens: int = 0,
+        total_input_tokens: int | None = None,
+        total_cached_tokens: int | None = None,
+        total_output_tokens: int | None = None,
+    ) -> dict:
         return {
             "timestamp": timestamp,
             "type": "event_msg",
@@ -2270,13 +2280,15 @@ class CodexSessionModelTests(unittest.TestCase):
                 "info": {
                     "last_token_usage": {
                         "input_tokens": input_tokens,
-                        "cached_input_tokens": 0,
+                        "cached_input_tokens": cached_tokens,
                         "output_tokens": output_tokens,
                     },
                     "total_token_usage": {
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": 0,
-                        "output_tokens": output_tokens,
+                        "input_tokens": total_input_tokens if total_input_tokens is not None else input_tokens,
+                        "cached_input_tokens": (
+                            total_cached_tokens if total_cached_tokens is not None else cached_tokens
+                        ),
+                        "output_tokens": total_output_tokens if total_output_tokens is not None else output_tokens,
                     },
                 },
             },
@@ -2351,6 +2363,222 @@ class CodexSessionModelTests(unittest.TestCase):
             )
 
         self.assertEqual([event.model for event in events], ["gpt-5.6-sol", "gpt-5.4"])
+
+    def test_long_fork_replay_is_skipped_while_parent_and_child_requests_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-parent.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-11T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "parent"},
+                    },
+                    self.token_count(
+                        "2026-07-11T10:00:00",
+                        100,
+                        10,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-11T10:01:00",
+                        200,
+                        20,
+                        total_input_tokens=300,
+                        total_output_tokens=30,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:00:30",
+                        50,
+                        5,
+                        total_input_tokens=350,
+                        total_output_tokens=35,
+                    ),
+                ],
+            )
+            self.write_session(
+                root,
+                "rollout-child.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "session_meta",
+                        "payload": {"id": "child", "forked_from_id": "parent"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:00:01",
+                        100,
+                        10,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:00:03.500",
+                        200,
+                        20,
+                        total_input_tokens=300,
+                        total_output_tokens=30,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:01:00",
+                        40,
+                        4,
+                        total_input_tokens=350,
+                        total_output_tokens=35,
+                    ),
+                ],
+            )
+            self.write_session(
+                root,
+                "rollout-sibling.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:00:00.500",
+                        "type": "session_meta",
+                        "payload": {"id": "sibling", "forked_from_id": "parent"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:00:01.500",
+                        100,
+                        10,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:00:04",
+                        200,
+                        20,
+                        total_input_tokens=300,
+                        total_output_tokens=30,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:02:00",
+                        45,
+                        6,
+                        total_input_tokens=360,
+                        total_output_tokens=36,
+                    ),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(
+            [(event.session_id, event.input_tokens, event.output_tokens) for event in events],
+            [("parent", 50, 5), ("child", 40, 4), ("sibling", 45, 6)],
+        )
+
+    def test_non_fork_session_keeps_all_token_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-regular.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "regular"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:00:00",
+                        70,
+                        7,
+                        total_input_tokens=70,
+                        total_output_tokens=7,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:01:00",
+                        80,
+                        8,
+                        total_input_tokens=150,
+                        total_output_tokens=15,
+                    ),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(
+            [(event.input_tokens, event.output_tokens) for event in events],
+            [(70, 7), (80, 8)],
+        )
+
+    def test_non_fork_repeated_cumulative_snapshots_keep_legacy_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-regular-a.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "regular-a"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:00:00",
+                        100,
+                        10,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:01:00",
+                        40,
+                        4,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:02:00",
+                        25,
+                        2,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                ],
+            )
+            self.write_session(
+                root,
+                "rollout-regular-b.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:03:00",
+                        "type": "session_meta",
+                        "payload": {"id": "regular-b"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:04:00",
+                        60,
+                        6,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(
+            [(event.session_id, event.input_tokens, event.output_tokens) for event in events],
+            [("regular-a", 100, 10)],
+        )
 
     def test_only_terminal_turn_errors_are_collected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
