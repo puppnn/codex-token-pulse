@@ -23,6 +23,8 @@
 - 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
 - 两个中文页签：`账号`、`用量统计`。
 - 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
+- 实时用量刷新：后台以冷热双层轮询观察 Codex 会话日志，活跃时只快速检查少量热文件，空闲后自动降频，并用低频全目录扫描补漏；发现新的 `token_count` 后先即时更新界面，再由完整导出结果校正。
+- Token 流量脉冲：账号页每个新增 `token_count` 对应一条从左向右移动的竖线，Token 越多竖线越高、越亮，约 5 秒走完整条轨迹；用量统计页使用单列分段流量柱，柱身保持亮色，仅柱顶约 6 像素渐变并以约 60 FPS 连续升降。两处均展示最近 5 秒 Token 流量。
 - 账号排行：按今日、5h、7d、30d 查看账号用量与额度状态。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
 - 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、常用模型和账号累计成本。
@@ -61,10 +63,25 @@ python .\monitor.py
 
 ## 本地独立监控
 
+Cockpit 不是必需依赖。直连官方账号时，Token Pulse 会解析 Codex 官方 `~/.codex/auth.json`（包括 JWT 邮箱和 `tokens.account_id`），并按认证文件修改时间记录手动切换边界。切换前已经开始、切换后才完成的任务仍归原账号；切换后开始的新任务归新账号。只有活动 provider 明确为 Cockpit API 服务时，才读取 `.cockpit_codex_auth.json` 和 Cockpit 请求日志，卸载后的遗留文件不会覆盖官方账号身份。
+
+悬浮窗默认每秒轻量检查一次认证身份。检测到手动切号时只追加一条切换时间记录并刷新活跃账号，不扫描会话日志，也不立即触发完整 Token 导出。
+
 如果希望完全不碰 Sub2API，可以强制本地独立模式。这个模式只读取本机 Codex/Claude 与 Antigravity Cockpit 本地日志，不请求 Sub2API 管理接口，也不使用 Sub2API 的最近请求、账号统计或并发数据。
 
 ```env
 TOKEN_MONITOR_MODE=local-codex
+```
+
+### 官方额度时间同步
+
+Token Pulse 会先读取 Cockpit 明文账号快照和 sidecar reserve 中的本地额度、重置时间；只有本地重置时间缺失或 stale 时，才使用 Cockpit 侧车维护的账号凭据请求 ChatGPT 官方 `wham/usage` 接口。程序只缓存解析后的 5h/7d/cycle 额度和重置时间，不会把 access token 写入日志、导出 JSON 或缓存文件。
+
+每个账号默认缓存 10 分钟；请求失败也会等待 10 分钟再重试，并继续显示本地 reserve 中已有的百分比。可通过环境变量调整或关闭：
+
+```env
+CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS=600
+CLIENT_USAGE_OFFICIAL_QUOTA_REFRESH=1
 ```
 
 如果 `.env` 里写着 `SUB2API_MONITOR_MODE=auto`，程序会按“当前 endpoint 门禁”处理：当前 Codex 指向 Sub2API 才读 Sub2API，否则走本地日志。
@@ -103,11 +120,22 @@ CLIENT_USAGE_CODEX_DESKTOP_LOG_ROOT=
 CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS=86400
 CLIENT_USAGE_OFFLINE_BACKFILL_MAX_DAYS=31
 SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS=90
+TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS=100
+TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS=250
+TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS=500
+TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS=30
+TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS=1000
 SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
 ```
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
+
+实时监听采用自适应冷热双层轮询：有日志活动时按 `TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS`（默认 `100` 毫秒）检查最多 16 个热文件；空闲 10 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS`（默认 `250` 毫秒），空闲 60 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS`（默认 `500` 毫秒）。程序每 20 秒只遍历一次完整目录以补充新文件，不重复读取历史日志内容。即时层只在内存中更新顶部 Token/请求总量和 24h Token 构成，不写入 provider、模型、成本、Activity、历史或统计缓存；随后仍由原有后台完整解析、fork replay 去重、账号归属和计费流程生成权威结果。
+
+`TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS` 默认为 `30` 秒。活跃会话仍在写日志时，自动完整扫描会暂缓；日志安静达到该时间后再更新账号归属、模型和成本。悬浮窗上的手动刷新按钮不受此限制。
+
+`TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS` 控制官方账号身份检查间隔，默认 `1000` 毫秒，最小 `500` 毫秒。监听只读取 `config.toml` 与当前路由对应的小型认证文件，切号记录保存在本地 `client_usage_auth_switch_events.jsonl`。
 
 悬浮窗关闭期间，Codex/Claude 仍会独立写入本地日志。重新打开后，导出器会先完整重建
 当天统计，再依据历史文件中的最后成功观测时间补录已经结束的日期。默认最多回看 31 天，

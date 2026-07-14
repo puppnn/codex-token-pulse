@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import sqlite3
 from bisect import bisect_left, bisect_right
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +65,10 @@ DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_usage_config.json")
 SPEED_HISTORY_PATH = Path(os.environ.get("CLIENT_USAGE_SPEED_HISTORY") or APP_DIR / "client_usage_speed_history.json")
 ACCOUNT_TIMELINE_PATH = Path(os.environ.get("CLIENT_USAGE_ACCOUNT_TIMELINE") or APP_DIR / "client_usage_account_timeline.json")
+AUTH_SWITCH_EVENTS_PATH = Path(
+    os.environ.get("CLIENT_USAGE_AUTH_SWITCH_EVENTS")
+    or APP_DIR / "client_usage_auth_switch_events.jsonl"
+)
 ATTRIBUTION_LEDGER_PATH = Path(os.environ.get("CLIENT_USAGE_ATTRIBUTION_LEDGER") or APP_DIR / "client_usage_attribution_ledger.json")
 USAGE_HISTORY_PATH = Path(os.environ.get("USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
 MODEL_PRICE_CACHE_PATH = Path(
@@ -74,6 +80,30 @@ MODEL_PRICE_SOURCE_URL = os.environ.get(
 )
 MODEL_PRICE_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS", "86400"))
 MODEL_PRICE_FETCH_TIMEOUT_SECONDS = float(os.environ.get("CLIENT_USAGE_MODEL_PRICE_FETCH_TIMEOUT_SECONDS", "4"))
+COCKPIT_OFFICIAL_QUOTA_CACHE_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_CACHE")
+    or APP_DIR / "client_usage_official_quota_cache.json"
+)
+COCKPIT_OFFICIAL_QUOTA_URL = os.environ.get(
+    "CLIENT_USAGE_OFFICIAL_QUOTA_URL",
+    "https://chatgpt.com/backend-api/wham/usage",
+)
+COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS = max(
+    60,
+    int(os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS", "600")),
+)
+COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS = max(
+    1.0,
+    env_float("CLIENT_USAGE_OFFICIAL_QUOTA_TIMEOUT_SECONDS", 4.0),
+)
+COCKPIT_OFFICIAL_QUOTA_MAX_WORKERS = max(
+    1,
+    min(8, int(os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_MAX_WORKERS", "4"))),
+)
+COCKPIT_OFFICIAL_QUOTA_ENABLED = os.environ.get(
+    "CLIENT_USAGE_OFFICIAL_QUOTA_REFRESH",
+    "1",
+).strip().lower() not in {"0", "false", "no", "off"}
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
@@ -85,6 +115,9 @@ CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS = int(
 )
 ACCOUNT_30D_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_ACCOUNT_30D_CACHE_SECONDS", "300"))
 QUOTA_WINDOW_START_TOLERANCE_SECONDS = int(os.environ.get("CLIENT_USAGE_QUOTA_WINDOW_START_TOLERANCE_SECONDS", "10"))
+COCKPIT_QUOTA_RESERVE_STALE_SECONDS = int(
+    os.environ.get("CLIENT_USAGE_COCKPIT_QUOTA_RESERVE_STALE_SECONDS", "1800")
+)
 LATEST_REQUEST_LOOKBACK_DAYS = int(os.environ.get("CLIENT_USAGE_LATEST_REQUEST_LOOKBACK_DAYS", "7"))
 OFFLINE_HISTORY_BACKFILL_MAX_DAYS = max(
     0,
@@ -200,6 +233,7 @@ class UsageEvent:
     request_key: str = ""
     route: str = ""
     request_at: datetime | None = None
+    account_at: datetime | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -659,6 +693,7 @@ def make_codex_event(
     request_key: str = "",
     route: str = "",
     request_at: datetime | None = None,
+    account_at: datetime | None = None,
     pricing_tier: str = "",
 ) -> UsageEvent | None:
     if when is None:
@@ -682,6 +717,7 @@ def make_codex_event(
         request_key=str(request_key or "").strip(),
         route=str(route or "").strip().lower(),
         request_at=request_at,
+        account_at=account_at,
     )
 
 
@@ -1169,6 +1205,7 @@ def scan_codex_events(
         fork_replay_cutoff = codex_fork_replay_cutoff(lines)
         session_key = session_id or str(path)
         active_turn_id = ""
+        active_turn_started_at: datetime | None = None
         for line in lines:
             try:
                 row = json.loads(line)
@@ -1206,6 +1243,7 @@ def scan_codex_events(
                 active_turn_id = str(payload.get("turn_id") or "").strip()
                 if not active_turn_id:
                     active_turn_id = f"started:{row.get('timestamp') or ''}"
+                active_turn_started_at = event_ts
                 continue
             if payload_type == "error":
                 if (
@@ -1238,11 +1276,13 @@ def scan_codex_events(
                     failures_by_turn[key].when = event_ts
                 if not turn_id or turn_id == active_turn_id:
                     active_turn_id = ""
+                    active_turn_started_at = None
                 continue
             if payload_type == "turn_aborted":
                 turn_id = str(payload.get("turn_id") or active_turn_id).strip()
                 if not turn_id or turn_id == active_turn_id:
                     active_turn_id = ""
+                    active_turn_started_at = None
                 continue
             if payload_type != "token_count":
                 continue
@@ -1335,6 +1375,7 @@ def scan_codex_events(
                         ts,
                         session_id=session_id,
                         request_key=session_id,
+                        account_at=active_turn_started_at,
                     )
                     if event is not None:
                         events.append(event)
@@ -1367,6 +1408,7 @@ def scan_codex_events(
                     ts,
                     session_id=session_id,
                     request_key=session_id,
+                    account_at=active_turn_started_at,
                 )
                 if event is not None:
                     events.append(event)
@@ -1645,10 +1687,14 @@ def ledger_label_for_event(
     if ledger is None:
         return "", stable_id
     label = ledger.get(stable_id, "")
+    if label in {UNASSIGNED_CODEX_LABEL, "Codex local"}:
+        label = ""
     if label:
         return label, stable_id
     legacy_id = legacy_codex_event_id(event)
     label = ledger.get(legacy_id, "")
+    if label in {UNASSIGNED_CODEX_LABEL, "Codex local"}:
+        label = ""
     if label and stable_id:
         ledger[stable_id] = label
     return label, stable_id
@@ -1656,6 +1702,10 @@ def ledger_label_for_event(
 
 def usage_event_attribution_time(event: UsageEvent) -> datetime:
     return event.request_at or event.when
+
+
+def usage_event_account_time(event: UsageEvent) -> datetime:
+    return event.account_at or usage_event_attribution_time(event)
 
 
 def usage_event_info_score(event: UsageEvent) -> int:
@@ -1669,6 +1719,8 @@ def usage_event_info_score(event: UsageEvent) -> int:
     if event.cost_multiplier is not None:
         score += 1
     if event.request_at is not None:
+        score += 1
+    if event.account_at is not None:
         score += 1
     return score
 
@@ -1733,9 +1785,94 @@ def cockpit_account_label(account_id: str, email: str, api_key_label: str) -> st
     return "Codex local - Unknown"
 
 
-def current_codex_account_label(home: Path) -> str:
+def decode_jwt_payload(value: Any) -> dict[str, Any]:
+    token = str(value or "").strip()
+    if token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".", 2)[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def codex_auth_identity(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict):
+        return ""
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    claims = decode_jwt_payload(tokens.get("id_token"))
+    auth_claims = claims.get("https://api.openai.com/auth")
+    auth_claims = auth_claims if isinstance(auth_claims, dict) else {}
+
+    email = str(
+        data.get("email")
+        or data.get("OPENAI_EMAIL")
+        or tokens.get("email")
+        or claims.get("email")
+        or claims.get("preferred_username")
+        or ""
+    ).strip()
+    if email:
+        return email
+
+    account_id = str(
+        data.get("account_id")
+        or tokens.get("account_id")
+        or claims.get("account_id")
+        or claims.get("chatgpt_account_id")
+        or auth_claims.get("chatgpt_account_id")
+        or auth_claims.get("account_id")
+        or ""
+    ).strip()
+    if account_id:
+        return account_id
+
+    return str(
+        data.get("api_provider_name")
+        or data.get("api_provider_id")
+        or ""
+    ).strip()
+
+
+def active_codex_model_provider(home: Path) -> str:
+    path = home / ".codex" / "config.toml"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("["):
+            break
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() == "model_provider":
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def codex_uses_cockpit_provider(home: Path) -> bool:
+    provider = active_codex_model_provider(home).strip().lower()
+    return (
+        provider in API_SERVICE_MIRROR_LABELS
+        or "codex_local_access" in provider
+        or "api-service" in provider
+    )
+
+
+def current_codex_account_snapshot(home: Path) -> tuple[str, Path | None, datetime | None]:
     codex_dir = home / ".codex"
-    for name in (".cockpit_codex_auth.json", "auth.json"):
+    names = (
+        (".cockpit_codex_auth.json",)
+        if codex_uses_cockpit_provider(home)
+        else ("auth.json",)
+    )
+    for name in names:
         path = codex_dir / name
         if not path.exists():
             continue
@@ -1743,30 +1880,22 @@ def current_codex_account_label(home: Path) -> str:
             data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
         except Exception:
             continue
-        email = str(data.get("email") or data.get("OPENAI_EMAIL") or "").strip()
-        if not email:
-            tokens = data.get("tokens") if isinstance(data, dict) else None
-            if isinstance(tokens, dict):
-                email = str(tokens.get("email") or "").strip()
-        if email:
-            return f"Codex local - {email}"
-        api_provider_name = str(data.get("api_provider_name") or "").strip()
-        if api_provider_name:
-            return f"Codex local - {api_provider_name}"
-        api_key_id = str(data.get("api_provider_id") or "").strip()
-        if api_key_id:
-            return f"Codex local - {api_key_id}"
-        account_id = str(data.get("account_id") or "").strip()
-        if account_id:
-            return f"Codex local - {account_id}"
-    return "Codex local"
+        identity = codex_auth_identity(data)
+        if identity:
+            return f"Codex local - {identity}", path, file_mtime_local(path)
+    return "Codex local", None, None
+
+
+def current_codex_account_label(home: Path) -> str:
+    label, _path, _changed_at = current_codex_account_snapshot(home)
+    return label
 
 
 def load_account_timeline() -> list[AccountMarker]:
     data = load_json_object(ACCOUNT_TIMELINE_PATH)
     raw_records = data.get("records")
     if not isinstance(raw_records, list):
-        return []
+        raw_records = []
     markers: list[AccountMarker] = []
     for item in raw_records:
         if not isinstance(item, dict):
@@ -1776,19 +1905,49 @@ def load_account_timeline() -> list[AccountMarker]:
         if when is None or not label:
             continue
         markers.append(AccountMarker(when=when, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
+    try:
+        auth_event_lines = AUTH_SWITCH_EVENTS_PATH.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines()
+    except OSError:
+        auth_event_lines = []
+    for line in auth_event_lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        when = parse_dt(item.get("at"))
+        label = str(item.get("label") or "").strip()
+        if when is None or not label:
+            continue
+        markers.append(AccountMarker(when=when, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
+    deduped: dict[tuple[datetime, str], AccountMarker] = {
+        (marker.when, marker.label): marker
+        for marker in markers
+    }
+    markers = list(deduped.values())
     markers.sort(key=lambda marker: marker.when)
     return markers
 
 
 def record_current_account_snapshot(home: Path, now: datetime) -> None:
-    label = current_codex_account_label(home)
+    label, _source_path, changed_at = current_codex_account_snapshot(home)
     if not label or label == "Codex local":
         return
     markers = load_account_timeline()
     if markers and markers[-1].label == label:
         return
-    markers.append(AccountMarker(when=now, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
     cutoff = now - timedelta(days=120)
+    marker_time = changed_at or now
+    if marker_time > now + timedelta(minutes=5):
+        marker_time = now
+    marker_time = max(cutoff, marker_time)
+    if markers and marker_time <= markers[-1].when:
+        marker_time = now
+    markers.append(AccountMarker(when=marker_time, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
     compact = [marker for marker in markers if marker.when >= cutoff]
     write_json_object(
         ACCOUNT_TIMELINE_PATH,
@@ -1822,7 +1981,7 @@ def account_label_for_event(
         label == UNASSIGNED_CODEX_LABEL
         and current_label
         and now is not None
-        and 0 <= (now - usage_event_attribution_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
+        and 0 <= (now - usage_event_account_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
     ):
         label = current_label
     return label
@@ -2250,6 +2409,251 @@ def quota_window_payload(
     return window
 
 
+def official_quota_window_payload(
+    raw_window: Any,
+    fallback_seconds: int,
+    checked_at: datetime,
+) -> dict[str, Any] | None:
+    if not isinstance(raw_window, dict):
+        return None
+    try:
+        window_seconds = int(raw_window.get("limit_window_seconds") or fallback_seconds)
+    except (TypeError, ValueError):
+        window_seconds = fallback_seconds
+    if window_seconds <= 0:
+        window_seconds = fallback_seconds
+    try:
+        used_percent = float(raw_window.get("used_percent"))
+        remaining_percent: float | None = 100.0 - used_percent
+    except (TypeError, ValueError):
+        remaining_percent = None
+    reset_at = raw_window.get("reset_at")
+    if not reset_at:
+        try:
+            reset_after = float(raw_window.get("reset_after_seconds") or 0)
+        except (TypeError, ValueError):
+            reset_after = 0.0
+        if reset_after > 0:
+            reset_at = checked_at.timestamp() + reset_after
+    window = quota_window_payload(
+        remaining_percent,
+        reset_at,
+        False,
+        max(1, round(window_seconds / 60)),
+    )
+    window.update(
+        {
+            "quota_source": "official-wham",
+            "quota_snapshot_at": checked_at.isoformat(timespec="seconds"),
+        }
+    )
+    if window.get("resets_at"):
+        window["quota_reset_unavailable"] = False
+    return window
+
+
+def official_quota_from_usage_response(
+    payload: Any,
+    checked_at: datetime | None = None,
+    fallback_plan_type: str = "",
+) -> dict[str, dict[str, Any]] | None:
+    if not isinstance(payload, dict):
+        return None
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return None
+    checked_at = checked_at or datetime.now(LOCAL_TZ)
+    seven_day_seconds = 7 * 24 * 60 * 60
+    windows = (
+        (rate_limit.get("primary_window"), 5 * 60 * 60),
+        (rate_limit.get("secondary_window"), seven_day_seconds),
+    )
+    five_hour: dict[str, Any] = {"quota_available": False, "quota_stale": False}
+    seven_day: dict[str, Any] = {"quota_available": False, "quota_stale": False}
+    cycle: dict[str, Any] = {"quota_available": False, "quota_stale": False}
+    short_window_present = False
+    seven_day_present = False
+    for raw_window, fallback_seconds in windows:
+        parsed = official_quota_window_payload(raw_window, fallback_seconds, checked_at)
+        if parsed is None:
+            continue
+        try:
+            window_seconds = int(parsed.get("window_minutes") or 0) * 60
+        except (TypeError, ValueError):
+            window_seconds = fallback_seconds
+        if window_seconds < seven_day_seconds:
+            five_hour = parsed
+            short_window_present = True
+        elif window_seconds == seven_day_seconds:
+            seven_day = parsed
+            seven_day_present = True
+        else:
+            cycle = parsed
+    plan_type = str(payload.get("plan_type") or fallback_plan_type or "").strip().lower()
+    if plan_type == "plus" and seven_day_present and not short_window_present:
+        five_hour = {
+            "quota_available": False,
+            "quota_stale": False,
+            "quota_unlimited": True,
+            "quota_source": "official-wham",
+            "quota_snapshot_at": checked_at.isoformat(timespec="seconds"),
+        }
+    return {
+        "window_5h": five_hour,
+        "window_7d": seven_day,
+        "window_cycle": cycle,
+    }
+
+
+def quota_row_needs_official_refresh(quota: Any) -> bool:
+    if not isinstance(quota, dict):
+        return True
+    available_windows = []
+    for key in ("window_5h", "window_7d", "window_cycle"):
+        window = quota.get(key)
+        if not isinstance(window, dict) or window.get("quota_unlimited"):
+            continue
+        if window.get("quota_available"):
+            available_windows.append(window)
+    if not available_windows:
+        return True
+    return any(window.get("quota_stale") or not window.get("resets_at") for window in available_windows)
+
+
+def load_official_quota_cache() -> dict[str, Any]:
+    try:
+        data = json.loads(COCKPIT_OFFICIAL_QUOTA_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    return accounts if isinstance(accounts, dict) else {}
+
+
+def read_cockpit_sidecar_auth(home: Path, account_id: str) -> dict[str, Any] | None:
+    path = (
+        home
+        / ".antigravity_cockpit"
+        / "codex_local_access_sidecar"
+        / "auths"
+        / f"{account_id}.json"
+    )
+    try:
+        auth = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(auth, dict) or auth.get("disabled"):
+        return None
+    expired = auth.get("expired")
+    if isinstance(expired, bool):
+        if expired:
+            return None
+    elif expired not in (None, ""):
+        try:
+            expires_at = float(expired)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at > 1 and expires_at <= datetime.now().timestamp():
+            return None
+    if not str(auth.get("access_token") or "").strip():
+        return None
+    if not str(auth.get("account_id") or "").strip():
+        return None
+    return auth
+
+
+def fetch_cockpit_official_quota(
+    auth: dict[str, Any],
+    plan_type: str,
+    checked_at: datetime,
+) -> dict[str, dict[str, Any]] | None:
+    access_token = str(auth.get("access_token") or "").strip()
+    account_id = str(auth.get("account_id") or "").strip()
+    if not access_token or not account_id:
+        return None
+    req = request.Request(
+        COCKPIT_OFFICIAL_QUOTA_URL,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "ChatGPT-Account-Id": account_id,
+            "User-Agent": "codex-token-pulse/1.0",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    return official_quota_from_usage_response(payload, checked_at, plan_type)
+
+
+def cockpit_official_quota_by_account(
+    home: Path,
+    accounts: dict[str, dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    if not COCKPIT_OFFICIAL_QUOTA_ENABLED or not accounts:
+        return {}
+    now = now or datetime.now(LOCAL_TZ)
+    now_epoch = now.timestamp()
+    cache = load_official_quota_cache()
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    pending: dict[str, tuple[dict[str, Any], str]] = {}
+    cache_changed = False
+    for account_id, account in accounts.items():
+        cached = cache.get(account_id)
+        try:
+            checked_epoch = float(cached.get("checked_at") or 0) if isinstance(cached, dict) else 0.0
+        except (TypeError, ValueError):
+            checked_epoch = 0.0
+        cache_age = now_epoch - checked_epoch if checked_epoch > 0 else float("inf")
+        if 0 <= cache_age < COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS:
+            quota = cached.get("quota") if isinstance(cached, dict) else None
+            if isinstance(quota, dict):
+                result[account_id] = quota
+            continue
+        auth = read_cockpit_sidecar_auth(home, account_id)
+        if auth is not None:
+            pending[account_id] = (auth, str(account.get("plan_type") or ""))
+
+    if pending:
+        worker_count = min(COCKPIT_OFFICIAL_QUOTA_MAX_WORKERS, len(pending))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(fetch_cockpit_official_quota, auth, plan_type, now): account_id
+                for account_id, (auth, plan_type) in pending.items()
+            }
+            for future in as_completed(futures):
+                account_id = futures[future]
+                try:
+                    quota = future.result()
+                except Exception:
+                    quota = None
+                cache[account_id] = {
+                    "checked_at": now_epoch,
+                    "quota": quota if isinstance(quota, dict) else None,
+                }
+                cache_changed = True
+                if isinstance(quota, dict):
+                    result[account_id] = quota
+
+    if cache_changed:
+        active_ids = set(accounts)
+        compact_cache = {
+            account_id: entry
+            for account_id, entry in cache.items()
+            if account_id in active_ids and isinstance(entry, dict)
+        }
+        try:
+            write_json_atomic(
+                COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
+                {"schema": 1, "accounts": compact_cache},
+            )
+        except OSError:
+            pass
+    return result
+
+
 def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, Any]]]:
     accounts_dir = home / ".antigravity_cockpit" / "codex_accounts"
     if not accounts_dir.exists():
@@ -2325,6 +2729,184 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
             "window_7d": seven_day,
             "window_cycle": cycle,
         }
+
+    # Newer Cockpit versions encrypt per-account JSON. The sidecar keeps a
+    # non-secret routing snapshot with current quota percentages, while the
+    # account manifest retains the ID/email/plan mapping needed for labels.
+    manifest_path = home / ".antigravity_cockpit" / "codex_accounts.json"
+    reserve_path = (
+        home
+        / ".antigravity_cockpit"
+        / "codex_local_access_sidecar"
+        / "quota-reserve.json"
+    )
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        manifest_data = {}
+    try:
+        reserve_data = json.loads(reserve_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        reserve_data = {}
+    manifest_rows = manifest_data.get("accounts") if isinstance(manifest_data, dict) else None
+    reserve_rows = reserve_data.get("accounts") if isinstance(reserve_data, dict) else None
+    manifest_by_id = {
+        str(row.get("id") or "").strip(): row
+        for row in (manifest_rows if isinstance(manifest_rows, list) else [])
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+    labels_by_id = {
+        account_id: cockpit_account_label(
+            account_id,
+            str(account.get("email") or ""),
+            str(account.get("api_provider_name") or account.get("name") or ""),
+        )
+        for account_id, account in manifest_by_id.items()
+    }
+
+    def reserve_window(
+        snapshot: dict[str, Any],
+        prefix: str,
+        stale: bool,
+        snapshot_at: str,
+        default_window_minutes: int,
+    ) -> dict[str, Any]:
+        present = snapshot.get(f"{prefix}WindowPresent") is True
+        value = snapshot.get(f"{prefix}RemainingPercent")
+        reset_value = next(
+            (
+                snapshot.get(key)
+                for key in (
+                    f"{prefix}ResetTime",
+                    f"{prefix}ResetAt",
+                    f"{prefix}ResetAtUnixSeconds",
+                    f"{prefix}ResetUnixSeconds",
+                )
+                if snapshot.get(key) not in (None, "")
+            ),
+            None,
+        )
+        resets_at = epoch_seconds_to_local_iso(reset_value)
+        if not resets_at:
+            parsed_reset = parse_dt(reset_value)
+            if parsed_reset is not None:
+                resets_at = parsed_reset.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        try:
+            window_minutes = int(snapshot.get(f"{prefix}WindowMinutes") or 0)
+        except (TypeError, ValueError):
+            window_minutes = 0
+        if window_minutes <= 0:
+            try:
+                window_seconds = int(
+                    snapshot.get(f"{prefix}LimitWindowSeconds")
+                    or snapshot.get(f"{prefix}WindowSeconds")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                window_seconds = 0
+            window_minutes = max(1, round(window_seconds / 60)) if window_seconds > 0 else default_window_minutes
+        window: dict[str, Any] = {
+            "quota_available": False,
+            "quota_stale": stale,
+            "quota_source": "sidecar-reserve",
+            "quota_snapshot_at": snapshot_at,
+            "window_minutes": window_minutes,
+            "window_days": round(float(window_minutes) / (24 * 60), 1),
+        }
+        if not present or value is None:
+            return window
+        try:
+            remaining = max(0.0, min(100.0, float(value)))
+        except (TypeError, ValueError):
+            window["quota_stale"] = True
+            return window
+        window.update(
+            {
+                "quota_available": True,
+                "remaining_percent": remaining,
+                "utilization": 100.0 - remaining,
+                "resets_at": resets_at,
+                "quota_reset_unavailable": not bool(resets_at),
+            }
+        )
+        return window
+
+    if isinstance(reserve_rows, dict):
+        now_epoch = datetime.now().timestamp()
+        for account_id, raw_snapshot in reserve_rows.items():
+            if not isinstance(raw_snapshot, dict):
+                continue
+            account = manifest_by_id.get(str(account_id), {})
+            label = cockpit_account_label(
+                str(account_id),
+                str(account.get("email") or ""),
+                str(account.get("api_provider_name") or account.get("name") or ""),
+            )
+            try:
+                snapshot_epoch = float(raw_snapshot.get("snapshotUpdatedAtUnixSeconds") or 0)
+            except (TypeError, ValueError):
+                snapshot_epoch = 0.0
+            snapshot_age = now_epoch - snapshot_epoch if snapshot_epoch > 0 else float("inf")
+            stale = snapshot_age < -300 or snapshot_age > max(
+                60,
+                COCKPIT_QUOTA_RESERVE_STALE_SECONDS,
+            )
+            snapshot_at = epoch_seconds_to_local_iso(snapshot_epoch)
+            plan_type = str(account.get("plan_type") or "").strip().lower()
+            hourly_present = raw_snapshot.get("hourlyWindowPresent") is True
+            weekly_present = raw_snapshot.get("weeklyWindowPresent") is True
+            hourly_minutes = 7 * 24 * 60 if plan_type == "plus" and hourly_present and not weekly_present else 5 * 60
+            hourly = reserve_window(raw_snapshot, "hourly", stale, snapshot_at, hourly_minutes)
+            weekly = reserve_window(raw_snapshot, "weekly", stale, snapshot_at, 7 * 24 * 60)
+            if plan_type == "plus" and hourly_present and not weekly_present:
+                five_hour = {
+                    "quota_available": False,
+                    "quota_stale": stale,
+                    "quota_unlimited": True,
+                    "quota_source": "sidecar-reserve",
+                    "quota_snapshot_at": snapshot_at,
+                }
+                seven_day = hourly
+            else:
+                five_hour = hourly
+                seven_day = weekly
+                if plan_type == "plus" and not hourly_present and weekly_present:
+                    five_hour = {
+                        "quota_available": False,
+                        "quota_stale": stale,
+                        "quota_unlimited": True,
+                        "quota_source": "sidecar-reserve",
+                        "quota_snapshot_at": snapshot_at,
+                    }
+            local_quota = {
+                "window_5h": five_hour,
+                "window_7d": seven_day,
+                "window_cycle": {
+                    "quota_available": False,
+                    "quota_stale": stale,
+                    "quota_source": "sidecar-reserve",
+                    "quota_snapshot_at": snapshot_at,
+                },
+            }
+            if label not in result or (
+                quota_row_needs_official_refresh(result[label])
+                and not quota_row_needs_official_refresh(local_quota)
+            ):
+                result[label] = local_quota
+
+    # Resolve every Cockpit-owned local source before using account credentials
+    # for a direct official request. A future sidecar version can therefore add
+    # reset timestamps without causing duplicate network traffic.
+    official_candidates = {
+        account_id: account
+        for account_id, account in manifest_by_id.items()
+        if quota_row_needs_official_refresh(result.get(labels_by_id.get(account_id, "")))
+    }
+    official_by_id = cockpit_official_quota_by_account(home, official_candidates)
+    for account_id, quota in official_by_id.items():
+        label = labels_by_id.get(account_id)
+        if label:
+            result[label] = quota
     return result
 
 
@@ -2815,7 +3397,7 @@ def account_label_at_time(
     request_markers: list[AccountMarker],
     request_times: list[datetime],
 ) -> str:
-    event_time = usage_event_attribution_time(event)
+    event_time = usage_event_account_time(event)
     label = ""
     if switch_markers:
         switch_pos = bisect_right(switch_times, event_time) - 1
@@ -2859,7 +3441,7 @@ def attribute_codex_events_by_account(
                 if (
                     current_label
                     and now is not None
-                    and 0 <= (now - usage_event_attribution_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
+                    and 0 <= (now - usage_event_account_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
                 ):
                     label = current_label
                 if attribution_ledger is not None and event_id:
@@ -2881,7 +3463,7 @@ def attribute_codex_events_by_account(
                 label == UNASSIGNED_CODEX_LABEL
                 and current_label
                 and now is not None
-                and 0 <= (now - usage_event_attribution_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
+                and 0 <= (now - usage_event_account_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
             ):
                 label = current_label
             if ledger is not None and event_id:
@@ -3118,7 +3700,9 @@ def concrete_api_service_account_marker(
     markers: list[AccountMarker],
     marker_index: dict[int, list[AccountMarker]] | None = None,
 ) -> AccountMarker | None:
-    event_time = usage_event_attribution_time(event)
+    # Cockpit writes request markers when the response finishes, matching the
+    # Codex token_count timestamp rather than the task-start attribution edge.
+    event_time = event.when
     exact_candidates = (
         (marker_index or {}).get(event.total_tokens, [])
         if marker_index is not None
@@ -4658,6 +5242,11 @@ def main() -> int:
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
+    # A manual auth switch can happen during a long session scan. Re-read the
+    # identity here and retain the auth file's mtime as the actual switch edge.
+    snapshot_now = datetime.now()
+    record_current_account_snapshot(home, snapshot_now)
+    current_label = current_codex_account_label(home)
     desktop_log_roots = default_codex_desktop_log_roots()
     if desktop_log_roots:
         codex_failures.extend(

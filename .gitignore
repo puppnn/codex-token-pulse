@@ -5,9 +5,11 @@ client_usage_config.json
 client_usage_speed_history.json
 client_usage_today.json
 client_usage_account_timeline.json
+client_usage_auth_switch_events.jsonl
 client_usage_attribution_ledger.json
 client_usage_route_labels.json
 client_usage_model_prices.json
+client_usage_official_quota_cache.json
 usage_history.json
 .venv/
 venv/

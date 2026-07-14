@@ -1,14 +1,372 @@
+import base64
+import copy
 import json
+import os
 import sqlite3
 import tempfile
 import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import client_usage_export
 import monitor
+
+
+class CodexAuthIdentityTests(unittest.TestCase):
+    @staticmethod
+    def jwt(claims: dict) -> str:
+        def encode(value: dict) -> str:
+            raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
+
+    @classmethod
+    def official_auth(cls, email: str, account_id: str = "account-official") -> dict:
+        return {
+            "tokens": {
+                "id_token": cls.jwt(
+                    {
+                        "email": email,
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": account_id,
+                        },
+                    }
+                ),
+                "account_id": account_id,
+            }
+        }
+
+    def test_modern_official_auth_reads_jwt_email_and_nested_account(self) -> None:
+        auth = self.official_auth("manual@example.com")
+
+        self.assertEqual(
+            client_usage_export.codex_auth_identity(auth),
+            "manual@example.com",
+        )
+        self.assertEqual(monitor.codex_auth_identity(auth), "manual@example.com")
+
+        auth["tokens"]["id_token"] = self.jwt({})
+        self.assertEqual(
+            client_usage_export.codex_auth_identity(auth),
+            "account-official",
+        )
+
+    def test_account_plan_type_reads_nested_auth_claim(self) -> None:
+        auth = {
+            "tokens": {
+                "id_token": self.jwt(
+                    {
+                        "email": "pro@example.com",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_plan_type": "pro",
+                        },
+                    }
+                )
+            }
+        }
+
+        self.assertEqual(monitor.codex_auth_plan_type(auth), "PRO")
+
+    def test_account_display_removes_nested_local_prefixes(self) -> None:
+        self.assertEqual(
+            monitor.ranking_account_display_name(
+                "LOCAL - Codex local - account@example.com"
+            ),
+            "account@example.com",
+        )
+        self.assertEqual(
+            monitor.ranking_account_display_name("Codex local - api-service-local"),
+            "API \u670d\u52a1",
+        )
+
+    def test_account_type_prefers_explicit_plan_then_local_metadata(self) -> None:
+        self.assertEqual(monitor.account_type_label({"plan_type": "plus"}), "PLUS")
+        with patch.object(
+            monitor,
+            "local_account_type_map",
+            return_value={"account@example.com": "K12"},
+        ):
+            self.assertEqual(
+                monitor.account_type_label(
+                    {"name": "LOCAL - Codex local - account@example.com"}
+                ),
+                "K12",
+            )
+        with patch.object(monitor, "local_account_type_map", return_value={}):
+            self.assertEqual(
+                monitor.account_type_label(
+                    {"name": "Codex local - removed@example.com"}
+                ),
+                "\u672a\u77e5",
+            )
+
+    def test_direct_provider_ignores_stale_cockpit_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_dir = home / ".codex"
+            codex_dir.mkdir()
+            (codex_dir / "config.toml").write_text(
+                'model_provider = "openai"\n',
+                encoding="utf-8",
+            )
+            (codex_dir / "auth.json").write_text(
+                json.dumps(self.official_auth("official@example.com")),
+                encoding="utf-8",
+            )
+            (codex_dir / ".cockpit_codex_auth.json").write_text(
+                json.dumps({"email": "api-service-local"}),
+                encoding="utf-8",
+            )
+
+            label = client_usage_export.current_codex_account_label(home)
+            with patch.object(monitor.os.path, "expanduser", return_value=str(home)):
+                monitor_identity = monitor.current_codex_auth_identity()
+
+        self.assertEqual(label, "Codex local - official@example.com")
+        self.assertEqual(monitor_identity, "official@example.com")
+
+    def test_api_service_provider_still_prefers_cockpit_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_dir = home / ".codex"
+            codex_dir.mkdir()
+            (codex_dir / "config.toml").write_text(
+                'model_provider = "codex_local_access"\n',
+                encoding="utf-8",
+            )
+            (codex_dir / "auth.json").write_text(
+                json.dumps(self.official_auth("official@example.com")),
+                encoding="utf-8",
+            )
+            (codex_dir / ".cockpit_codex_auth.json").write_text(
+                json.dumps({"email": "api-service-local"}),
+                encoding="utf-8",
+            )
+
+            label = client_usage_export.current_codex_account_label(home)
+            with patch.object(monitor.os.path, "expanduser", return_value=str(home)):
+                monitor_identity = monitor.current_codex_auth_identity()
+
+        self.assertEqual(label, "Codex local - api-service-local")
+        self.assertEqual(monitor_identity, "api-service-local")
+
+    def test_switch_timeline_uses_auth_file_modification_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_dir = home / ".codex"
+            codex_dir.mkdir()
+            timeline_path = home / "timeline.json"
+            auth_events_path = home / "auth-switches.jsonl"
+            auth_path = codex_dir / "auth.json"
+            (codex_dir / "config.toml").write_text(
+                'model_provider = "openai"\n',
+                encoding="utf-8",
+            )
+            auth_path.write_text(
+                json.dumps(self.official_auth("switched@example.com")),
+                encoding="utf-8",
+            )
+            switched_at = datetime(2026, 7, 14, 10, 5, 0).timestamp()
+            os.utime(auth_path, (switched_at, switched_at))
+            now = datetime(2026, 7, 14, 10, 35, 0)
+
+            with (
+                patch.object(client_usage_export, "ACCOUNT_TIMELINE_PATH", timeline_path),
+                patch.object(client_usage_export, "AUTH_SWITCH_EVENTS_PATH", auth_events_path),
+            ):
+                client_usage_export.record_current_account_snapshot(home, now)
+                markers = client_usage_export.load_account_timeline()
+
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].label, "Codex local - switched@example.com")
+        self.assertEqual(markers[0].when, datetime.fromtimestamp(switched_at))
+
+    def test_no_cockpit_manual_switch_splits_tasks_at_auth_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_dir = home / ".codex"
+            codex_dir.mkdir()
+            timeline_path = home / "timeline.json"
+            auth_events_path = home / "auth-switches.jsonl"
+            auth_path = codex_dir / "auth.json"
+            (codex_dir / "config.toml").write_text(
+                'model_provider = "openai"\n',
+                encoding="utf-8",
+            )
+            first_switch = datetime(2026, 7, 14, 10, 0, 0)
+            second_switch = datetime(2026, 7, 14, 10, 5, 0)
+
+            with (
+                patch.object(client_usage_export, "ACCOUNT_TIMELINE_PATH", timeline_path),
+                patch.object(client_usage_export, "AUTH_SWITCH_EVENTS_PATH", auth_events_path),
+            ):
+                auth_path.write_text(
+                    json.dumps(self.official_auth("account-a@example.com", "account-a")),
+                    encoding="utf-8",
+                )
+                os.utime(auth_path, (first_switch.timestamp(), first_switch.timestamp()))
+                client_usage_export.record_current_account_snapshot(
+                    home,
+                    datetime(2026, 7, 14, 10, 1, 0),
+                )
+
+                auth_path.write_text(
+                    json.dumps(self.official_auth("account-b@example.com", "account-b")),
+                    encoding="utf-8",
+                )
+                os.utime(auth_path, (second_switch.timestamp(), second_switch.timestamp()))
+                client_usage_export.record_current_account_snapshot(
+                    home,
+                    datetime(2026, 7, 14, 10, 35, 0),
+                )
+                markers = client_usage_export.load_account_timeline()
+
+            events = [
+                client_usage_export.UsageEvent(
+                    when=datetime(2026, 7, 14, 10, 6, 0),
+                    request_at=datetime(2026, 7, 14, 10, 4, 0),
+                    model="gpt-test",
+                    input_tokens=100,
+                    cached_tokens=20,
+                    output_tokens=10,
+                    session_id="session-a",
+                ),
+                client_usage_export.UsageEvent(
+                    when=datetime(2026, 7, 14, 10, 7, 0),
+                    request_at=datetime(2026, 7, 14, 10, 6, 0),
+                    model="gpt-test",
+                    input_tokens=200,
+                    cached_tokens=40,
+                    output_tokens=20,
+                    session_id="session-b",
+                ),
+            ]
+            attributed = client_usage_export.attribute_codex_events_by_account(
+                events,
+                markers,
+            )
+
+        self.assertEqual(
+            sum(event.total_tokens for rows in attributed.values() for event in rows),
+            sum(event.total_tokens for event in events),
+        )
+        self.assertEqual(
+            [event.session_id for event in attributed["Codex local - account-a@example.com"]],
+            ["session-a"],
+        )
+        self.assertEqual(
+            [event.session_id for event in attributed["Codex local - account-b@example.com"]],
+            ["session-b"],
+        )
+
+    def test_monitor_switch_log_deduplicates_the_last_valid_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            events_path = Path(directory) / "auth-switches.jsonl"
+            first_switch = datetime(2026, 7, 14, 10, 0, tzinfo=monitor.CN_TZ)
+            second_switch = datetime(2026, 7, 14, 10, 5, tzinfo=monitor.CN_TZ)
+
+            with patch.object(monitor, "AUTH_SWITCH_EVENTS_PATH", events_path):
+                self.assertTrue(
+                    monitor.append_codex_auth_switch_event(
+                        "account-a@example.com",
+                        first_switch,
+                    )
+                )
+                with events_path.open("a", encoding="utf-8") as handle:
+                    handle.write("not-json\n")
+                self.assertFalse(
+                    monitor.append_codex_auth_switch_event(
+                        "account-a@example.com",
+                        first_switch + timedelta(minutes=1),
+                    )
+                )
+                self.assertTrue(
+                    monitor.append_codex_auth_switch_event(
+                        "account-b@example.com",
+                        second_switch,
+                    )
+                )
+
+            records = []
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        self.assertEqual(
+            [record["label"] for record in records],
+            [
+                "Codex local - account-a@example.com",
+                "Codex local - account-b@example.com",
+            ],
+        )
+
+    def test_exporter_loads_ordered_switch_log_without_timeline_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            timeline_path = root / "missing-timeline.json"
+            events_path = root / "auth-switches.jsonl"
+            events_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "at": "2026-07-14T10:05:00+08:00",
+                                "label": "Codex local - account-b@example.com",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "at": "2026-07-14T10:00:00+08:00",
+                                "label": "Codex local - account-a@example.com",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(client_usage_export, "ACCOUNT_TIMELINE_PATH", timeline_path),
+                patch.object(client_usage_export, "AUTH_SWITCH_EVENTS_PATH", events_path),
+            ):
+                markers = client_usage_export.load_account_timeline()
+
+        self.assertEqual(
+            [marker.label for marker in markers],
+            [
+                "Codex local - account-a@example.com",
+                "Codex local - account-b@example.com",
+            ],
+        )
+
+    def test_auth_switch_capture_refreshes_only_live_accounts(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._last_auth_identity = "account-a@example.com"
+        app._refresh_live_active_async = MagicMock(return_value=True)
+        app.refresh_async = MagicMock(return_value=True)
+        changed_at = datetime(2026, 7, 14, 10, 5, tzinfo=monitor.CN_TZ)
+
+        with (
+            patch.object(
+                monitor,
+                "current_codex_auth_snapshot",
+                return_value=("account-b@example.com", Path("auth.json"), changed_at),
+            ),
+            patch.object(monitor, "append_codex_auth_switch_event") as append_event,
+        ):
+            changed = app._capture_auth_switch()
+
+        self.assertTrue(changed)
+        self.assertEqual(app._last_auth_identity, "account-b@example.com")
+        append_event.assert_called_once_with("account-b@example.com", changed_at)
+        app._refresh_live_active_async.assert_called_once_with()
+        app.refresh_async.assert_not_called()
 
 
 class CompactNumberTests(unittest.TestCase):
@@ -24,6 +382,107 @@ class CompactNumberTests(unittest.TestCase):
         self.assertEqual(monitor.exact_token_count(1_260_000_000), "1,260,000,000")
         self.assertEqual(monitor.exact_token_count(999_900_000), "999,900,000")
         self.assertEqual(monitor.exact_token_count(None), "0")
+
+    def test_single_segmented_flow_meter_grows_with_token_volume(self) -> None:
+        zero = monitor.FloatingMonitorApp._token_flow_meter_fill_top(0.0, 10, 110)
+        low = monitor.FloatingMonitorApp._token_flow_meter_fill_top(0.2, 10, 110)
+        high = monitor.FloatingMonitorApp._token_flow_meter_fill_top(0.9, 10, 110)
+
+        self.assertEqual(zero, 110)
+        self.assertEqual(low, 90)
+        self.assertEqual(high, 20)
+
+    def test_flow_meter_fade_is_limited_to_the_moving_head(self) -> None:
+        solid_top, bands = monitor.FloatingMonitorApp._token_flow_meter_head_geometry(
+            60.0,
+            110.0,
+        )
+
+        self.assertEqual(solid_top, 68.0)
+        self.assertEqual(len(bands), monitor.TOKEN_FLOW_METER_HEAD_BANDS)
+        self.assertEqual(bands[0][0], 60.0)
+        self.assertEqual(bands[-1][1], 68.0)
+
+    def test_flow_meter_level_eases_up_and_down(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_meter_display_level = 0.0
+        app._token_flow_meter_last_tick = 0.0
+
+        rising = app._smooth_token_flow_meter_level(1.0, now=0.016)
+        app._token_flow_meter_last_tick = 0.016
+        falling = app._smooth_token_flow_meter_level(0.0, now=0.032)
+
+        self.assertGreater(rising, 0.2)
+        self.assertLess(rising, 1.0)
+        self.assertGreater(falling, 0.0)
+        self.assertLess(falling, rising)
+
+    def test_token_delta_badge_merges_nearby_events_and_restarts_later(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+
+        app._record_token_delta_badge(12_000, now=10.0)
+        app._record_token_delta_badge(345, now=10.2)
+        merged = app._token_delta_badge_visual(now=10.2)
+        app._record_token_delta_badge(90, now=11.0)
+        restarted = app._token_delta_badge_visual(now=11.0)
+
+        self.assertEqual(merged, ("+12,345", monitor.Theme.live, True))
+        self.assertEqual(restarted, ("+90", monitor.Theme.live, True))
+
+    def test_token_delta_badge_fades_smoothly_then_hides(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._record_token_delta_badge(12_345, now=10.0)
+
+        text, middle_color, visible = app._token_delta_badge_visual(
+            now=10.0 + monitor.TOKEN_DELTA_BADGE_DURATION_SECONDS / 2
+        )
+        expired = app._token_delta_badge_visual(
+            now=10.0 + monitor.TOKEN_DELTA_BADGE_DURATION_SECONDS
+        )
+
+        self.assertEqual(text, "+12,345")
+        self.assertTrue(visible)
+        self.assertNotEqual(middle_color, monitor.Theme.live)
+        self.assertNotEqual(middle_color, monitor.Theme.ag_surface)
+        self.assertEqual(expired, ("", monitor.Theme.ag_surface, False))
+
+    def test_common_models_prioritize_five_rows_and_one_provider_row(self) -> None:
+        visible = monitor.FloatingMonitorApp._top_model_visible_count(
+            model_count=5,
+            provider_count=3,
+            available_height=236,
+        )
+
+        self.assertEqual(visible, 5)
+
+    def test_common_models_badge_can_report_a_truncated_sixth_model(self) -> None:
+        visible = monitor.FloatingMonitorApp._top_model_visible_count(
+            model_count=6,
+            provider_count=3,
+            available_height=236,
+        )
+
+        self.assertEqual(visible, 5)
+
+
+class UsageSyncLabelTests(unittest.TestCase):
+    def test_routine_cached_baseline_does_not_replace_normal_update_time(self) -> None:
+        self.assertEqual(monitor.usage_sync_label({"state": "cached"}), "")
+
+    def test_sync_failures_still_show_a_warning(self) -> None:
+        self.assertTrue(monitor.usage_sync_label({"state": "timeout"}))
+        self.assertTrue(monitor.usage_sync_label({"state": "error"}))
+        self.assertTrue(monitor.usage_sync_label({"state": "stale"}))
+
+    def test_current_totals_raise_the_today_trend_without_rewriting_history(self) -> None:
+        summary = monitor.summarize_trend_rows([])
+        original = copy.deepcopy(summary)
+
+        updated = monitor.trend_with_current_totals(summary, 123_456, 12, 3.5)
+
+        self.assertEqual(updated["today_tokens"], 123_456)
+        self.assertEqual(updated["series"][-1]["tokens"], 123_456)
+        self.assertEqual(summary, original)
 
 
 class TooltipLayoutTests(unittest.TestCase):
@@ -279,6 +738,99 @@ class AccountUsageSortTests(unittest.TestCase):
 
         self.assertEqual(ordered_today[0]["name"], "old-heavy")
         self.assertEqual(ordered_30d[0]["name"], "old-heavy")
+
+
+class AccountDisplayRetentionTests(unittest.TestCase):
+    def test_only_inactive_account_without_weekly_quota_is_hidden(self) -> None:
+        now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+        inactive = {"name": "Codex local - inactive@example.com", "tokens": 9_000_000}
+        recent_request = {"name": "Codex local - request@example.com"}
+        recent_tokens = {"name": "Codex local - tokens@example.com"}
+        quota_only = {
+            "name": "Codex local - quota@example.com",
+            "window_7d": {
+                "quota_available": True,
+                "quota_stale": False,
+                "remaining_percent": 100.0,
+            },
+        }
+
+        self.assertFalse(
+            monitor.account_should_remain_visible(inactive, {}, now=now)
+        )
+        self.assertTrue(
+            monitor.account_should_remain_visible(
+                recent_request,
+                {"requests": 1, "tokens": 0},
+                now=now,
+            )
+        )
+        self.assertTrue(
+            monitor.account_should_remain_visible(
+                recent_tokens,
+                {"requests": 0, "tokens": 100},
+                now=now,
+            )
+        )
+        self.assertTrue(
+            monitor.account_should_remain_visible(quota_only, {}, now=now)
+        )
+
+    def test_stale_weekly_quota_does_not_keep_inactive_account(self) -> None:
+        row = {
+            "name": "Codex local - stale@example.com",
+            "window_7d": {
+                "quota_available": True,
+                "quota_stale": True,
+                "remaining_percent": 80.0,
+            },
+        }
+
+        self.assertFalse(monitor.account_should_remain_visible(row, {}))
+
+    def test_account_cumulative_filter_keeps_recent_quota_and_gap_rows(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = monitor.MonitorState(
+            today_tokens=123_456,
+            top_accounts=[
+                {"name": "old@example.com", "window_7d": {}},
+                {
+                    "name": "quota@example.com",
+                    "window_7d": {
+                        "quota_available": True,
+                        "quota_stale": False,
+                        "utilization": 0.0,
+                    },
+                },
+            ],
+        )
+        cumulative_rows = [
+            {"name": "Codex local - old@example.com", "tokens": 9_000_000},
+            {"name": "Codex local - recent@example.com", "tokens": 8_000_000},
+            {"name": "Codex local - quota@example.com", "tokens": 7_000_000},
+            {"name": "Historical detail gap", "tokens": 6_000_000},
+        ]
+        recent_rows = [
+            {
+                "name": "Codex local - recent@example.com",
+                "requests": 2,
+                "tokens": 200,
+            }
+        ]
+
+        with patch.object(app, "_usage_range_providers", return_value=recent_rows):
+            visible = app._filter_account_display_rows(cumulative_rows)
+
+        self.assertEqual(
+            [row["name"] for row in visible],
+            [
+                "Codex local - recent@example.com",
+                "Codex local - quota@example.com",
+                "Historical detail gap",
+            ],
+        )
+        self.assertEqual(app.state.today_tokens, 123_456)
+        self.assertEqual(cumulative_rows[0]["tokens"], 9_000_000)
 
 
 class ApiServicePoolAggregateTests(unittest.TestCase):
@@ -789,6 +1341,33 @@ class LatestRequestFallbackTests(unittest.TestCase):
         label = client_usage_export.concrete_api_service_account_label(event, [marker])
 
         self.assertEqual(label, "Codex local - delayed@example.com")
+
+    def test_api_service_account_match_uses_response_time_after_manual_switch(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 11, 21, 6, 0),
+            request_at=datetime(2026, 7, 11, 21, 0, 0),
+            model="gpt-test",
+            input_tokens=90_000,
+            cached_tokens=9_000,
+            output_tokens=1_000,
+            session_id="long-api-session",
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 11, 21, 0, 0),
+                label="Codex local - wrong-at-start@example.com",
+                total_tokens=100_000,
+            ),
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 11, 21, 6, 0),
+                label="Codex local - response-owner@example.com",
+                total_tokens=100_000,
+            ),
+        ]
+
+        label = client_usage_export.concrete_api_service_account_label(event, markers)
+
+        self.assertEqual(label, "Codex local - response-owner@example.com")
 
     def test_api_service_account_match_allows_small_total_token_difference(self) -> None:
         event = client_usage_export.UsageEvent(
@@ -1347,6 +1926,241 @@ class WindowSemanticsTests(unittest.TestCase):
         con.commit()
         con.close()
 
+    def test_encrypted_cockpit_accounts_use_sidecar_quota_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cockpit = root / ".antigravity_cockpit"
+            accounts_dir = cockpit / "codex_accounts"
+            reserve_dir = cockpit / "codex_local_access_sidecar"
+            accounts_dir.mkdir(parents=True)
+            reserve_dir.mkdir(parents=True)
+            accounts = [
+                {
+                    "id": "codex_k12",
+                    "email": "k12@example.com",
+                    "plan_type": "k12",
+                },
+                {
+                    "id": "codex_plus",
+                    "email": "plus@example.com",
+                    "plan_type": "plus",
+                },
+            ]
+            (cockpit / "codex_accounts.json").write_text(
+                json.dumps({"accounts": accounts}),
+                encoding="utf-8",
+            )
+            for account in accounts:
+                (accounts_dir / f"{account['id']}.json").write_text(
+                    json.dumps({"version": 1, "ciphertext": "encrypted"}),
+                    encoding="utf-8",
+                )
+            snapshot_at = int(datetime.now().timestamp())
+            (reserve_dir / "quota-reserve.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "codex_k12": {
+                                "hourlyRemainingPercent": 3,
+                                "hourlyWindowPresent": True,
+                                "weeklyRemainingPercent": 85,
+                                "weeklyWindowPresent": True,
+                                "snapshotUpdatedAtUnixSeconds": snapshot_at,
+                            },
+                            "codex_plus": {
+                                "hourlyRemainingPercent": 26,
+                                "hourlyWindowPresent": True,
+                                "weeklyRemainingPercent": 100,
+                                "weeklyWindowPresent": False,
+                                "snapshotUpdatedAtUnixSeconds": snapshot_at,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            quota = client_usage_export.cockpit_codex_quota_by_label(root)
+
+        k12 = quota["Codex local - k12@example.com"]
+        self.assertEqual(k12["window_5h"]["remaining_percent"], 3.0)
+        self.assertEqual(k12["window_7d"]["remaining_percent"], 85.0)
+        self.assertTrue(k12["window_5h"]["quota_reset_unavailable"])
+        plus = quota["Codex local - plus@example.com"]
+        self.assertTrue(plus["window_5h"]["quota_unlimited"])
+        self.assertEqual(plus["window_7d"]["remaining_percent"], 26.0)
+        self.assertTrue(plus["window_7d"]["quota_reset_unavailable"])
+
+    def test_cockpit_sidecar_reset_times_prevent_official_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cockpit = root / ".antigravity_cockpit"
+            accounts_dir = cockpit / "codex_accounts"
+            sidecar = cockpit / "codex_local_access_sidecar"
+            auth_dir = sidecar / "auths"
+            accounts_dir.mkdir(parents=True)
+            auth_dir.mkdir(parents=True)
+            account_id = "codex_local_reset"
+            account = {
+                "id": account_id,
+                "email": "local-reset@example.com",
+                "plan_type": "k12",
+            }
+            (cockpit / "codex_accounts.json").write_text(
+                json.dumps({"accounts": [account]}),
+                encoding="utf-8",
+            )
+            (accounts_dir / f"{account_id}.json").write_text(
+                json.dumps({"version": 1, "ciphertext": "encrypted"}),
+                encoding="utf-8",
+            )
+            now = datetime.now(client_usage_export.LOCAL_TZ)
+            reset_5h = int((now + timedelta(hours=4)).timestamp())
+            reset_7d = int((now + timedelta(days=6)).timestamp())
+            (sidecar / "quota-reserve.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            account_id: {
+                                "hourlyRemainingPercent": 64,
+                                "hourlyWindowPresent": True,
+                                "hourlyResetAtUnixSeconds": reset_5h,
+                                "weeklyRemainingPercent": 41,
+                                "weeklyWindowPresent": True,
+                                "weeklyResetAtUnixSeconds": reset_7d,
+                                "snapshotUpdatedAtUnixSeconds": int(now.timestamp()),
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / f"{account_id}.json").write_text(
+                json.dumps(
+                    {
+                        "access_token": "must-not-be-used",
+                        "account_id": "chatgpt-account-id",
+                        "expired": datetime.now().timestamp() + 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(client_usage_export.request, "urlopen") as urlopen:
+                quota = client_usage_export.cockpit_codex_quota_by_label(root)
+
+        urlopen.assert_not_called()
+        windows = quota["Codex local - local-reset@example.com"]
+        self.assertEqual(windows["window_5h"]["quota_source"], "sidecar-reserve")
+        self.assertTrue(windows["window_5h"]["resets_at"])
+        self.assertTrue(windows["window_7d"]["resets_at"])
+        self.assertFalse(windows["window_5h"]["quota_reset_unavailable"])
+
+    def test_official_quota_response_maps_5h_and_7d_reset_times(self) -> None:
+        checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        reset_5h = int(datetime(2026, 7, 14, 17, 0, tzinfo=client_usage_export.LOCAL_TZ).timestamp())
+        reset_7d = int(datetime(2026, 7, 20, 12, 0, tzinfo=client_usage_export.LOCAL_TZ).timestamp())
+
+        quota = client_usage_export.official_quota_from_usage_response(
+            {
+                "plan_type": "k12",
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 5 * 60 * 60,
+                        "reset_at": reset_5h,
+                        "used_percent": 34,
+                    },
+                    "secondary_window": {
+                        "limit_window_seconds": 7 * 24 * 60 * 60,
+                        "reset_at": reset_7d,
+                        "used_percent": 61,
+                    },
+                },
+            },
+            checked_at,
+        )
+
+        assert quota is not None
+        self.assertEqual(quota["window_5h"]["remaining_percent"], 66.0)
+        self.assertEqual(quota["window_7d"]["remaining_percent"], 39.0)
+        self.assertEqual(quota["window_5h"]["window_minutes"], 300)
+        self.assertEqual(quota["window_7d"]["window_minutes"], 10080)
+        self.assertTrue(quota["window_5h"]["resets_at"].startswith("2026-07-14T17:00:00"))
+        self.assertTrue(quota["window_7d"]["resets_at"].startswith("2026-07-20T12:00:00"))
+
+    def test_official_plus_7d_response_marks_5h_unlimited(self) -> None:
+        checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        quota = client_usage_export.official_quota_from_usage_response(
+            {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 7 * 24 * 60 * 60,
+                        "reset_at": checked_at.timestamp() + 3 * 24 * 60 * 60,
+                        "used_percent": 74,
+                    },
+                    "secondary_window": None,
+                },
+            },
+            checked_at,
+        )
+
+        assert quota is not None
+        self.assertTrue(quota["window_5h"]["quota_unlimited"])
+        self.assertEqual(quota["window_7d"]["remaining_percent"], 26.0)
+
+    def test_official_quota_request_is_cached_for_ten_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth_dir = (
+                root
+                / ".antigravity_cockpit"
+                / "codex_local_access_sidecar"
+                / "auths"
+            )
+            auth_dir.mkdir(parents=True)
+            account_id = "codex_cached"
+            (auth_dir / f"{account_id}.json").write_text(
+                json.dumps(
+                    {
+                        "access_token": "secret-access-token",
+                        "account_id": "chatgpt-account-id",
+                        "disabled": False,
+                        "expired": datetime.now().timestamp() + 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cache_path = root / "official-quota-cache.json"
+            checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+            response_payload = {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 7 * 24 * 60 * 60,
+                        "reset_at": checked_at.timestamp() + 2 * 24 * 60 * 60,
+                        "used_percent": 20,
+                    },
+                    "secondary_window": None,
+                },
+            }
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps(response_payload).encode("utf-8")
+            accounts = {account_id: {"plan_type": "plus"}}
+            with (
+                patch.object(client_usage_export, "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH", cache_path),
+                patch.object(client_usage_export.request, "urlopen", return_value=response) as urlopen,
+            ):
+                first = client_usage_export.cockpit_official_quota_by_account(root, accounts, checked_at)
+                second = client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    accounts,
+                    checked_at + timedelta(minutes=9, seconds=59),
+                )
+
+            self.assertEqual(urlopen.call_count, 1)
+            self.assertEqual(first, second)
+            self.assertNotIn("secret-access-token", cache_path.read_text(encoding="utf-8"))
+
     def test_plus_primary_7d_maps_to_official_7d_and_unlimited_5h(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1844,6 +2658,177 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(result[label]["window_rolling_7d"]["tokens"], 66_000_000)
 
 
+class CodexUsageFileWatcherTests(unittest.TestCase):
+    @staticmethod
+    def append_text(path: Path, text: str) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_only_appended_token_count_triggers_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            path.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            watcher = monitor.CodexUsageFileWatcher(root)
+
+            self.assertFalse(watcher.poll())
+            self.append_text(path, '{"type":"event_msg","payload":{"type":"task_started"}}\n')
+            self.assertFalse(watcher.poll())
+            token_row = {
+                "timestamp": "2026-07-14T10:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 40,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                            "total_tokens": 50,
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 400,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 100,
+                        },
+                    },
+                },
+            }
+            self.append_text(path, json.dumps(token_row) + "\n")
+            events = watcher.poll_events()
+            self.assertTrue(watcher.token_count_changed)
+            self.assertEqual([event["total_tokens"] for event in events], [50])
+            self.assertFalse(watcher.poll())
+
+            token_row["timestamp"] = "2026-07-14T10:00:01Z"
+            self.append_text(path, json.dumps(token_row) + "\n")
+            self.assertEqual(watcher.poll_events(), [])
+            self.assertTrue(watcher.token_count_changed)
+
+    def test_live_event_carries_the_session_id_from_its_rollout_path(self) -> None:
+        session_id = "019f54a2-9034-7651-a517-89989e6d6b1b"
+        watcher = monitor.CodexUsageFileWatcher(Path("unused"))
+        row = {
+            "timestamp": "2026-07-14T10:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 40,
+                        "cached_input_tokens": 20,
+                        "output_tokens": 10,
+                        "total_tokens": 50,
+                    }
+                },
+            },
+        }
+
+        events = watcher._extract_live_events(
+            Path(f"rollout-2026-07-14T10-00-00-{session_id}.jsonl"),
+            (json.dumps(row) + "\n").encode("utf-8"),
+        )
+
+        self.assertEqual(events[0]["session_id"], session_id)
+
+    def test_new_session_with_token_count_triggers_after_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watcher = monitor.CodexUsageFileWatcher(root)
+
+            self.assertFalse(watcher.poll())
+            path = root / "2026" / "07" / "14" / "rollout-new.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '{"type":"event_msg","payload":{"type": "token_count"}}\n',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(watcher.poll())
+
+    def test_marker_split_across_writes_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            path.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll()
+
+            self.append_text(path, '{"type":"event_msg","payload":{"type":"token_')
+            self.assertFalse(watcher.poll())
+            self.append_text(path, 'count"}}\n')
+
+            self.assertTrue(watcher.poll())
+
+    def test_incremental_read_uses_only_a_small_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout-session.jsonl"
+            path.write_bytes(b"x" * 100_000)
+            watcher = monitor.CodexUsageFileWatcher(
+                path.parent,
+                max_read_bytes=64 * 1024,
+            )
+            start = path.stat().st_size
+            self.append_text(path, '\n{"type":"event_msg"}\n')
+            end = path.stat().st_size
+
+            data = watcher._read_region(path, start, end)
+
+            self.assertLessEqual(
+                len(data),
+                monitor.LIVE_USAGE_WATCH_OVERLAP_BYTES + (end - start),
+            )
+
+    def test_hot_poll_does_not_repeat_the_full_directory_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            path.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll()
+
+            with patch.object(
+                watcher,
+                "_full_scan_paths",
+                wraps=watcher._full_scan_paths,
+            ) as full_scan:
+                watcher.poll()
+
+            full_scan.assert_not_called()
+
+    def test_poll_interval_backs_off_while_idle(self) -> None:
+        with patch.object(monitor.time, "monotonic", return_value=100.0):
+            watcher = monitor.CodexUsageFileWatcher(Path("unused"))
+
+        self.assertEqual(
+            watcher.next_poll_interval_ms(105.0),
+            monitor.LIVE_USAGE_WATCH_INTERVAL_MS,
+        )
+        self.assertEqual(
+            watcher.next_poll_interval_ms(130.0),
+            monitor.LIVE_USAGE_WATCH_IDLE_INTERVAL_MS,
+        )
+        self.assertEqual(
+            watcher.next_poll_interval_ms(170.0),
+            monitor.LIVE_USAGE_WATCH_COLD_INTERVAL_MS,
+        )
+
+    def test_full_scan_fallback_discovers_a_cold_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll()
+            path = root / "2025" / "01" / "01" / "rollout-cold.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '{"type":"event_msg","payload":{"type":"token_count"}}\n',
+                encoding="utf-8",
+            )
+            watcher._last_full_scan_at -= monitor.LIVE_USAGE_WATCH_FULL_SCAN_SECONDS + 1
+
+            self.assertTrue(watcher.poll())
+
+
 class LiveActiveSessionScanTests(unittest.TestCase):
     SESSION_ID = "019f54a2-9034-7651-a517-89989e6d6b1b"
 
@@ -1945,6 +2930,31 @@ class LiveActiveSessionScanTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["provider"], "Codex local - account@example.com")
         self.assertEqual(rows[0]["activity_source"], "live-session-tail")
+
+    def test_unchanged_live_tail_is_not_read_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(root, "task_started")
+            tail_cache: dict = {}
+            with patch.object(
+                monitor,
+                "_read_jsonl_tail",
+                wraps=monitor._read_jsonl_tail,
+            ) as read_tail:
+                first = monitor.scan_live_codex_active_sessions(
+                    root,
+                    [],
+                    tail_cache=tail_cache,
+                )
+                second = monitor.scan_live_codex_active_sessions(
+                    root,
+                    [],
+                    tail_cache=tail_cache,
+                )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(read_tail.call_count, 1)
 
     def test_completed_tail_is_removed_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2229,6 +3239,8 @@ class ManualRefreshTests(unittest.TestCase):
         app._refresh_lock = threading.Lock()
         app._refresh_lock.acquire()
         app._refresh_pending = False
+        app._refresh_pending_force = False
+        app._refresh_pending_usage = False
         app._draw = lambda: None
 
         started = app.refresh_async(force=True)
@@ -2256,6 +3268,8 @@ class ManualRefreshTests(unittest.TestCase):
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app._refresh_lock = threading.Lock()
         app._refresh_pending = False
+        app._refresh_pending_force = False
+        app._refresh_pending_usage = False
         app._loading = False
         app.client = FakeClient()
         app._draw = lambda: None
@@ -2267,6 +3281,378 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(app.client.clear_calls, 1)
         app._refresh_lock.release()
+
+
+class LiveUsageOverlayTests(unittest.TestCase):
+    @staticmethod
+    def state(tokens: int = 100, requests: int = 2, *, fresh: bool = False) -> monitor.MonitorState:
+        hour = datetime.now(monitor.CN_TZ).hour
+        client_usage = {
+            "tokens": tokens,
+            "requests": requests,
+            "input_tokens": 60,
+            "cached_input_tokens": 30,
+            "output_tokens": 10,
+            "dashboard": {
+                "hourly_today": [
+                    {"hour": value, "tokens": tokens if value == hour else 0, "requests": requests if value == hour else 0}
+                    for value in range(24)
+                ]
+            },
+        }
+        return monitor.MonitorState(
+            loading=False,
+            updated_at=0.0,
+            mode="local",
+            usage_source="local",
+            today_requests=requests,
+            today_tokens=tokens,
+            client_usage=client_usage,
+            usage_sync={"fresh": fresh},
+            latest_request={},
+        )
+
+    @staticmethod
+    def event() -> dict:
+        return {
+            "when": datetime.now(timezone.utc),
+            "total_tokens": 50,
+            "input_tokens": 40,
+            "cached_tokens": 20,
+            "output_tokens": 10,
+        }
+
+    def test_live_event_updates_only_top_level_totals_immediately(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        original_client_usage = copy.deepcopy(app.state.client_usage)
+
+        self.assertTrue(app._record_live_usage_events([self.event()]))
+
+        self.assertEqual(app.state.today_tokens, 150)
+        self.assertEqual(app.state.today_requests, 3)
+        self.assertEqual(app.state.client_usage, original_client_usage)
+
+    def test_live_trace_starts_new_events_at_detection_time(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        app._token_flow_samples = []
+        now = datetime.now(timezone.utc)
+        first = self.event()
+        first["when"] = now - timedelta(seconds=1)
+        second = self.event()
+        second["when"] = now - timedelta(seconds=3)
+
+        with patch.object(monitor.time, "monotonic", return_value=100.0):
+            app._record_live_usage_events([first, second])
+
+        self.assertEqual(len(app._token_flow_samples), 2)
+        spacing = app._token_flow_samples[0][0] - app._token_flow_samples[1][0]
+        self.assertAlmostEqual(app._token_flow_samples[0][0], 100.0)
+        self.assertAlmostEqual(spacing, 0.02)
+
+    def test_live_events_feed_exact_batch_total_to_delta_badge(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        first = self.event()
+        second = self.event()
+        second["total_tokens"] = 75
+
+        with patch.object(app, "_record_token_delta_badge") as record_badge:
+            app._record_live_usage_events([first, second])
+
+        record_badge.assert_called_once()
+        self.assertEqual(record_badge.call_args.args, (125,))
+        self.assertIsInstance(record_badge.call_args.kwargs["now"], float)
+        self.assertEqual(app.state.today_tokens, 225)
+
+    def test_live_event_updates_recent_request_from_matching_session(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "session-1",
+                "provider": "Codex local - current@example.com",
+                "model": "gpt-current",
+                "active": True,
+            }
+        ]
+        app._live_usage_overlay = None
+        event = self.event()
+        event["session_id"] = "session-1"
+
+        app._record_live_usage_events([event])
+
+        self.assertEqual(app.state.latest_account_name, "Codex local - current@example.com")
+        self.assertEqual(app.state.latest_request["model"], "gpt-current")
+        self.assertEqual(
+            app.state.latest_request["created_at"],
+            event["when"].astimezone(monitor.CN_TZ).isoformat(timespec="seconds"),
+        )
+        self.assertEqual(app.state.cost_history["today_tokens"], 150)
+
+    def test_live_overlay_does_not_become_unclassified_token_mix(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        app._record_live_usage_events([self.event()])
+
+        summary = app._usage_range_summary("24h")
+        mix = app._summary_token_mix(summary)
+
+        self.assertEqual(summary["tokens"], 150)
+        self.assertEqual(summary["breakdown_tokens"], 150)
+        self.assertEqual(mix["input"], 80)
+        self.assertEqual(mix["cached"], 50)
+        self.assertEqual(mix["output"], 20)
+        self.assertEqual(mix["unknown"], 0)
+
+    def test_authoritative_unknown_is_preserved_during_live_overlay(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=120)
+        app._live_usage_overlay = None
+        app._record_live_usage_events([self.event()])
+
+        summary = app._usage_range_summary("24h")
+        mix = app._summary_token_mix(summary)
+
+        self.assertEqual(summary["tokens"], 170)
+        self.assertEqual(mix["unknown"], 20)
+
+    def test_live_overlay_respects_authoritative_single_event_limit(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        event = self.event()
+        event["total_tokens"] = monitor.LIVE_USAGE_MAX_SINGLE_EVENT_TOKENS + 1
+
+        self.assertFalse(app._record_live_usage_events([event]))
+        self.assertEqual(app.state.today_tokens, 100)
+
+    def test_cached_state_keeps_overlay_until_authoritative_total_catches_up(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        app._record_live_usage_events([self.event()])
+        cached = self.state()
+
+        self.assertFalse(app._authoritative_state_covers_live_overlay(cached))
+        app._apply_live_usage_overlay(cached)
+        self.assertEqual(cached.today_tokens, 150)
+
+        authoritative = self.state(tokens=150, requests=3, fresh=True)
+        self.assertTrue(app._authoritative_state_covers_live_overlay(authoritative))
+
+    def test_optimistic_overlay_is_not_written_to_usage_history(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        app._record_live_usage_events([self.event()])
+        app._refresh_pending = False
+        app._refresh_pending_force = False
+        app._refresh_pending_usage = False
+        app._refresh_lock = threading.Lock()
+        app._refresh_lock.acquire()
+        app._loading = True
+        app.closed = False
+        app.error = None
+        app._draw = lambda: None
+        captured: list[int] = []
+
+        def update_history(state: monitor.MonitorState) -> dict:
+            captured.append(state.today_tokens)
+            return {}
+
+        with patch.object(monitor, "update_usage_history", side_effect=update_history):
+            app._apply_state(self.state())
+
+        self.assertEqual(captured, [100])
+        self.assertEqual(app.state.today_tokens, 150)
+
+    def test_live_change_does_not_start_a_full_export(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        app._live_usage_lock = threading.Lock()
+        app._live_usage_lock.acquire()
+        app.closed = False
+        app._draw = lambda: None
+        app.refresh_async = lambda *args, **kwargs: self.fail("live change started a full export")
+
+        app._apply_live_usage_change(True, [self.event()])
+
+        self.assertEqual(app.state.today_tokens, 150)
+        self.assertFalse(app._live_usage_lock.locked())
+
+    def test_recent_active_session_defers_automatic_full_export(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "session-1",
+                "active": True,
+                "latest_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+
+        self.assertTrue(app._codex_logs_busy())
+
+        app.state.client_usage["active_sessions"][0]["latest_at"] = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=monitor.LIVE_USAGE_EXPORT_IDLE_SECONDS + 1)
+        ).isoformat()
+        self.assertFalse(app._codex_logs_busy())
+
+    def test_token_flow_level_scales_with_recent_token_volume_and_decays(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_samples = [(100.0, 20_000)]
+
+        with patch.object(monitor.time, "monotonic", return_value=100.0):
+            low_level, low_tokens = app._token_flow_snapshot()
+        app._token_flow_samples = [(100.0, 800_000)]
+        with patch.object(monitor.time, "monotonic", return_value=100.0):
+            high_level, high_tokens = app._token_flow_snapshot()
+
+        self.assertGreater(high_level, low_level)
+        self.assertEqual(low_tokens, 20_000)
+        self.assertEqual(high_tokens, 800_000)
+
+        with patch.object(monitor.time, "monotonic", return_value=113.0):
+            expired_level, expired_tokens = app._token_flow_snapshot()
+        self.assertEqual((expired_level, expired_tokens), (0.0, 0))
+
+    def test_account_trace_uses_one_taller_pulse_for_more_tokens(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_samples = [(100.0, 20_000)]
+        with patch.object(monitor.time, "monotonic", return_value=103.0):
+            low_pulses = app._token_flow_trace_pulses(160, 18)
+
+        app._token_flow_samples = [(100.0, 800_000)]
+        with patch.object(monitor.time, "monotonic", return_value=103.0):
+            high_pulses = app._token_flow_trace_pulses(160, 18)
+
+        self.assertEqual(len(low_pulses), 1)
+        self.assertEqual(len(high_pulses), 1)
+        self.assertGreater(
+            max(height for _x, height, _level in high_pulses),
+            max(height for _x, height, _level in low_pulses),
+        )
+
+    def test_account_trace_draws_exactly_one_pulse_per_event(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_samples = [
+            (100.0, 20_000),
+            (100.5, 200_000),
+            (101.0, 800_000),
+        ]
+
+        with patch.object(monitor.time, "monotonic", return_value=103.0):
+            pulses = app._token_flow_trace_pulses(160, 18)
+
+        self.assertEqual(len(pulses), 3)
+
+    def test_account_trace_pulses_move_from_left_to_right(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_samples = [(100.0, 200_000)]
+        with patch.object(monitor.time, "monotonic", return_value=101.0):
+            early_pulses = app._token_flow_trace_pulses(160, 18)
+        with patch.object(monitor.time, "monotonic", return_value=105.0):
+            late_pulses = app._token_flow_trace_pulses(160, 18)
+
+        early_center = sum(x for x, _height, _level in early_pulses) / len(early_pulses)
+        late_center = sum(x for x, _height, _level in late_pulses) / len(late_pulses)
+        self.assertGreater(late_center, early_center)
+
+    def test_account_trace_keeps_rendered_spacing_stable_between_frames(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._token_flow_samples = [
+            (100.001, 200_000),
+            (100.146, 300_000),
+        ]
+
+        with patch.object(monitor.time, "monotonic", return_value=102.001):
+            first_frame = app._token_flow_trace_pulses(160, 18)
+        with patch.object(monitor.time, "monotonic", return_value=102.017):
+            second_frame = app._token_flow_trace_pulses(160, 18)
+
+        first_gap = round(first_frame[0][0]) - round(first_frame[1][0])
+        second_gap = round(second_frame[0][0]) - round(second_frame[1][0])
+        self.assertGreater(first_gap, 0)
+        self.assertEqual(first_gap, second_gap)
+
+    def test_account_trace_reuses_canvas_lines_at_60fps(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._main_tab = "accounts"
+        app._token_flow_trace_rect = (10, 20, 170, 40)
+        app.canvas = MagicMock()
+        app.canvas.find_withtag.side_effect = [(11,), (21, 22)]
+
+        with (
+            patch.object(app, "_token_flow_snapshot", return_value=(0.5, 100_000)),
+            patch.object(
+                app,
+                "_token_flow_trace_pulses",
+                return_value=[(20.0, 4, 0.2), (40.0, 6, 0.6)],
+            ),
+        ):
+            redrawn = app._redraw_token_flow_trace()
+
+        self.assertTrue(redrawn)
+        self.assertLessEqual(monitor.TOKEN_FLOW_ANIMATION_INTERVAL_MS, 17)
+        app.canvas.delete.assert_not_called()
+        app.canvas.create_line.assert_not_called()
+        self.assertEqual(app.canvas.coords.call_count, 3)
+        self.assertEqual(app.canvas.itemconfigure.call_count, 3)
+
+    def test_stats_meter_reuses_canvas_segments_at_60fps(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._main_tab = "stats"
+        app._token_flow_meter_rect = (10, 20, 30, 80)
+        app._token_flow_meter_fill_bounds = (12.0, 22.0, 26.0, 78.0)
+        app.canvas = MagicMock()
+        head_items = tuple(range(21, 21 + monitor.TOKEN_FLOW_METER_HEAD_BANDS))
+        app.canvas.find_withtag.side_effect = [(11,), head_items]
+
+        with (
+            patch.object(app, "_token_flow_snapshot", return_value=(0.5, 100_000)),
+            patch.object(app, "_smooth_token_flow_meter_level", return_value=0.5),
+        ):
+            redrawn = app._redraw_token_flow_meter()
+
+        self.assertTrue(redrawn)
+        self.assertLessEqual(monitor.TOKEN_FLOW_ANIMATION_INTERVAL_MS, 17)
+        app.canvas.delete.assert_not_called()
+        self.assertEqual(
+            app.canvas.coords.call_count,
+            1 + monitor.TOKEN_FLOW_METER_HEAD_BANDS,
+        )
+        app.canvas.itemconfigure.assert_not_called()
+
+    def test_stats_delta_badge_reuses_one_canvas_text_item(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._main_tab = "stats"
+        app.canvas = MagicMock()
+        app.canvas.find_withtag.return_value = (17,)
+
+        with patch.object(
+            app,
+            "_token_delta_badge_visual",
+            return_value=("+12,345", "#3A8A72", True),
+        ):
+            redrawn = app._redraw_token_delta_badge()
+
+        self.assertTrue(redrawn)
+        app.canvas.delete.assert_not_called()
+        app.canvas.create_text.assert_not_called()
+        app.canvas.itemconfigure.assert_called_once_with(
+            17,
+            text="+12,345",
+            fill="#3A8A72",
+            state="normal",
+        )
 
 
 class CodexSessionModelTests(unittest.TestCase):
@@ -2310,6 +3696,61 @@ class CodexSessionModelTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_token_event_keeps_task_start_as_attribution_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-manual-switch.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "session_meta",
+                        "payload": {"id": "manual-switch-session"},
+                    },
+                    {
+                        "timestamp": "2026-07-12T10:01:00",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-a"},
+                    },
+                    self.token_count("2026-07-12T10:05:00", 100, 10),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].when, datetime(2026, 7, 12, 10, 5))
+        self.assertIsNone(events[0].request_at)
+        self.assertEqual(events[0].account_at, datetime(2026, 7, 12, 10, 1))
+        self.assertEqual(
+            client_usage_export.usage_event_attribution_time(events[0]),
+            datetime(2026, 7, 12, 10, 5),
+        )
+
+        markers = [
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 12, 9, 0),
+                label="Codex local - account-a@example.com",
+                kind="switch",
+            ),
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 7, 12, 10, 3),
+                label="Codex local - account-b@example.com",
+                kind="switch",
+            ),
+        ]
+        attributed = client_usage_export.attribute_codex_events_by_account(
+            events,
+            markers,
+        )
+        self.assertIn("Codex local - account-a@example.com", attributed)
+        self.assertNotIn("Codex local - account-b@example.com", attributed)
 
     def test_token_count_inherits_model_from_turn_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
