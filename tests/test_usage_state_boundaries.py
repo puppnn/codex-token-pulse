@@ -1830,6 +1830,60 @@ class WindowSemanticsTests(unittest.TestCase):
 class LiveActiveSessionScanTests(unittest.TestCase):
     SESSION_ID = "019f54a2-9034-7651-a517-89989e6d6b1b"
 
+    def write_cockpit_marker(
+        self,
+        path: Path,
+        when: datetime,
+        *,
+        email: str,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE request_logs (
+                    timestamp INTEGER,
+                    account_id TEXT,
+                    email TEXT,
+                    api_key_label TEXT,
+                    model_id TEXT,
+                    total_tokens INTEGER,
+                    input_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    output_tokens INTEGER
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(when.timestamp() * 1000),
+                    "account-1",
+                    email,
+                    "Default",
+                    "gpt-test",
+                    input_tokens + output_tokens,
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def write_live_rows(self, root: Path, rows: list[dict]) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"rollout-2026-07-14T09-00-00-{self.SESSION_ID}.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def write_session(self, root: Path, lifecycle: str) -> Path:
         root.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1882,6 +1936,119 @@ class LiveActiveSessionScanTests(unittest.TestCase):
             rows = monitor.scan_live_codex_active_sessions(root, [])
 
         self.assertEqual(rows, [])
+
+    def test_api_service_session_uses_recent_cockpit_token_marker(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(seconds=2)
+        token_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "requests.sqlite"
+            self.write_live_rows(
+                root / "sessions",
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-1"},
+                    },
+                    {
+                        "timestamp": token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 10_000,
+                                    "cached_input_tokens": 8_000,
+                                    "output_tokens": 500,
+                                    "total_tokens": 10_500,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+            self.write_cockpit_marker(
+                db_path,
+                token_at + timedelta(milliseconds=150),
+                email="routed@example.com",
+                input_tokens=10_000,
+                cached_tokens=8_000,
+                output_tokens=500,
+            )
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    root / "sessions",
+                    [{"session_id": self.SESSION_ID, "provider": "正在识别账号"}],
+                    now=now,
+                    cockpit_db_path=db_path,
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["provider"], "Codex local - routed@example.com")
+        self.assertEqual(rows[0]["model"], "gpt-test")
+
+    def test_api_service_session_does_not_match_token_before_current_turn(self) -> None:
+        now = datetime.now(timezone.utc)
+        token_at = now - timedelta(seconds=3)
+        started_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "requests.sqlite"
+            self.write_live_rows(
+                root / "sessions",
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 9_000,
+                                    "cached_input_tokens": 8_000,
+                                    "output_tokens": 400,
+                                    "total_tokens": 9_400,
+                                }
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-2"},
+                    },
+                ],
+            )
+            self.write_cockpit_marker(
+                db_path,
+                token_at,
+                email="previous@example.com",
+                input_tokens=9_000,
+                cached_tokens=8_000,
+                output_tokens=400,
+            )
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    root / "sessions",
+                    [],
+                    now=now,
+                    cockpit_db_path=db_path,
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["provider"], "API 服务 · 等待首个响应")
 
 
 class ActiveSessionLifecycleTests(unittest.TestCase):

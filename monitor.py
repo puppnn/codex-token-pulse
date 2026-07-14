@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -34,6 +35,12 @@ LOCAL_ACTIVE_WINDOW_SECONDS = int(os.environ.get("SUB2API_LOCAL_ACTIVE_WINDOW_SE
 LIVE_ACTIVE_STALE_SECONDS = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_STALE_SECONDS", "7200"))
 LIVE_ACTIVE_TAIL_BYTES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_TAIL_BYTES", str(2 * 1024 * 1024)))
 LIVE_ACTIVE_MAX_FILES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_MAX_FILES", "64"))
+LIVE_ACCOUNT_MATCH_SECONDS = float(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_MATCH_SECONDS", "300"))
+LIVE_ACCOUNT_MARKER_LIMIT = int(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_MARKER_LIMIT", "4096"))
+COCKPIT_REQUEST_LOG_DB = Path(
+    os.environ.get("TOKEN_PULSE_COCKPIT_REQUEST_LOG_DB")
+    or Path.home() / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
+)
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 if not CLIENT_USAGE_EXPORT.exists():
     fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
@@ -723,11 +730,153 @@ def _current_codex_account_label() -> str:
     return ""
 
 
+def _token_usage_int(row: dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(row.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _live_token_usage(row: dict[str, Any]) -> dict[str, Any] | None:
+    payload = row.get("payload") or {}
+    if row.get("type") != "event_msg" or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info") or {}
+    last = info.get("last_token_usage") or {}
+    if not isinstance(last, dict) or not last:
+        return None
+    when = _parse_time(str(row.get("timestamp") or ""))
+    if when is None:
+        return None
+    input_tokens = _token_usage_int(last, "input_tokens")
+    cached_tokens = _token_usage_int(last, "cached_input_tokens")
+    output_tokens = _token_usage_int(last, "output_tokens")
+    total_tokens = _token_usage_int(last, "total_tokens") or input_tokens + output_tokens
+    if total_tokens <= 0:
+        return None
+    return {
+        "when": when,
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _cockpit_account_label(account_id: Any, email: Any, api_key_label: Any) -> str:
+    identity = str(email or "").strip() or str(api_key_label or "").strip() or str(account_id or "").strip()
+    return f"Codex local - {identity}" if identity else ""
+
+
+def _load_live_cockpit_markers(
+    db_path: Path,
+    now_utc: datetime,
+) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    start_ms = int((now_utc - timedelta(seconds=max(60.0, LIVE_ACCOUNT_MATCH_SECONDS))).timestamp() * 1000)
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        rows = connection.execute(
+            """
+            SELECT timestamp, account_id, email, api_key_label, model_id,
+                   total_tokens, input_tokens, cached_tokens, output_tokens
+            FROM request_logs
+            WHERE timestamp >= ? AND total_tokens > 0
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (start_ms, max(1, LIVE_ACCOUNT_MARKER_LIMIT)),
+        ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+
+    markers: list[dict[str, Any]] = []
+    for timestamp, account_id, email, api_key_label, model, total, input_value, cached, output in rows:
+        label = _cockpit_account_label(account_id, email, api_key_label)
+        if not label:
+            continue
+        try:
+            when = datetime.fromtimestamp(int(timestamp) / 1000.0, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            continue
+        markers.append(
+            {
+                "when": when,
+                "label": label,
+                "model": str(model or "").strip(),
+                "total_tokens": max(0, int(total or 0)),
+                "input_tokens": max(0, int(input_value or 0)),
+                "cached_tokens": max(0, int(cached or 0)),
+                "output_tokens": max(0, int(output or 0)),
+            }
+        )
+    return markers
+
+
+def _match_live_cockpit_marker(
+    usage: dict[str, Any] | None,
+    markers: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not usage:
+        return None
+    when = usage.get("when")
+    if not isinstance(when, datetime):
+        return None
+    total_tokens = int(usage.get("total_tokens") or 0)
+    exact = [
+        marker
+        for marker in markers
+        if int(marker.get("total_tokens") or 0) == total_tokens
+        and abs((marker["when"] - when).total_seconds()) <= LIVE_ACCOUNT_MATCH_SECONDS
+    ]
+    component_exact = [
+        marker
+        for marker in exact
+        if int(marker.get("input_tokens") or 0) == int(usage.get("input_tokens") or 0)
+        and int(marker.get("cached_tokens") or 0) == int(usage.get("cached_tokens") or 0)
+        and int(marker.get("output_tokens") or 0) == int(usage.get("output_tokens") or 0)
+    ]
+    candidates = component_exact or exact
+    if candidates:
+        return min(candidates, key=lambda marker: abs((marker["when"] - when).total_seconds()))
+
+    fuzzy_delta = max(256, int(total_tokens * 0.005))
+    fuzzy = [
+        marker
+        for marker in markers
+        if abs((marker["when"] - when).total_seconds()) <= 30
+        and abs(int(marker.get("total_tokens") or 0) - total_tokens) <= fuzzy_delta
+    ]
+    if not fuzzy:
+        return None
+    return min(
+        fuzzy,
+        key=lambda marker: (
+            abs(int(marker.get("total_tokens") or 0) - total_tokens),
+            abs((marker["when"] - when).total_seconds()),
+        ),
+    )
+
+
+def _concrete_live_provider(value: Any) -> str:
+    label = str(value or "").strip()
+    if not label or label == "正在识别账号" or label.startswith("API 服务 ·"):
+        return ""
+    return label
+
+
 def scan_live_codex_active_sessions(
     sessions_root: Path,
     cached_sessions: list[dict[str, Any]] | None = None,
     *,
     now: datetime | None = None,
+    cockpit_db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cached_by_id = {
@@ -751,8 +900,14 @@ def scan_live_codex_active_sessions(
     candidates.sort(key=lambda item: item[0], reverse=True)
 
     current_label = _current_codex_account_label()
-    if "api-service" in current_label.lower():
+    api_service_route = "api-service" in current_label.lower()
+    if api_service_route:
         current_label = ""
+    cockpit_markers = (
+        _load_live_cockpit_markers(cockpit_db_path or COCKPIT_REQUEST_LOG_DB, now_utc)
+        if api_service_route
+        else []
+    )
     active_rows: list[dict[str, Any]] = []
     session_pattern = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
     terminal_states = {"task_complete", "turn_aborted"}
@@ -764,36 +919,53 @@ def scan_live_codex_active_sessions(
         lifecycle_state = ""
         lifecycle_at = ""
         started_at = ""
+        latest_usage: dict[str, Any] | None = None
         for line in reversed(_read_jsonl_tail(path)):
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if latest_usage is None:
+                latest_usage = _live_token_usage(row)
+            if lifecycle_state and latest_usage is not None:
+                break
             if row.get("type") != "event_msg":
                 continue
             payload = row.get("payload") or {}
             payload_type = str(payload.get("type") or "")
-            if payload_type not in {"task_started", *terminal_states}:
+            if lifecycle_state or payload_type not in {"task_started", *terminal_states}:
                 continue
             lifecycle_state = payload_type
             lifecycle_at = str(row.get("timestamp") or "")
             if payload_type == "task_started":
                 started_at = lifecycle_at
-            break
+            if latest_usage is not None:
+                break
         cached = cached_by_id.get(session_id, {})
         if lifecycle_state in terminal_states:
             continue
         recently_written = now_utc.timestamp() - modified <= max(1, LOCAL_ACTIVE_WINDOW_SECONDS)
         if lifecycle_state != "task_started" and not recently_written:
             continue
-        provider = str(cached.get("provider") or current_label or "正在识别账号")
+        started_dt = _parse_time(started_at)
+        if started_dt is not None and latest_usage is not None and latest_usage["when"] < started_dt:
+            latest_usage = None
+        matched_marker = _match_live_cockpit_marker(latest_usage, cockpit_markers)
+        matched_label = str((matched_marker or {}).get("label") or "")
+        cached_provider = _concrete_live_provider(cached.get("provider"))
+        if api_service_route and matched_label:
+            provider = matched_label
+        else:
+            provider = cached_provider or current_label or matched_label
+        if not provider:
+            provider = "API 服务 · 等待首个响应" if api_service_route else "正在识别账号"
         latest_at = datetime.fromtimestamp(modified, tz=timezone.utc).isoformat(timespec="seconds")
         live = dict(cached)
         live.update(
             {
                 "session_id": session_id,
                 "provider": provider,
-                "model": cached.get("model") or "-",
+                "model": cached.get("model") or (matched_marker or {}).get("model") or "-",
                 "latest_at": latest_at,
                 "started_at": started_at or cached.get("started_at") or lifecycle_at,
                 "active": True,
