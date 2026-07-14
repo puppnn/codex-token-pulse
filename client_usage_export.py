@@ -3050,20 +3050,7 @@ def mark_codex_failure_hours(
             continue
         candidate_hour = failure.when.hour
         candidate = by_hour.get(candidate_hour)
-        if candidate is None:
-            continue
-        if int(candidate.get("tokens") or 0) > 0:
-            candidate_hour += 1
-            candidate = by_hour.get(candidate_hour)
-        if (
-            candidate is None
-            or candidate_hour <= 0
-            or candidate_hour > last_observed_hour
-            or int(candidate.get("tokens") or 0) > 0
-        ):
-            continue
-        previous = by_hour.get(candidate_hour - 1)
-        if previous is None or int(previous.get("tokens") or 0) <= 0:
+        if candidate is None or candidate_hour > last_observed_hour:
             continue
         candidate["failure"] = True
         candidate["failure_count"] = int(candidate.get("failure_count") or 0) + 1

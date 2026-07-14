@@ -2673,7 +2673,7 @@ class CodexSessionModelTests(unittest.TestCase):
         self.assertEqual([failure.turn_id for failure in failures], ["legacy-error", "terminal-error"])
         self.assertEqual([failure.when.minute for failure in failures], [22, 31])
 
-    def test_error_marks_only_the_adjacent_observed_zero_hour(self) -> None:
+    def test_error_marks_the_actual_hour_even_when_it_has_usage(self) -> None:
         hourly = [
             {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
             for hour in range(24)
@@ -2694,11 +2694,11 @@ class CodexSessionModelTests(unittest.TestCase):
             datetime(2026, 7, 12, 4, 20),
         )
 
-        self.assertTrue(hourly[4]["failure"])
-        self.assertEqual(hourly[4]["failure_count"], 1)
-        self.assertFalse(any(row.get("failure") for row in hourly[5:]))
+        self.assertTrue(hourly[3]["failure"])
+        self.assertEqual(hourly[3]["failure_count"], 1)
+        self.assertFalse(any(row.get("failure") for row in hourly[4:]))
 
-    def test_error_marker_waits_for_the_hour_and_clears_when_activity_resumes(self) -> None:
+    def test_error_marker_is_visible_immediately_and_survives_later_activity(self) -> None:
         hourly = [
             {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
             for hour in range(24)
@@ -2718,7 +2718,7 @@ class CodexSessionModelTests(unittest.TestCase):
             date(2026, 7, 12),
             datetime(2026, 7, 12, 3, 59),
         )
-        self.assertFalse(any(row.get("failure") for row in hourly))
+        self.assertTrue(hourly[3]["failure"])
 
         hourly[4]["tokens"] = 50
         client_usage_export.mark_codex_failure_hours(
@@ -2727,9 +2727,10 @@ class CodexSessionModelTests(unittest.TestCase):
             date(2026, 7, 12),
             datetime(2026, 7, 12, 5, 30),
         )
-        self.assertFalse(any(row.get("failure") for row in hourly))
+        self.assertTrue(hourly[3]["failure"])
+        self.assertFalse(hourly[4].get("failure"))
 
-    def test_repeated_desktop_network_failures_mark_adjacent_idle_hour(self) -> None:
+    def test_repeated_desktop_network_failures_mark_the_failure_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_root = Path(directory)
             log_dir = log_root / "2026" / "07" / "11"
@@ -2767,8 +2768,8 @@ class CodexSessionModelTests(unittest.TestCase):
             date(2026, 7, 12),
             datetime(2026, 7, 12, 5, 0),
         )
-        self.assertTrue(hourly[4]["failure"])
-        self.assertEqual(hourly[4]["failure_kind"], "desktop_network")
+        self.assertTrue(hourly[3]["failure"])
+        self.assertEqual(hourly[3]["failure_kind"], "desktop_network")
 
     def test_desktop_log_roots_discover_msix_app_data_and_install_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

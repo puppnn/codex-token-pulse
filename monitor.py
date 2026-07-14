@@ -3578,7 +3578,7 @@ class FloatingMonitorApp:
                 col = index % cols
                 tokens = float(item.get("tokens") or 0)
                 intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
-                failed = bool(item.get("failure")) and tokens <= 0
+                failed = bool(item.get("failure"))
                 x1 = grid_x + col * (cell + cell_gap)
                 y1 = grid_y + row * (cell + cell_gap)
                 fill = Theme.ag_crit if failed else self._activity_color(intensity)
