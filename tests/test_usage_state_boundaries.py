@@ -26,6 +26,20 @@ class CompactNumberTests(unittest.TestCase):
         self.assertEqual(monitor.exact_token_count(None), "0")
 
 
+class TooltipLayoutTests(unittest.TestCase):
+    class FixedWidthFont:
+        @staticmethod
+        def measure(value: str) -> int:
+            return len(value)
+
+    def test_four_line_failure_tooltip_is_not_truncated(self) -> None:
+        text = "03:00-04:00\n100 tokens\n2 calls · $0.01\nCodex task error detected at 03:55"
+
+        lines = monitor.FloatingMonitorApp._wrap_tooltip_lines(text, self.FixedWidthFont(), 80)
+
+        self.assertEqual(lines, text.splitlines())
+
+
 class ModelPricingFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_online_prices = client_usage_export._ONLINE_PRICE_TABLE
@@ -1048,8 +1062,8 @@ class LocalExportHighWaterTests(unittest.TestCase):
                 self.assertNotIn("failure_kind", hourly)
 
     def test_high_water_preserves_failure_from_current_scan(self) -> None:
-        previous = self.snapshot(self.day, 0)
-        current = self.snapshot(self.day, 0)
+        previous = self.snapshot(self.day, 1_000_000)
+        current = self.snapshot(self.day, 100_000)
         current["dashboard"]["hourly_today"][0].update(
             {
                 "failure": True,
@@ -1063,7 +1077,10 @@ class LocalExportHighWaterTests(unittest.TestCase):
         client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
 
         hourly = current["dashboard"]["hourly_today"][0]
+        self.assertEqual(hourly["tokens"], 1_000_000)
         self.assertTrue(hourly["failure"])
+        self.assertEqual(hourly["failure_count"], 1)
+        self.assertEqual(hourly["failure_at"], f"{self.day.isoformat()}T08:59:53+08:00")
         self.assertEqual(hourly["failure_kind"], "desktop_network")
 
     def test_high_water_preserves_totals_but_keeps_newer_latest_timestamp(self) -> None:

@@ -4027,7 +4027,7 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             # Failure annotations are live scan results, not cumulative high-water data.
             for key in failure_keys:
                 current_row.pop(key, None)
-            if tokens_of(current_row) <= 0 and current_failure.get("failure"):
+            if current_failure.get("failure"):
                 current_row.update(current_failure)
 
     existing_today = existing.get("today")
