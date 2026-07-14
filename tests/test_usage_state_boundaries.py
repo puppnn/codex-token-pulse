@@ -2291,6 +2291,71 @@ class CodexSessionModelTests(unittest.TestCase):
             [(70, 7), (80, 8)],
         )
 
+    def test_non_fork_repeated_cumulative_snapshots_keep_legacy_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-regular-a.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T09:59:00",
+                        "type": "session_meta",
+                        "payload": {"id": "regular-a"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:00:00",
+                        100,
+                        10,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:01:00",
+                        40,
+                        4,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                    self.token_count(
+                        "2026-07-12T10:02:00",
+                        25,
+                        2,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                ],
+            )
+            self.write_session(
+                root,
+                "rollout-regular-b.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:03:00",
+                        "type": "session_meta",
+                        "payload": {"id": "regular-b"},
+                    },
+                    self.token_count(
+                        "2026-07-12T10:04:00",
+                        60,
+                        6,
+                        total_input_tokens=100,
+                        total_output_tokens=10,
+                    ),
+                ],
+            )
+
+            events = client_usage_export.scan_codex_events(
+                root,
+                datetime(2026, 7, 12, 9, 0),
+                datetime(2026, 7, 12, 11, 0),
+            )
+
+        self.assertEqual(
+            [(event.session_id, event.input_tokens, event.output_tokens) for event in events],
+            [("regular-a", 100, 10)],
+        )
+
     def test_only_terminal_turn_errors_are_collected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

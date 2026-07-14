@@ -1129,7 +1129,11 @@ def scan_codex_events(
     events: list[UsageEvent] = []
     failures_by_turn: dict[tuple[str, str], CodexFailureEvent] = {}
     seen_events: set[tuple[str, str, int, int, int, int]] = set()
-    seen_totals: set[tuple[Any, ...]] = set()
+    seen_totals: set[tuple[str, int, int, int, int]] = set()
+    signatures_by_total: dict[
+        tuple[str, int, int, int, int],
+        set[tuple[int, ...]],
+    ] = {}
     session_paths: dict[str, Path] = {}
     paths = iter_recent_jsonl(root, start, session_paths=session_paths)
     headers = codex_session_headers(paths)
@@ -1145,7 +1149,7 @@ def scan_codex_events(
             file_activity_at = None
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
         current_model = CODEX_DEFAULT_MODEL
-        seen: set[tuple[int, ...]] = set()
+        seen: set[tuple[int, int, int, int]] = set()
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
@@ -1262,7 +1266,12 @@ def scan_codex_events(
                 "cached_input_tokens": usage_int(total, "cached_input_tokens"),
                 "output_tokens": usage_int(total, "output_tokens"),
             }
-            key = signature
+            key = (
+                current["input_tokens"],
+                current["cached_input_tokens"],
+                current["output_tokens"],
+                usage_int(total, "reasoning_output_tokens"),
+            )
             if key in seen:
                 if inherited_replay:
                     last_total = current
@@ -1278,19 +1287,31 @@ def scan_codex_events(
                 continue
             explicit_model = str(row.get("model") or payload.get("model") or "").strip()
             model = codex_model_name(explicit_model) if explicit_model else current_model
-            total_key = (model, *signature)
+            total_key = (
+                model,
+                current["input_tokens"],
+                current["cached_input_tokens"],
+                current["output_tokens"],
+                usage_int(total, "reasoning_output_tokens"),
+            )
             if (
                 parent_prefix_index == 0
                 and fork_replay_cutoff is not None
                 and ts <= fork_replay_cutoff
             ):
                 seen_totals.add(total_key)
+                signatures_by_total.setdefault(total_key, set()).add(signature)
                 last_total = current
                 continue
             if total_key in seen_totals:
-                last_total = current
-                continue
-            seen_totals.add(total_key)
+                known_signatures = signatures_by_total.get(total_key, set())
+                # Only confirmed forks may contain distinct branch requests at one cumulative total.
+                if parent_prefix_index == 0 or signature in known_signatures:
+                    last_total = current
+                    continue
+            else:
+                seen_totals.add(total_key)
+            signatures_by_total.setdefault(total_key, set()).add(signature)
             last_usage = info.get("last_token_usage") or {}
             if last_usage:
                 input_tokens = usage_int(last_usage, "input_tokens")
