@@ -1827,6 +1827,63 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(result[label]["window_rolling_7d"]["tokens"], 66_000_000)
 
 
+class LiveActiveSessionScanTests(unittest.TestCase):
+    SESSION_ID = "019f54a2-9034-7651-a517-89989e6d6b1b"
+
+    def write_session(self, root: Path, lifecycle: str) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        path = root / f"rollout-2026-07-14T09-00-00-{self.SESSION_ID}.jsonl"
+        rows = [
+            {
+                "type": "session_meta",
+                "payload": {"id": self.SESSION_ID},
+            },
+            {
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {"type": lifecycle, "turn_id": "turn-1"},
+            },
+            {
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {}},
+            },
+        ]
+        path.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_running_tail_reuses_cached_account_without_full_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(root, "task_started")
+            rows = monitor.scan_live_codex_active_sessions(
+                root,
+                [
+                    {
+                        "session_id": self.SESSION_ID,
+                        "provider": "Codex local - account@example.com",
+                        "model": "gpt-test",
+                    }
+                ],
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["provider"], "Codex local - account@example.com")
+        self.assertEqual(rows[0]["activity_source"], "live-session-tail")
+
+    def test_completed_tail_is_removed_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(root, "task_complete")
+            rows = monitor.scan_live_codex_active_sessions(root, [])
+
+        self.assertEqual(rows, [])
+
+
 class ActiveSessionLifecycleTests(unittest.TestCase):
     def test_running_lifecycle_wins_over_old_token_activity(self) -> None:
         now = datetime(2026, 7, 12, 14, 0, 0)
@@ -2459,6 +2516,28 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
             [date(2026, 7, 10), date(2026, 7, 11), date(2026, 7, 12)],
         )
 
+    def test_reconcile_does_not_rescan_last_day_after_today_success(self) -> None:
+        last_day = date(2026, 7, 12)
+        now = datetime(2026, 7, 13, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                last_day.isoformat(): self.history_row(last_day, 100),
+            },
+            "offline_sync": {
+                "state": "complete",
+                "last_successful_at": "2026-07-13T08:30:00+08:00",
+            },
+        }
+
+        targets = client_usage_export.offline_history_dates_to_reconcile(
+            history,
+            now,
+            max_days=31,
+        )
+
+        self.assertEqual(targets, [])
+
     def test_reconcile_never_reduces_existing_high_water(self) -> None:
         day = date(2026, 7, 10)
         existing = self.history_row(day, 1_000)
@@ -2617,6 +2696,24 @@ class ClientUsageSyncStatusTests(unittest.TestCase):
         self.assertTrue(usage["sync"]["cache_used"])
         self.assertTrue(usage["stale"])
 
+    def test_cached_startup_load_does_not_wait_for_exporter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_path = root / "export.py"
+            usage_path = root / "usage.json"
+            export_path.write_text("# fixture", encoding="utf-8")
+            usage_path.write_text(json.dumps(self.payload(125)), encoding="utf-8")
+            with (
+                patch.object(monitor, "CLIENT_USAGE_EXPORT", export_path),
+                patch.object(monitor, "CLIENT_USAGE_JSON", usage_path),
+                patch.object(monitor.subprocess, "run") as run_export,
+            ):
+                usage = monitor.load_client_usage(run_export=False)
+
+        run_export.assert_not_called()
+        self.assertEqual(usage["tokens"], 125)
+        self.assertEqual(usage["sync"]["state"], "cached")
+
     def test_timeout_after_current_output_write_is_only_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2715,6 +2812,32 @@ class AttributionLedgerTests(unittest.TestCase):
 
         self.assertIn("Codex local - account@example.com", attributed)
         self.assertEqual(ledger[stable_id], "Codex local - account@example.com")
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_monitor_launch_exits_without_creating_window(self) -> None:
+        with (
+            patch.object(monitor, "acquire_single_instance_mutex", return_value=None),
+            patch.object(monitor, "release_single_instance_mutex") as release,
+            patch.object(monitor, "FloatingMonitorApp") as app_factory,
+        ):
+            started = monitor.run_monitor_app()
+
+        self.assertFalse(started)
+        app_factory.assert_not_called()
+        release.assert_not_called()
+
+    def test_mutex_is_released_after_monitor_closes(self) -> None:
+        with (
+            patch.object(monitor, "acquire_single_instance_mutex", return_value=123),
+            patch.object(monitor, "release_single_instance_mutex") as release,
+            patch.object(monitor, "FloatingMonitorApp") as app_factory,
+        ):
+            started = monitor.run_monitor_app()
+
+        self.assertTrue(started)
+        app_factory.return_value.run.assert_called_once_with()
+        release.assert_called_once_with(123)
 
 
 class ListScrollbarTests(unittest.TestCase):

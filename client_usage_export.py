@@ -3414,11 +3414,12 @@ def offline_history_dates_to_reconcile(
 
     targets: set[date] = set()
     observed_at = latest_history_observation(history)
-    if observed_at is not None and observed_at.date() < today:
-        cursor = max(floor, observed_at.date())
-        while cursor <= last_complete_day:
-            targets.add(cursor)
-            cursor += timedelta(days=1)
+    if observed_at is not None:
+        if observed_at.date() < today:
+            cursor = max(floor, observed_at.date())
+            while cursor <= last_complete_day:
+                targets.add(cursor)
+                cursor += timedelta(days=1)
     elif known_dates:
         targets.add(max(floor, max(known_dates)))
     else:

@@ -31,6 +31,9 @@ CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_E
 ACCOUNT_WINDOW_CACHE_SECONDS = int(os.environ.get("SUB2API_ACCOUNT_WINDOW_CACHE_SECONDS", "60"))
 ACCOUNT_STATS_CACHE_SECONDS = int(os.environ.get("SUB2API_ACCOUNT_STATS_CACHE_SECONDS", "300"))
 LOCAL_ACTIVE_WINDOW_SECONDS = int(os.environ.get("SUB2API_LOCAL_ACTIVE_WINDOW_SECONDS", "300"))
+LIVE_ACTIVE_STALE_SECONDS = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_STALE_SECONDS", "7200"))
+LIVE_ACTIVE_TAIL_BYTES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_TAIL_BYTES", str(2 * 1024 * 1024)))
+LIVE_ACTIVE_MAX_FILES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_MAX_FILES", "64"))
 CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
 if not CLIENT_USAGE_EXPORT.exists():
     fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
@@ -53,6 +56,45 @@ CLIENT_USAGE_ROUTE_LABELS_JSON = Path(
 CN_TZ = timezone(timedelta(hours=8), "CST")
 DISPLAY_TIMEZONE = "Asia/Shanghai"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\TokenPulseFloatingMonitor"
+ERROR_ALREADY_EXISTS = 183
+
+
+def acquire_single_instance_mutex() -> int | None:
+    if os.name != "nt":
+        return -1
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            return -1
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return None
+        return int(handle)
+    except (AttributeError, OSError):
+        return -1
+
+
+def release_single_instance_mutex(handle: int | None) -> None:
+    if handle in {None, -1} or os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except (AttributeError, OSError):
+        pass
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -643,6 +685,126 @@ def is_recent_activity(value: str | None, window_seconds: int = LOCAL_ACTIVE_WIN
     return 0 <= seconds <= max(1, window_seconds)
 
 
+def _read_jsonl_tail(path: Path, max_bytes: int = LIVE_ACTIVE_TAIL_BYTES) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            offset = max(0, size - max(1, max_bytes))
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return []
+    if offset:
+        newline = data.find(b"\n")
+        data = data[newline + 1 :] if newline >= 0 else b""
+    return data.decode("utf-8", errors="ignore").splitlines()
+
+
+def _current_codex_account_label() -> str:
+    codex_dir = Path.home() / ".codex"
+    for name in (".cockpit_codex_auth.json", "auth.json"):
+        path = codex_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        email = str(data.get("email") or data.get("OPENAI_EMAIL") or "").strip()
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if not email and isinstance(tokens, dict):
+            email = str(tokens.get("email") or "").strip()
+        if email:
+            return f"Codex local - {email}"
+        for key in ("api_provider_name", "api_provider_id", "account_id"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return f"Codex local - {value}"
+    return ""
+
+
+def scan_live_codex_active_sessions(
+    sessions_root: Path,
+    cached_sessions: list[dict[str, Any]] | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cached_by_id = {
+        str(row.get("session_id") or ""): dict(row)
+        for row in (cached_sessions or [])
+        if isinstance(row, dict) and row.get("session_id")
+    }
+    candidates: list[tuple[float, Path]] = []
+    try:
+        paths = sessions_root.rglob("*.jsonl")
+        for path in paths:
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            age = now_utc.timestamp() - modified
+            if -5 <= age <= max(1, LIVE_ACTIVE_STALE_SECONDS):
+                candidates.append((modified, path))
+    except OSError:
+        return []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    current_label = _current_codex_account_label()
+    if "api-service" in current_label.lower():
+        current_label = ""
+    active_rows: list[dict[str, Any]] = []
+    session_pattern = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+    terminal_states = {"task_complete", "turn_aborted"}
+    for modified, path in candidates[: max(1, LIVE_ACTIVE_MAX_FILES)]:
+        match = session_pattern.search(path.stem)
+        if match is None:
+            continue
+        session_id = match.group(1)
+        lifecycle_state = ""
+        lifecycle_at = ""
+        started_at = ""
+        for line in reversed(_read_jsonl_tail(path)):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("type") != "event_msg":
+                continue
+            payload = row.get("payload") or {}
+            payload_type = str(payload.get("type") or "")
+            if payload_type not in {"task_started", *terminal_states}:
+                continue
+            lifecycle_state = payload_type
+            lifecycle_at = str(row.get("timestamp") or "")
+            if payload_type == "task_started":
+                started_at = lifecycle_at
+            break
+        cached = cached_by_id.get(session_id, {})
+        if lifecycle_state in terminal_states:
+            continue
+        recently_written = now_utc.timestamp() - modified <= max(1, LOCAL_ACTIVE_WINDOW_SECONDS)
+        if lifecycle_state != "task_started" and not recently_written:
+            continue
+        provider = str(cached.get("provider") or current_label or "正在识别账号")
+        latest_at = datetime.fromtimestamp(modified, tz=timezone.utc).isoformat(timespec="seconds")
+        live = dict(cached)
+        live.update(
+            {
+                "session_id": session_id,
+                "provider": provider,
+                "model": cached.get("model") or "-",
+                "latest_at": latest_at,
+                "started_at": started_at or cached.get("started_at") or lifecycle_at,
+                "active": True,
+                "activity_source": "live-session-tail",
+            }
+        )
+        active_rows.append(live)
+    active_rows.sort(key=lambda row: str(row.get("latest_at") or ""), reverse=True)
+    return active_rows
+
+
 def local_active_accounts_from_client_usage(
     client_usage: dict[str, Any] | None,
     *,
@@ -830,6 +992,7 @@ def normalize_usage_window(progress: Any) -> dict[str, Any]:
 def load_client_usage(
     include_30d: bool = False,
     backfill_history_details: bool = False,
+    run_export: bool = True,
 ) -> dict[str, Any] | None:
     attempted_at = datetime.now(CN_TZ).isoformat(timespec="seconds")
     before_mtime_ns: int | None = None
@@ -842,7 +1005,7 @@ def load_client_usage(
     export_state = "cached"
     export_message = ""
     export_attempted = False
-    if CLIENT_USAGE_EXPORT.exists():
+    if run_export and CLIENT_USAGE_EXPORT.exists():
         export_attempted = True
         try:
             command = [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)]
@@ -1505,8 +1668,12 @@ def build_local_monitor_state(
     error_text: str | None = None,
     usage_note: str = "本地客户端日志",
     include_30d: bool = False,
+    refresh_usage: bool = True,
 ) -> MonitorState:
-    client_usage = load_client_usage(include_30d=include_30d) or {
+    client_usage = load_client_usage(
+        include_30d=include_30d,
+        run_export=refresh_usage,
+    ) or {
         "requests": 0,
         "tokens": 0,
         "cost": 0.0,
@@ -2318,12 +2485,32 @@ class FloatingMonitorApp:
         self.HEIGHT = int(type(self).HEIGHT)
         self.client = Sub2APIClient()
         self.state: MonitorState | None = None
+        try:
+            if self.client.mode in {"local", "local-codex", "client", "client-local"}:
+                self.state = build_local_monitor_state(
+                    usage_note="\u672c\u5730\u65e5\u5fd7\uff08\u72ec\u7acb\u76d1\u63a7\uff09",
+                    include_30d=self.client.include_account_30d,
+                    refresh_usage=False,
+                )
+            elif self.client.mode in {"", "auto", "fallback", "auto-sub2api"}:
+                points_to_sub2api, codex_urls = self.client._codex_points_to_sub2api()
+                if points_to_sub2api is not True:
+                    first = codex_urls[0] if codex_urls else ""
+                    endpoint_note = strip_url_path(first) or "\u672a\u786e\u8ba4 Codex endpoint"
+                    self.state = build_local_monitor_state(
+                        usage_note=f"Auto: Codex -> {endpoint_note} / \u672c\u5730\u65e5\u5fd7",
+                        include_30d=self.client.include_account_30d,
+                        refresh_usage=False,
+                    )
+        except Exception:
+            self.state = None
         self.error: str | None = None
         self.closed = False
         self._pinned = True
         self._loading = False
         self._refresh_lock = threading.Lock()
         self._refresh_pending = False
+        self._live_active_lock = threading.Lock()
         self._pulse_phase = 0.0
         self._fade_alpha = 0.0
         self._drag_data = {"x": 0, "y": 0}
@@ -2436,6 +2623,7 @@ class FloatingMonitorApp:
         self._fade_in()
         self.refresh_async()
         self._schedule_auto_refresh()
+        self._schedule_live_active_refresh()
         self._schedule_midnight_refresh()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4819,6 +5007,59 @@ class FloatingMonitorApp:
     def _on_visibility(self, _event: tk.Event) -> None:
         self._ensure_topmost()
 
+    def _refresh_live_active_async(self) -> bool:
+        if not self._live_active_lock.acquire(blocking=False):
+            return False
+        cached_sessions: list[dict[str, Any]] = []
+        if self.state is not None and isinstance(self.state.client_usage, dict):
+            raw_sessions = self.state.client_usage.get("active_sessions")
+            if isinstance(raw_sessions, list):
+                cached_sessions = [
+                    dict(row) for row in raw_sessions if isinstance(row, dict)
+                ]
+
+        def _worker() -> None:
+            try:
+                sessions = scan_live_codex_active_sessions(
+                    Path.home() / ".codex" / "sessions",
+                    cached_sessions,
+                )
+            except Exception:
+                sessions = None
+            try:
+                self.root.after(0, lambda: self._apply_live_active_sessions(sessions))
+            except tk.TclError:
+                self._live_active_lock.release()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    def _apply_live_active_sessions(
+        self,
+        sessions: list[dict[str, Any]] | None,
+    ) -> None:
+        try:
+            if (
+                sessions is None
+                or self.state is None
+                or self.state.usage_source != "local"
+                or not isinstance(self.state.client_usage, dict)
+            ):
+                return
+            self.state.client_usage["active_sessions"] = sessions
+            self.state.active_accounts = local_active_accounts_from_client_usage(
+                self.state.client_usage
+            )
+            self._draw()
+        finally:
+            self._live_active_lock.release()
+
+    def _schedule_live_active_refresh(self) -> None:
+        if self.closed:
+            return
+        self._refresh_live_active_async()
+        self.root.after(REFRESH_SECONDS * 1000, self._schedule_live_active_refresh)
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  DATA REFRESH
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4912,5 +5153,18 @@ class FloatingMonitorApp:
 
     def run(self) -> None:
         self.root.mainloop()
+
+
+def run_monitor_app() -> bool:
+    mutex_handle = acquire_single_instance_mutex()
+    if mutex_handle is None:
+        return False
+    try:
+        FloatingMonitorApp().run()
+    finally:
+        release_single_instance_mutex(mutex_handle)
+    return True
+
+
 if __name__ == "__main__":
-    FloatingMonitorApp().run()
+    run_monitor_app()
