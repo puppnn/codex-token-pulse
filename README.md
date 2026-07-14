@@ -8,13 +8,13 @@
 
 ### 账号
 
-显示当前活跃账号、最近请求、今日统计、Token 趋势和账号用量排行。支持 `今日 / 近5小时 / 近7天 / 周期` 切换。
+显示当前活跃账号、最近请求、今日统计、Token 趋势和账号用量排行。支持 `今日 / 5h / 7d / 30d` 切换。
 
 ![账号页](assets/screenshots/accounts.png)
 
 ### 用量统计
 
-提供 `24h / 7d / 30d / All` 视图，包含 Token Chips、缓存命中率、Activity 热力图、Top Models 和 Provider 成本排行。
+提供 `24h / 7d / 30d / 全部` 视图，包含 Token 构成、缓存命中率、活跃分布、常用模型和账号累计成本。
 
 ![用量统计页](assets/screenshots/usage-stats.png)
 
@@ -23,10 +23,10 @@
 - 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
 - 两个中文页签：`账号`、`用量统计`。
 - 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
-- 账号排行：按今日、近 5 小时、近 7 天、周期窗口查看账号用量。
+- 账号排行：按今日、5h、7d、30d 查看账号用量与额度状态。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
-- 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、Top Models 和 Provider 成本。
-- Activity 热力图：支持 24h、7d、30d、All time，不同强度颜色表示用量高低，鼠标悬停可查看具体值。
+- 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、常用模型和账号累计成本。
+- 活跃分布：支持 24h、7d、30d、全部，不同强度颜色表示用量高低，鼠标悬停可查看具体值；窄窗口的全部视图聚焦最近 30 天。
 - 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
 - 去重逻辑：保留 Codex fork replay 去重和 Sub2API mirror 扣除；Cockpit API 服务模式以去重后的
   原始请求为权威总量，`api-service-local` / `codex_local_access_runtime` 仅合并为一个展示项，不再重复扣除。
