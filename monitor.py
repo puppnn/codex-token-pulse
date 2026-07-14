@@ -2233,69 +2233,75 @@ class Sub2APIClient:
 
 
 class Theme:
-    """Neutral charcoal palette with restrained periwinkle-blue data accents."""
+    """Graphite telemetry palette with clear live, data, and warning roles."""
     # ── base surfaces ──
-    bg_dark = "#18181B"
-    bg_card = "#202023"
-    bg_section = "#26262B"
-    bg_lift = "#2B2B31"
-    bg_hover = "#39393F"
+    bg_dark = "#111417"
+    bg_card = "#171B1F"
+    bg_section = "#1D2328"
+    bg_lift = "#242C32"
+    bg_hover = "#2B353C"
 
-    # ── primary blue ramp ──
-    amber_dim = "#405F98"
-    amber = "#6E9DF8"
-    amber_bright = "#F4F4F6"
-    amber_glow = "#97B8F8"
+    # ── signature accents ──
+    live = "#58D6AD"
+    data = "#78A8FF"
+    warn = "#F2BF62"
+    coral = "#FF756B"
 
-    # ── secondary accents ──
-    cyan = "#8DB2F8"
-    cyan_dim = "#44444B"
-    violet = "#B5C8F5"
-    blue = "#4E7FE4"
+    # Compatibility aliases used by the drawing code.
+    amber_dim = "#28584F"
+    amber = live
+    amber_bright = "#F4F2ED"
+    amber_glow = "#A7C2FF"
+    cyan = data
+    cyan_dim = "#29424C"
+    violet = "#C7A6FF"
+    blue = "#5A83D8"
 
     # ── text ──
-    text_primary = "#F5F5F7"
-    text_secondary = "#B8B8BF"
-    text_muted = "#888891"
+    text_primary = "#F4F2ED"
+    text_secondary = "#C1C8CB"
+    text_muted = "#98A2A8"
 
     # ── semantic ──
-    accent_cyan = "#8DB2F8"
-    accent_red = "#F06A6A"
-    accent_green = "#68C995"
-    quota_red_bg = "#412B30"
-    quota_amber_bg = "#413829"
-    quota_green_bg = "#263A34"
-    ag_bg = "#29292E"
-    ag_surface = "#27272C"
-    ag_surface_hover = "#39393F"
-    ag_border = "#35353B"
-    ag_divider = "#303035"
-    ag_accent = "#6E9DF8"
-    ag_bar = "#87ACF5"
-    ag_success = "#68C995"
-    ag_warn = "#E2B45B"
-    ag_crit = "#F06A6A"
-    ag_muted = "#92929B"
-    ag_input = "#91B4F8"
-    ag_cache = "#6E9DF8"
-    ag_output = "#4E7FE4"
-    ag_reason = "#BBCDF8"
+    accent_cyan = data
+    accent_red = coral
+    accent_green = live
+    quota_red_bg = "#3B2527"
+    quota_amber_bg = "#3A3122"
+    quota_green_bg = "#20352F"
+    ag_bg = "#151A1E"
+    ag_surface = "#1D2328"
+    ag_surface_hover = "#29333A"
+    ag_border = "#303A41"
+    ag_divider = "#2A3238"
+    ag_accent = data
+    ag_bar = "#82AFFF"
+    ag_success = live
+    ag_warn = warn
+    ag_crit = coral
+    ag_muted = "#929CA2"
+    ag_input = "#83D4E4"
+    ag_cache = data
+    ag_output = "#C7A6FF"
+    ag_reason = warn
 
     # ── misc ──
-    border = "#34343A"
-    shadow = "#0E0E10"
+    border = "#303940"
+    shadow = "#080A0C"
     transparent = "#010203"
 
     # ── fonts (family, size, weight) ──
-    font_title = ("Segoe UI", 18, "bold")
-    font_section = ("Segoe UI", 11, "bold")
-    font_label = ("Segoe UI", 10, "normal")
-    font_label_bold = ("Segoe UI", 10, "bold")
-    font_value = ("Segoe UI", 18, "bold")
-    font_value_sm = ("Segoe UI", 14, "bold")
-    font_tiny = ("Segoe UI", 9, "normal")
-    font_micro = ("Segoe UI", 8, "normal")
-    font_icon = ("Segoe UI", 13, "normal")
+    font_title = ("Bahnschrift", 19, "bold")
+    font_hero = ("Microsoft YaHei UI", 11, "bold")
+    font_section = ("Microsoft YaHei UI", 10, "bold")
+    font_label = ("Microsoft YaHei UI", 9, "normal")
+    font_label_bold = ("Microsoft YaHei UI", 9, "bold")
+    font_value = ("Bahnschrift", 19, "bold")
+    font_value_sm = ("Bahnschrift", 14, "bold")
+    font_tiny = ("Microsoft YaHei UI", 8, "normal")
+    font_micro = ("Microsoft YaHei UI", 8, "normal")
+    font_data = ("Cascadia Mono", 8, "normal")
+    font_icon = ("Segoe Fluent Icons", 10, "normal")
 
 
 class FloatingMonitorApp:
@@ -2378,9 +2384,38 @@ class FloatingMonitorApp:
 
         # ── fonts (resolved) ──
         self._fonts: dict[str, tkfont.Font] = {}
+        available_fonts = {family.casefold(): family for family in tkfont.families(self.root)}
+        self._fluent_icons = False
         for attr in dir(Theme):
             if attr.startswith("font_"):
                 family, size, weight = getattr(Theme, attr)
+                if attr == "font_icon":
+                    icon_family = available_fonts.get(family.casefold())
+                    if not icon_family:
+                        icon_family = available_fonts.get("segoe mdl2 assets")
+                    if icon_family:
+                        family = icon_family
+                        self._fluent_icons = True
+                    else:
+                        family = "Segoe UI Symbol"
+                else:
+                    resolved_family = available_fonts.get(family.casefold())
+                    if not resolved_family:
+                        if attr == "font_data":
+                            fallback_names = ("Consolas", "Segoe UI")
+                        elif attr in {"font_title", "font_value", "font_value_sm"}:
+                            fallback_names = ("Segoe UI Variable", "Segoe UI")
+                        else:
+                            fallback_names = ("Segoe UI Variable", "Segoe UI")
+                        resolved_family = next(
+                            (
+                                available_fonts[name.casefold()]
+                                for name in fallback_names
+                                if name.casefold() in available_fonts
+                            ),
+                            family,
+                        )
+                    family = resolved_family
                 self._fonts[attr] = tkfont.Font(
                     family=family, size=size, weight=weight
                 )
@@ -2440,6 +2475,88 @@ class FloatingMonitorApp:
         pts = self._rounded_rect_points(x1, y1, x2, y2, r)
         return self.canvas.create_polygon(pts, smooth=True, **kw)
 
+    def _draw_panel(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        *,
+        fill: str | None = None,
+        outline: str | None = None,
+        radius: int = 8,
+    ) -> int:
+        return self._draw_rounded_rect(
+            x1,
+            y1,
+            x2,
+            y2,
+            r=radius,
+            fill=fill or Theme.ag_surface,
+            outline=outline or Theme.ag_border,
+            width=1,
+        )
+
+    def _draw_header_mark(self, x: int, y: int, color: str) -> None:
+        """Draw the compact pulse-line product mark."""
+        self._draw_rounded_rect(
+            x,
+            y,
+            x + 29,
+            y + 29,
+            r=7,
+            fill=Theme.bg_section,
+            outline=Theme.border,
+            width=1,
+        )
+        points = [
+            x + 6, y + 16,
+            x + 10, y + 16,
+            x + 13, y + 10,
+            x + 17, y + 21,
+            x + 20, y + 14,
+            x + 24, y + 14,
+        ]
+        self.canvas.create_line(
+            *points,
+            fill=color,
+            width=2,
+            capstyle="round",
+            joinstyle="round",
+        )
+
+    def _draw_section_label(
+        self,
+        col_l: int,
+        col_r: int,
+        y: int,
+        title: str,
+        meta: str = "",
+    ) -> int:
+        self.canvas.create_text(
+            col_l,
+            y,
+            anchor="nw",
+            text=title,
+            font=self._fonts["font_section"],
+            fill=Theme.text_primary,
+        )
+        if meta:
+            self.canvas.create_text(
+                col_r,
+                y + 2,
+                anchor="ne",
+                text=meta,
+                font=self._fonts["font_tiny"],
+                fill=Theme.text_muted,
+            )
+        return y + 24
+
+    def _account_rank_row_height(self) -> int:
+        if self._account_range in {"5h", "7d"}:
+            return 51 if self.HEIGHT < 653 else 64
+        return 39
+
     def _apply_window_size(self, width: int, height: int) -> None:
         width = int(max(self.MIN_WIDTH, width))
         height = int(max(self.MIN_HEIGHT, height))
@@ -2473,13 +2590,44 @@ class FloatingMonitorApp:
     def _draw_tooltip(self, W: int, H: int) -> None:
         if not self._tooltip_text:
             return
-        lines = self._tooltip_text.split("\n")[:3]
-        width = max(self._text_width(line, "font_micro") for line in lines) + 18
+        font = self._fonts["font_micro"]
+        max_text_width = max(80, W - 34)
+        lines: list[str] = []
+        truncated = False
+        raw_lines = self._tooltip_text.splitlines() or [self._tooltip_text]
+        for raw_index, raw_line in enumerate(raw_lines):
+            remaining = raw_line or " "
+            while remaining and len(lines) < 3:
+                if font.measure(remaining) <= max_text_width:
+                    lines.append(remaining)
+                    remaining = ""
+                    continue
+                low, high = 1, len(remaining)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if font.measure(remaining[:middle]) <= max_text_width:
+                        low = middle
+                    else:
+                        high = middle - 1
+                split_at = max(1, low)
+                lines.append(remaining[:split_at])
+                remaining = remaining[split_at:]
+            if remaining or (len(lines) >= 3 and raw_index < len(raw_lines) - 1):
+                truncated = True
+                break
+        if not lines:
+            return
+        if truncated:
+            last_line = lines[-1]
+            while last_line and font.measure(last_line + "...") > max_text_width:
+                last_line = last_line[:-1]
+            lines[-1] = last_line + "..."
+        width = min(W - 16, max(font.measure(line) for line in lines) + 18)
         height = 18 * len(lines) + 8
         x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
         y = min(max(8, self._tooltip_pos[1] + 14), max(8, H - height - 8))
         self._draw_rounded_rect(x, y, x + width, y + height, r=6,
-                                fill=Theme.bg_lift, outline=Theme.ag_accent, width=1)
+                                fill=Theme.bg_lift, outline=Theme.data, width=1)
         for index, line in enumerate(lines):
             self.canvas.create_text(x + 9, y + 7 + index * 18, anchor="nw",
                                     text=line, font=self._fonts["font_micro"], fill=Theme.text_primary)
@@ -2522,7 +2670,7 @@ class FloatingMonitorApp:
     def _draw_pill(self, x: int, y: int, text: str, color: str, max_w: int) -> None:
         label = self._truncate(text, "font_tiny", max_w - 14)
         width = min(max_w, self._text_width(label, "font_tiny") + 14)
-        self._draw_rounded_rect(x, y, x + width, y + 22, r=8, fill=Theme.bg_dark, outline=Theme.border)
+        self._draw_rounded_rect(x, y, x + width, y + 21, r=6, fill=Theme.bg_dark, outline=Theme.border)
         self.canvas.create_text(x + 7, y + 4, anchor="nw", text=label, font=self._fonts["font_tiny"], fill=color)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2554,7 +2702,7 @@ class FloatingMonitorApp:
     def _draw_footer(self, W: int, H: int) -> None:
         now_str = datetime.now(CN_TZ).strftime("%H:%M:%S UTC+8")
         self.canvas.create_text(W // 2, H - 10, anchor="s", text=now_str,
-                                font=self._fonts["font_tiny"], fill=Theme.text_muted)
+                                font=self._fonts["font_data"], fill=Theme.text_muted)
         self.canvas.create_line(W - 18, H - 7, W - 7, H - 18, fill=Theme.border, width=1)
         self.canvas.create_line(W - 13, H - 7, W - 7, H - 13, fill=Theme.text_muted, width=1)
 
@@ -2618,21 +2766,34 @@ class FloatingMonitorApp:
             ("main_accounts", "\u8d26\u53f7", "accounts"),
             ("main_stats", "\u7528\u91cf\u7edf\u8ba1", "stats"),
         ]
-        gap = 5
+        gap = 2
+        tab_h = 29
+        inset = 3
+        self._draw_rounded_rect(col_l, y, col_r, y + tab_h, r=8,
+                                fill=Theme.ag_bg, outline=Theme.border)
+        inner_l = col_l + inset
+        inner_r = col_r - inset
         total_gap = gap * (len(tabs) - 1)
-        tab_w = max(62, (col_r - col_l - total_gap) // len(tabs))
-        tab_h = 25
+        tab_w = max(62, (inner_r - inner_l - total_gap) // len(tabs))
         for index, (button_name, label, value) in enumerate(tabs):
-            x1 = col_l + index * (tab_w + gap)
-            x2 = col_r if index == len(tabs) - 1 else x1 + tab_w
-            self._btn_rects[button_name] = (x1, y, x2, y + tab_h)
+            x1 = inner_l + index * (tab_w + gap)
+            x2 = inner_r if index == len(tabs) - 1 else x1 + tab_w
+            self._btn_rects[button_name] = (x1, y + 2, x2, y + tab_h - 2)
             selected = self._main_tab == value
             hovered = self._hover_btn == button_name
-            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
-            self._draw_rounded_rect(x1, y, x2, y + tab_h, r=7, fill=fill, outline=outline, width=1)
-            self.canvas.create_text((x1 + x2) // 2, y + 12, anchor="center", text=label,
+            fill = Theme.bg_lift if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            text_color = Theme.text_primary if selected or hovered else Theme.ag_muted
+            self._draw_rounded_rect(x1, y + 3, x2, y + tab_h - 3, r=6, fill=fill, outline="")
+            if selected:
+                self.canvas.create_line(
+                    x1 + 18,
+                    y + tab_h - 3,
+                    x2 - 18,
+                    y + tab_h - 3,
+                    fill=Theme.data,
+                    width=2,
+                )
+            self.canvas.create_text((x1 + x2) // 2, y + 14, anchor="center", text=label,
                                     font=self._fonts["font_label_bold"], fill=text_color)
         return y + tab_h + 10
 
@@ -2642,9 +2803,9 @@ class FloatingMonitorApp:
         if badge:
             bw = self._text_width(badge, "font_micro") + 14
             self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
-                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+                                    fill=Theme.ag_bg, outline=Theme.ag_border)
             self.canvas.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
-                                    font=self._fonts["font_micro"], fill=Theme.ag_muted)
+                                    font=self._fonts["font_tiny"], fill=Theme.ag_muted)
         return y + 24
 
     def _draw_donut(self, x: int, y: int, size: int, pct: float, color: str, label: str) -> None:
@@ -2693,16 +2854,16 @@ class FloatingMonitorApp:
     @staticmethod
     def _activity_color(intensity: float) -> str:
         if intensity <= 0:
-            return "#2D2D32"
+            return "#252C31"
         if intensity < 0.18:
-            return "#3D4C6B"
+            return "#284B49"
         if intensity < 0.38:
-            return "#5276B7"
+            return "#347A6A"
         if intensity < 0.68:
-            return "#6E9DF8"
+            return "#4FB895"
         if intensity < 0.9:
-            return "#91B4F8"
-        return "#3975E5"
+            return "#68DAB2"
+        return "#8AE9C8"
 
     def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
         if is_today:
@@ -3007,33 +3168,39 @@ class FloatingMonitorApp:
 
     def _draw_activity_heatmap(self, col_l: int, col_r: int, y: int, summary: dict[str, Any], series: list[dict[str, Any]]) -> int:
         c = self.canvas
-        c.create_text(col_l, y, anchor="nw", text="Activity",
+        c.create_text(col_l, y, anchor="nw", text="\u6d3b\u8dc3\u5206\u5e03",
                       font=self._fonts["font_section"], fill=Theme.text_primary)
-        chip_x = col_l + self._text_width("Activity", "font_section") + 10
-        self._draw_rounded_rect(chip_x, y - 1, chip_x + 78, y + 18, r=6,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
-        c.create_text(chip_x + 39, y + 8, anchor="center", text="Contribution",
-                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
-        badge = f"{summary.get('label', '-') } heatmap"
+        heatmap_label = (
+            "ALL  \u00b7  \u8fd1\u671f"
+            if self._usage_range == "all"
+            else str(summary.get("label", "-")).upper()
+        )
+        badge = f"{heatmap_label}  \u00b7  TOKEN"
         bw = self._text_width(badge, "font_micro") + 14
         self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
+                                fill=Theme.ag_bg, outline=Theme.ag_border)
         c.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
-                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
+                      font=self._fonts["font_tiny"], fill=Theme.ag_muted)
         y += 28
         if not series:
             c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u8d8b\u52bf\u6570\u636e",
                           font=self._fonts["font_label"], fill=Theme.ag_muted)
             return y + 30
 
+        compact_all = self._usage_range == "all" and self.HEIGHT < 726
         if self._usage_range == "24h":
             visible = series[-24:]
         elif self._usage_range == "7d":
             visible = series[-7:]
-        elif self._usage_range == "30d":
+        elif self._usage_range == "30d" or compact_all:
             visible = series[-30:]
         else:
             visible = series
+            available_w = max(1, col_r - col_l - 24)
+            max_cols = max(1, (available_w + 4) // 9)
+            max_days = max(7, (max_cols - 2) * 7)
+            if len(visible) > max_days:
+                visible = visible[-max_days:]
         max_tokens = max([float(item.get("tokens") or 0) for item in visible], default=0.0) or 1.0
         peak = max(visible, key=lambda item: float(item.get("tokens") or 0))
         if self._usage_range == "24h":
@@ -3108,7 +3275,7 @@ class FloatingMonitorApp:
                     f"{item.get('date', '-')}\n{exact_token_count(tokens)}\n{compact_number(item.get('requests', 0))} calls \u00b7 {money(item.get('cost', 0))}",
                 )
             legend_y = grid_y + cell_h + 9
-        elif self._usage_range == "30d":
+        elif self._usage_range == "30d" or compact_all:
             cols = 30
             rows_count = 1
             cell_gap = 3
@@ -3201,24 +3368,24 @@ class FloatingMonitorApp:
                 )
             legend_y = grid_y + rows_count * (cell + cell_gap) + 8
 
-        c.create_text(col_l, legend_y + 1, anchor="nw", text="Less",
+        c.create_text(col_l, legend_y + 1, anchor="nw", text="\u4f4e",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
-        legend_x = col_l + 30
-        for idx, color in enumerate(["#2D2D32", "#3D4C6B", "#5276B7", "#6E9DF8", "#3975E5"]):
+        legend_x = col_l + 18
+        for idx, color in enumerate(["#252C31", "#284B49", "#347A6A", "#4FB895", "#8AE9C8"]):
             self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
                                     r=2, fill=color, outline=Theme.ag_border)
-        c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="More",
+        c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="\u9ad8",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         if self._usage_range == "24h" and any(item.get("failure") for item in visible):
             error_x = legend_x + 112
             self._draw_rounded_rect(error_x, legend_y, error_x + 10, legend_y + 10,
                                     r=2, fill=Theme.ag_crit, outline=Theme.ag_crit)
-            c.create_text(error_x + 14, legend_y + 1, anchor="nw", text="Error",
+            c.create_text(error_x + 14, legend_y + 1, anchor="nw", text="\u9519\u8bef",
                           font=self._fonts["font_micro"], fill=Theme.ag_muted)
         peak_tokens = int(float(peak.get("tokens") or 0))
         peak_label = f"{int(peak.get('hour')):02d}:00" if self._usage_range == "24h" and peak.get("hour") is not None else str(peak.get("date") or "-")
         c.create_text(col_r, legend_y + 1, anchor="ne",
-                      text=f"Peak: {peak_label} ({exact_token_count(peak_tokens)})",
+                      text=f"\u5cf0\u503c {peak_label}  {compact_number(peak_tokens)}",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         return legend_y + 23
 
@@ -3415,81 +3582,96 @@ class FloatingMonitorApp:
     def _draw_usage_stats_page(self, col_l: int, col_r: int, y: int, H: int) -> None:
         c = self.canvas
         summary = self._usage_range_summary(self._usage_range)
-        c.create_text(col_l, y, anchor="nw", text="Usage Dashboard",
+        c.create_text(col_l, y, anchor="nw", text="\u7528\u91cf\u6982\u89c8",
                       font=self._fonts["font_section"], fill=Theme.text_primary)
-        range_buttons = [("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("All", "all")]
-        btn_w = 39
-        gap = 4
+        range_buttons = [("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("\u5168\u90e8", "all")]
+        btn_w = 38
+        gap = 2
         x = col_r - (btn_w * len(range_buttons) + gap * (len(range_buttons) - 1))
+        self._draw_rounded_rect(x - 3, y - 2, col_r + 3, y + 22, r=7,
+                                fill=Theme.ag_bg, outline=Theme.border)
         for label, value in range_buttons:
             name = f"usage_range_{value}"
             selected = self._usage_range == value
-            self._btn_rects[name] = (x - 3, y - 4, x + btn_w + 3, y + 24)
-            fill = Theme.bg_hover if selected else Theme.ag_surface
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else Theme.ag_muted
-            self._draw_rounded_rect(x, y - 1, x + btn_w, y + 21, r=6, fill=fill, outline=outline)
+            self._btn_rects[name] = (x, y - 3, x + btn_w, y + 23)
+            hovered = self._hover_btn == name
+            fill = Theme.bg_lift if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            text_color = Theme.text_primary if selected or hovered else Theme.ag_muted
+            self._draw_rounded_rect(x, y, x + btn_w, y + 20, r=5, fill=fill, outline="")
+            if selected:
+                c.create_line(x + 9, y + 20, x + btn_w - 9, y + 20, fill=Theme.data, width=2)
             c.create_text(x + btn_w // 2, y + 10, anchor="center", text=label,
-                          font=self._fonts["font_micro"], fill=text_color)
+                          font=self._fonts["font_tiny"], fill=text_color)
             x += btn_w + gap
         y += 28
 
-        hero_h = 78
-        self._draw_rounded_rect(col_l, y, col_r, y + hero_h, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
+        compact_layout = H < 700
+        hero_h = 70 if compact_layout else 74
+        self._draw_panel(col_l, y, col_r, y + hero_h, fill=Theme.ag_surface, radius=8)
+        c.create_text(col_l + 12, y + 9, anchor="nw", text="\u603b TOKEN",
+                      font=self._fonts["font_tiny"], fill=Theme.ag_muted)
+        c.create_text(col_l + 12, y + 25, anchor="nw", text=compact_number(summary["tokens"]),
+                      font=self._fonts["font_value"], fill=Theme.ag_accent)
+        c.create_text(col_l + 12, y + 52, anchor="nw", text=f"{compact_number(summary['requests'])} \u6b21\u8bf7\u6c42",
+                      font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         mid = col_l + (col_r - col_l) // 2
-        total_tokens_text = exact_token_count(summary["tokens"])
-        total_tokens_font = "font_value"
-        if self._text_width(total_tokens_text, total_tokens_font) > mid - col_l - 24:
-            total_tokens_font = "font_value_sm"
-        c.create_text(col_l + 12, y + 10, anchor="nw", text="Total Tokens",
-                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
-        c.create_text(col_l + 12, y + 29, anchor="nw", text=total_tokens_text,
-                      font=self._fonts[total_tokens_font], fill=Theme.ag_accent)
-        c.create_text(col_l + 12, y + 56, anchor="nw", text=f"{compact_number(summary['requests'])} calls",
-                      font=self._fonts["font_micro"], fill=Theme.text_secondary)
         c.create_line(mid, y + 12, mid, y + hero_h - 12, fill=Theme.ag_divider, width=1)
-        c.create_text(mid + 14, y + 10, anchor="nw", text="Estimated Cost",
-                      font=self._fonts["font_micro"], fill=Theme.ag_muted)
-        c.create_text(mid + 14, y + 29, anchor="nw", text=money(summary["cost"]),
-                      font=self._fonts["font_value"], fill=Theme.ag_success)
-        c.create_text(mid + 14, y + 56, anchor="nw", text=f"{summary['label']} window",
-                      font=self._fonts["font_micro"], fill=Theme.text_secondary)
-        y += hero_h + 12
+        c.create_text(mid + 14, y + 9, anchor="nw", text="\u9884\u4f30\u6210\u672c",
+                      font=self._fonts["font_tiny"], fill=Theme.ag_muted)
+        c.create_text(mid + 14, y + 25, anchor="nw", text=money(summary["cost"]),
+                      font=self._fonts["font_value"], fill=Theme.warn)
+        c.create_text(mid + 14, y + 52, anchor="nw", text=f"{summary['label']} \u65f6\u95f4\u7a97\u53e3",
+                      font=self._fonts["font_tiny"], fill=Theme.text_secondary)
+        self._add_tooltip(
+            col_l,
+            y,
+            mid - 1,
+            y + hero_h,
+            f"\u603b Token\n{exact_token_count(summary['tokens'])}\n{int(summary['requests'] or 0):,} \u6b21\u8bf7\u6c42",
+        )
+        y += hero_h + 10
 
         mix = self._summary_token_mix(summary)
         token_items = [
-            ("Input", mix["input"], Theme.ag_input),
-            ("Cache Read", mix["cached"], Theme.ag_cache),
-            ("Cache Write", mix["cache_create"], Theme.ag_reason),
-            ("Output", mix["output"], Theme.ag_output),
+            ("\u8f93\u5165", mix["input"], Theme.ag_input),
+            ("\u7f13\u5b58\u8bfb\u53d6", mix["cached"], Theme.ag_cache),
+            ("\u7f13\u5b58\u5199\u5165", mix["cache_create"], Theme.ag_reason),
+            ("\u8f93\u51fa", mix["output"], Theme.ag_output),
         ]
         cache_base = mix["input"] + mix["cached"] + mix["cache_create"]
         cache_hit_text = f"{mix['cached'] * 100 / cache_base:.1f}%" if cache_base > 0 else "-"
         chip_items = [
-            ("Input", exact_token_count(mix["input"]), Theme.ag_input),
-            ("Cache Read", exact_token_count(mix["cached"]), Theme.ag_cache),
-            ("Cache Hit", cache_hit_text, Theme.ag_success),
-            ("Cache Write", exact_token_count(mix["cache_create"]), Theme.ag_reason),
-            ("Output", exact_token_count(mix["output"]), Theme.ag_output),
+            ("\u8f93\u5165", compact_number(mix["input"]), Theme.ag_input),
+            ("\u7f13\u5b58\u8bfb\u53d6", compact_number(mix["cached"]), Theme.ag_cache),
+            ("\u7f13\u5b58\u5199\u5165", compact_number(mix["cache_create"]), Theme.ag_reason),
+            ("\u8f93\u51fa", compact_number(mix["output"]), Theme.ag_output),
         ]
         if mix.get("unknown", 0) > 0:
-            token_items.append(("Untracked", mix["unknown"], Theme.ag_muted))
-            chip_items.append(("Untracked", exact_token_count(mix["unknown"]), Theme.ag_muted))
+            token_items.append(("\u672a\u5f52\u7c7b", mix["unknown"], Theme.ag_muted))
+            chip_items.append(("\u672a\u5f52\u7c7b", compact_number(mix["unknown"]), Theme.ag_muted))
         mix_total = sum(value for _label, value, _color in token_items)
-        chip_badge = f"{summary['label']} mix"
+        chip_badge = f"{summary['label']}  \u00b7  \u7f13\u5b58\u547d\u4e2d {cache_hit_text}"
         if mix.get("unknown", 0) > 0:
-            chip_badge = f"{summary['label']} partial"
-        y = self._draw_ag_section(col_l, col_r, y, "Token Chips", chip_badge)
+            chip_badge += "  \u00b7  \u90e8\u5206"
+        y = self._draw_ag_section(col_l, col_r, y, "Token \u6784\u6210", chip_badge)
         chip_w = (col_r - col_l - 8) // 2
         for index, (label, value_text, color) in enumerate(chip_items):
             cx = col_l + (index % 2) * (chip_w + 8)
             cy = y + (index // 2) * 34
-            self._draw_rounded_rect(cx, cy, cx + chip_w, cy + 27, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_rounded_rect(cx, cy, cx + chip_w, cy + 27, r=6,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
             c.create_oval(cx + 8, cy + 10, cx + 15, cy + 17, fill=color, outline="")
             c.create_text(cx + 22, cy + 6, anchor="nw", text=label,
                           font=self._fonts["font_micro"], fill=Theme.text_secondary)
             c.create_text(cx + chip_w - 8, cy + 6, anchor="ne", text=value_text,
-                          font=self._fonts["font_micro"], fill=Theme.text_primary)
+                          font=self._fonts["font_data"], fill=Theme.text_primary)
+            self._add_tooltip(
+                cx,
+                cy,
+                cx + chip_w,
+                cy + 27,
+                f"{label}\n{exact_token_count(token_items[index][1])}",
+            )
         y += max(72, math.ceil(len(chip_items) / 2) * 34 + 4)
         bar_x = col_l
         bar_w = col_r - col_l
@@ -3566,44 +3748,51 @@ class FloatingMonitorApp:
                           font=self._fonts["font_label"], fill=Theme.ag_muted)
             y += 30
 
+        providers = sorted(
+            self._usage_range_providers(self._usage_range),
+            key=lambda row: (-float(row.get("cost") or 0), -int(row.get("tokens") or 0), str(row.get("name") or "")),
+        )
         models = self._top_models(self._usage_range)
-        y = self._draw_ag_section(col_l, col_r, y, "Top Models", f"{len(models)} models")
+        y = self._draw_ag_section(col_l, col_r, y, "\u5e38\u7528\u6a21\u578b", f"{len(models)} \u4e2a\u6a21\u578b")
         if not models:
             c.create_text(col_l + 4, y, anchor="nw", text="\u6682\u65e0\u6a21\u578b\u7edf\u8ba1",
                           font=self._fonts["font_label"], fill=Theme.ag_muted)
             y += 28
         else:
             max_model_tokens = max(tokens for _model, tokens in models) or 1
-            for model, tokens in models[:5]:
-                self._draw_rounded_rect(col_l, y, col_r, y + 29, r=6, fill=Theme.ag_surface, outline=Theme.ag_border)
+            list_bottom = H - 38
+            target_provider_rows = min(3, len(providers))
+            model_capacity = max(
+                0,
+                (list_bottom - y - 24 - target_provider_rows * 48) // 34,
+            )
+            model_limit = max(1, min(3, model_capacity))
+            for model, tokens in models[:model_limit]:
+                self._draw_panel(col_l, y, col_r, y + 29, fill=Theme.ag_surface, radius=6)
                 c.create_text(col_l + 9, y + 7, anchor="nw",
-                              text=self._truncate(model, "font_micro", max(90, col_r - col_l - 124)),
-                              font=self._fonts["font_micro"], fill=Theme.text_primary)
+                              text=self._truncate(model, "font_data", max(90, col_r - col_l - 124)),
+                              font=self._fonts["font_data"], fill=Theme.text_primary)
                 pct = int(tokens * 100 / max_model_tokens)
-                c.create_text(col_r - 9, y + 7, anchor="ne", text=exact_token_count(tokens),
+                c.create_text(col_r - 9, y + 7, anchor="ne", text=f"{compact_number(tokens)} tok",
                               font=self._fonts["font_micro"], fill=Theme.text_secondary)
                 self._draw_rounded_rect(col_l + 9, y + 22, col_r - 9, y + 25, r=1, fill=Theme.ag_bg, outline="")
                 fill_w = int((col_r - col_l - 18) * pct / 100)
                 self._draw_rounded_rect(col_l + 9, y + 22, col_l + 9 + fill_w, y + 25, r=1,
                                         fill=Theme.ag_accent, outline="")
                 self._add_tooltip(
-                    col_l + 9,
-                    y + 20,
-                    col_r - 9,
-                    y + 27,
+                    col_l,
+                    y,
+                    col_r,
+                    y + 29,
                     f"{model}\n{exact_token_count(tokens)}",
                 )
                 y += 34
 
-        providers = sorted(
-            self._usage_range_providers(self._usage_range),
-            key=lambda row: (-float(row.get("cost") or 0), -int(row.get("tokens") or 0), str(row.get("name") or "")),
-        )
-        y = self._draw_ag_section(col_l, col_r, y, "Account Cumulative", f"{len(providers)} accounts")
+        y = self._draw_ag_section(col_l, col_r, y, "\u8d26\u53f7\u7d2f\u8ba1", f"{len(providers)} \u4e2a\u8d26\u53f7")
         list_top = y
         list_bottom = H - 38
         row_h = 48
-        available_rows = max(1, (list_bottom - list_top) // row_h)
+        available_rows = max(0, (list_bottom - list_top) // row_h)
         max_start_index = max(0, len(providers) - available_rows)
         max_scroll = max_start_index * row_h
         self._scroll_limits["stats"] = max_scroll
@@ -3617,30 +3806,31 @@ class FloatingMonitorApp:
         visible_providers = providers[first_index:first_index + available_rows]
         for visible_index, provider in enumerate(visible_providers):
             row_y = list_top + visible_index * row_h
-            self._draw_rounded_rect(col_l, row_y, col_r, row_y + row_h - 7, r=6,
-                                    fill=Theme.ag_surface, outline=Theme.ag_border)
+            self._draw_panel(col_l, row_y, col_r, row_y + row_h - 7,
+                             fill=Theme.ag_surface, radius=6)
             provider_name = local_provider_display_name(str(provider.get("name") or "-"))
             name = self._truncate(provider_name, "font_label", max(90, col_r - col_l - 132))
-            tokens = exact_token_count(provider.get("tokens", 0))
+            tokens = compact_number(provider.get("tokens", 0))
+            exact_tokens = exact_token_count(provider.get("tokens", 0))
             cost_value = float(provider.get("cost") or 0)
             requests_count = compact_number(provider.get("requests", 0))
             c.create_text(col_l + 9, row_y + 6, anchor="nw", text=name,
                           font=self._fonts["font_label"], fill=Theme.text_primary)
             c.create_text(col_r - 9, row_y + 6, anchor="ne", text=money(cost_value),
-                          font=self._fonts["font_label_bold"], fill=Theme.ag_success)
-            c.create_text(col_l + 9, row_y + 24, anchor="nw", text=f"{tokens}  \u00b7  {requests_count} calls",
+                          font=self._fonts["font_label_bold"], fill=Theme.warn)
+            c.create_text(col_l + 9, row_y + 24, anchor="nw", text=f"{tokens} tok  \u00b7  {requests_count} \u6b21",
                           font=self._fonts["font_micro"], fill=Theme.ag_muted)
             bar_w = int((col_r - col_l - 18) * min(1.0, cost_value / max_provider_cost))
             if bar_w > 0:
                 c.create_rectangle(col_l + 9, row_y + 38, col_l + 9 + bar_w, row_y + 40,
                                    fill=Theme.ag_bar, outline="")
-                self._add_tooltip(
-                    col_l + 9,
-                    row_y + 35,
-                    col_r - 9,
-                    row_y + 43,
-                    f"{provider_name}\n{tokens}\n{money(cost_value)}",
-                )
+            self._add_tooltip(
+                col_l,
+                row_y,
+                col_r,
+                row_y + row_h - 7,
+                f"{provider_name}\n{exact_tokens} tokens\n{money(cost_value)}",
+            )
 
         self._draw_list_scrollbar(
             "stats",
@@ -3672,34 +3862,37 @@ class FloatingMonitorApp:
         COL_R = W - PAD
 
         # ── outer card background ──
-        self._draw_rounded_rect(4, 7, W - 2, H - 2, r=18, fill=Theme.shadow, outline="")
-        self._draw_rounded_rect(0, 0, W, H - 5, r=18, fill=Theme.bg_card, outline=Theme.border, width=1)
-
-        # ── subtle top accent lines ──
-        c.create_line(20, 2, W // 2 - 8, 2, fill=Theme.amber, width=2)
-        c.create_line(W // 2 + 8, 2, W - 20, 2, fill=Theme.cyan_dim, width=2)
+        self._draw_rounded_rect(3, 6, W - 2, H - 2, r=14, fill=Theme.shadow, outline="")
+        self._draw_rounded_rect(0, 0, W, H - 5, r=14, fill=Theme.bg_card, outline=Theme.border, width=1)
+        c.create_line(18, 1, W - 18, 1, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
         #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
-        y = 16
-        title_text = "Token Pulse"
-        c.create_text(COL_L, y, anchor="nw", text=title_text,
-                       font=self._fonts["font_title"], fill=Theme.amber_bright)
-
         sync_state = str((self.state.usage_sync or {}).get("state") or "") if self.state else ""
+        y = 12
         if self._loading:
-            brightness = int(128 + 127 * math.sin(self._pulse_phase))
-            dot_color = f"#{brightness // 2:02x}{brightness:02x}{brightness:02x}"
-            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=dot_color, outline="")
+            phase = (math.sin(self._pulse_phase) + 1.0) / 2.0
+            pulse_rgb = (
+                int(40 + 48 * phase),
+                int(88 + 126 * phase),
+                int(79 + 94 * phase),
+            )
+            pulse_color = "#%02x%02x%02x" % pulse_rgb
         elif self.state:
             if sync_state in {"timeout", "error", "unavailable", "stale"}:
-                status_color = Theme.accent_red
+                pulse_color = Theme.coral
             elif sync_state == "partial":
-                status_color = Theme.ag_warn
+                pulse_color = Theme.warn
             else:
-                status_color = Theme.accent_green
-            c.create_oval(COL_R - 78, y + 5, COL_R - 68, y + 15, fill=status_color, outline="")
+                pulse_color = Theme.live
+        else:
+            pulse_color = Theme.text_muted
+        self._draw_header_mark(COL_L, y, pulse_color)
+
+        title_x = COL_L + 39
+        c.create_text(title_x, y - 1, anchor="nw", text="Token Pulse",
+                      font=self._fonts["font_title"], fill=Theme.text_primary)
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
         if self._refresh_pending:
@@ -3711,37 +3904,49 @@ class FloatingMonitorApp:
         sync_label = usage_sync_label(self.state.usage_sync if self.state else None)
         if sync_label and not self._loading and not self._refresh_pending:
             updated = sync_label
-        subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
-        if self.state and self.state.mode == "local-codex":
-            subtitle = f"\u6d3b\u8dc3 {active_count}  /  {updated}"
-        c.create_text(COL_L, y + 24, anchor="nw", text=subtitle,
-                      font=self._fonts["font_micro"], fill=Theme.amber)
+        subtitle = f"\u6d3b\u8dc3 {active_count}  \u00b7  {updated}"
+        c.create_text(title_x, y + 24, anchor="nw", text=subtitle,
+                      font=self._fonts["font_tiny"],
+                      fill=pulse_color if self.state else Theme.text_muted)
 
-        btn_y = y - 2
+        btn_y = y + 1
+        close_glyph = "\ue8bb" if self._fluent_icons else "\u00d7"
+        pin_glyph = (
+            ("\ue718" if self._pinned else "\ue77a")
+            if self._fluent_icons
+            else ("\u25c6" if self._pinned else "\u25c7")
+        )
+        refresh_glyph = "\ue72c" if self._fluent_icons else "\u21bb"
         btn_specs = [
-            ("btn_close", "\u00d7", COL_R - 14),
-            ("btn_pin", "\u7f6e" if self._pinned else "\u9876", COL_R - 36),
-            ("btn_refresh", "\u21bb", COL_R - 58),
+            ("btn_close", close_glyph, COL_R - 11, "\u5173\u95ed"),
+            (
+                "btn_pin",
+                pin_glyph,
+                COL_R - 37,
+                "\u53d6\u6d88\u7f6e\u9876" if self._pinned else "\u4fdd\u6301\u7f6e\u9876",
+            ),
+            ("btn_refresh", refresh_glyph, COL_R - 63, "\u5237\u65b0\u6570\u636e"),
         ]
         self._btn_rects.clear()
-        for name, glyph, bx in btn_specs:
-            bx1, by1, bx2, by2 = bx - 9, btn_y - 2, bx + 9, btn_y + 16
+        for name, glyph, bx, tooltip in btn_specs:
+            bx1, by1, bx2, by2 = bx - 10, btn_y - 2, bx + 10, btn_y + 18
             self._btn_rects[name] = (bx1, by1, bx2, by2)
+            self._add_tooltip(bx1, by1, bx2, by2, tooltip)
             is_hover = self._hover_btn == name
             bg = Theme.bg_hover if is_hover else ""
             if bg:
-                self._draw_rounded_rect(bx1, by1, bx2, by2, r=4, fill=bg, outline="")
-            fg = Theme.amber_bright if is_hover else Theme.text_secondary
+                self._draw_rounded_rect(bx1, by1, bx2, by2, r=6, fill=bg, outline="")
+            fg = Theme.text_primary if is_hover else Theme.text_secondary
             if name == "btn_close":
                 fg = Theme.accent_red if is_hover else Theme.text_secondary
             elif name == "btn_refresh" and (self._loading or self._refresh_pending):
-                fg = Theme.cyan
-            c.create_text(bx, btn_y + 7, text=glyph, font=self._fonts["font_icon"],
+                fg = Theme.live
+            c.create_text(bx, btn_y + 8, text=glyph, font=self._fonts["font_icon"],
                            fill=fg, anchor="center")
 
-        y = 52
+        y = 55
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
-        y += 10
+        y += 8
         y = self._draw_main_tabs(COL_L, COL_R, y)
         if self._main_tab == "stats":
             self._draw_usage_stats_page(COL_L, COL_R, y, H)
@@ -3752,27 +3957,52 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  CURRENT CHANNEL HERO
         # ════════════════════════════════════════════════════════
-        y += 12
-        self._draw_rounded_rect(COL_L, y, COL_R, y + 72, r=13, fill=Theme.bg_section, outline=Theme.border)
+        y += 8
+        self._draw_panel(COL_L, y, COL_R, y + 72, fill=Theme.bg_section, radius=8)
         all_active_accounts = list(self.state.active_accounts or []) if self.state else []
         accounts = all_active_accounts
         latest_name = self.state.latest_account_name if self.state else ""
+        total_current = sum(int(account.get("current") or 0) for account in all_active_accounts)
         if accounts:
             hero_name = accounts[0].get("name", latest_name or "-")
-            total_current = sum(int(account.get("current") or 0) for account in all_active_accounts)
-            hero_sub = f"{len(all_active_accounts)} \u4e2a\u8d26\u53f7\u6d3b\u8dc3 / \u603b\u5e76\u53d1 {total_current}"
+            hero_sub = f"{len(all_active_accounts)} \u4e2a\u8d26\u53f7\u5728\u7ebf  \u00b7  \u8def\u7531\u6b63\u5e38"
             hero_color = Theme.accent_green
         else:
             status, _model, ago, color = self._latest_status()
-            hero_name = latest_name or ("\u6b63\u5728\u8bfb\u53d6\u6570\u636e" if self._loading or not self.state else "\u6682\u65e0\u6570\u636e")
-            hero_sub = f"\u6700\u8fd1 {status} / {ago}" if status != "-" else ("\u521d\u59cb\u5316\u4e2d" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42")
+            hero_name = latest_name or (
+                "\u6b63\u5728\u8bfb\u53d6\u6570\u636e"
+                if self._loading or not self.state
+                else "\u6682\u65e0\u6570\u636e"
+            )
+            hero_sub = (
+                f"\u6700\u8fd1 {status}  \u00b7  {ago}"
+                if status != "-"
+                else ("\u521d\u59cb\u5316\u4e2d" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42")
+            )
             hero_color = color if status != "-" else Theme.cyan
-        c.create_rectangle(COL_L + 12, y + 13, COL_L + 58, y + 15, fill=Theme.cyan, outline="")
-        c.create_text(COL_L + 12, y + 22, anchor="nw", text=self._truncate(hero_name, "font_label_bold", COL_R - COL_L - 32),
-                      font=self._fonts["font_label_bold"], fill=Theme.text_primary)
-        self._draw_pill(COL_L + 12, y + 44, hero_sub, hero_color, 170)
-        if self.state and self.state.client_usage:
-            self._draw_pill(COL_R - 94, y + 44, "\u672c\u5730", Theme.amber_bright, 76)
+        metric_l = COL_R - 72
+        c.create_rectangle(COL_L, y + 12, COL_L + 3, y + 60, fill=hero_color, outline="")
+        c.create_oval(COL_L + 13, y + 13, COL_L + 21, y + 21, fill=hero_color, outline="")
+        c.create_text(COL_L + 28, y + 10, anchor="nw", text="\u5f53\u524d\u8def\u7531",
+                      font=self._fonts["font_tiny"], fill=Theme.text_muted)
+        display_name = self._truncate(str(hero_name), "font_hero", metric_l - COL_L - 42)
+        c.create_text(COL_L + 14, y + 29, anchor="nw", text=display_name,
+                      font=self._fonts["font_hero"], fill=Theme.text_primary)
+        c.create_text(COL_L + 14, y + 52, anchor="nw", text=hero_sub,
+                      font=self._fonts["font_tiny"], fill=hero_color)
+        if display_name != str(hero_name):
+            self._add_tooltip(COL_L + 14, y + 27, metric_l - 8, y + 48, str(hero_name))
+        c.create_line(metric_l, y + 13, metric_l, y + 59, fill=Theme.ag_divider, width=1)
+        source_label = "LOCAL" if self.state and self.state.client_usage else str(
+            self.state.source_label if self.state else "WAIT"
+        ).upper()
+        c.create_text(COL_R - 12, y + 9, anchor="ne",
+                      text=self._truncate(source_label, "font_data", 54),
+                      font=self._fonts["font_data"], fill=Theme.data)
+        c.create_text(COL_R - 12, y + 28, anchor="ne", text=compact_number(total_current),
+                      font=self._fonts["font_value_sm"], fill=Theme.text_primary)
+        c.create_text(COL_R - 12, y + 51, anchor="ne", text="\u5e76\u53d1",
+                      font=self._fonts["font_tiny"], fill=Theme.text_muted)
         y += 82
 
         # ════════════════════════════════════════════════════════
@@ -3780,14 +4010,20 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         section_y = y
         c.create_text(COL_L, section_y, anchor="nw", text="\u5f53\u524d\u6d3b\u8dc3",
-                      font=self._fonts["font_section"], fill=Theme.amber)
+                      font=self._fonts["font_section"], fill=Theme.text_primary)
 
         y += 24
         active_row_h = 26
+        default_height = int(type(self).HEIGHT)
+        base_capacity = 1 + max(
+            0,
+            (min(H, default_height) - 700) // active_row_h,
+        )
         active_capacity = balanced_active_row_capacity(
             H,
-            int(type(self).HEIGHT),
+            default_height,
             active_row_h,
+            base_rows=base_capacity,
         )
         visible_active_rows = min(len(accounts), active_capacity)
         max_active_start = max(0, len(accounts) - visible_active_rows)
@@ -3868,9 +4104,9 @@ class FloatingMonitorApp:
         #  LATEST REQUEST
         # ════════════════════════════════════════════════════════
         y += 10
-        c.create_text(COL_L, y, anchor="nw", text="\u6700\u8fd1\u8bf7\u6c42",
-                       font=self._fonts["font_section"], fill=Theme.amber)
-        y += 22
+        y = self._draw_section_label(COL_L, COL_R, y, "\u6700\u8fd1\u8bf7\u6c42")
+        request_h = 52
+        self._draw_panel(COL_L, y, COL_R, y + request_h, fill=Theme.ag_surface, radius=7)
 
         if self.state and self.state.latest_request:
             req = self.state.latest_request
@@ -3884,55 +4120,60 @@ class FloatingMonitorApp:
             status_text = "\u9519\u8bef" if kind == "error" else ("\u6210\u529f" if kind else "-")
             status_color = Theme.accent_red if kind == "error" else Theme.accent_green
 
-            label_pairs = [
-                ("\u8d26\u53f7", self._truncate(acct, "font_label", 200)),
-                ("\u72b6\u6001", status_text),
-                ("\u6a21\u578b", model),
-                ("\u65f6\u95f4", relative_time(created) if created else "-"),
-            ]
-            for lbl, val in label_pairs:
-                c.create_text(COL_L + 8, y, anchor="nw", text=lbl,
-                               font=self._fonts["font_tiny"], fill=Theme.text_muted)
-                value_color = status_color if lbl == "\u72b6\u6001" else (Theme.cyan if lbl == "\u6a21\u578b" else Theme.text_primary)
-                c.create_text(COL_L + 64, y, anchor="nw",
-                               text=self._truncate(val, "font_label", COL_R - COL_L - 72),
-                               font=self._fonts["font_label"], fill=value_color)
-                y += 19
+            status_w = self._text_width(status_text, "font_tiny") + 22
+            status_x = COL_R - status_w - 9
+            self._draw_rounded_rect(status_x, y + 8, COL_R - 9, y + 27, r=6,
+                                    fill=Theme.bg_dark, outline=Theme.border)
+            c.create_oval(status_x + 7, y + 14, status_x + 13, y + 20,
+                          fill=status_color, outline="")
+            c.create_text(status_x + 17, y + 11, anchor="nw", text=status_text,
+                          font=self._fonts["font_tiny"], fill=status_color)
+            account_text = self._truncate(acct, "font_label_bold", status_x - COL_L - 24)
+            c.create_text(COL_L + 10, y + 9, anchor="nw", text=account_text,
+                          font=self._fonts["font_label_bold"], fill=Theme.text_primary)
+            if account_text != acct:
+                self._add_tooltip(COL_L + 10, y + 7, status_x - 6, y + 27, acct)
+            c.create_text(COL_L + 10, y + 32, anchor="nw", text="MODEL",
+                          font=self._fonts["font_data"], fill=Theme.text_muted)
+            c.create_text(COL_L + 54, y + 31, anchor="nw",
+                          text=self._truncate(model, "font_data", COL_R - COL_L - 142),
+                          font=self._fonts["font_data"], fill=Theme.data)
+            c.create_text(COL_R - 10, y + 31, anchor="ne",
+                          text=relative_time(created) if created else "-",
+                          font=self._fonts["font_tiny"], fill=Theme.text_muted)
         else:
-            c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u6700\u8fd1\u8bf7\u6c42" if self._loading or not self.state else "\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55"),
-                           font=self._fonts["font_label"], fill=Theme.text_muted)
-            y += 22
+            empty_request = (
+                "\u6b63\u5728\u8bfb\u53d6\u6700\u8fd1\u8bf7\u6c42"
+                if self._loading or not self.state
+                else "\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55"
+            )
+            c.create_text(COL_L + 10, y + 17, anchor="nw", text=empty_request,
+                          font=self._fonts["font_label"], fill=Theme.text_muted)
 
-        y += 4
+        y += request_h + 8
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
         #  TODAY STATS
         # ════════════════════════════════════════════════════════
         y += 10
-        c.create_text(COL_L, y, anchor="nw", text="\u4eca\u65e5\u7edf\u8ba1",
-                       font=self._fonts["font_section"], fill=Theme.amber)
+        source_text = ""
         if self.state and self.state.client_usage:
             client_tokens = int(self.state.client_usage.get("tokens") or 0)
             client_requests = int(self.state.client_usage.get("requests") or 0)
             if client_tokens or client_requests:
                 source_text = f"\u672c\u5730\u603b\u91cf {compact_number(client_tokens)} tok"
-                c.create_text(COL_R, y + 1, anchor="ne", text=source_text,
-                               font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         elif self.state and self.state.usage_note:
-            c.create_text(COL_R, y + 1, anchor="ne",
-                           text=self._truncate(self.state.usage_note, "font_tiny", 180),
-                           font=self._fonts["font_tiny"], fill=Theme.text_secondary)
-        y += 24
+            source_text = self._truncate(self.state.usage_note, "font_tiny", 180)
+        y = self._draw_section_label(COL_L, COL_R, y, "\u4eca\u65e5\u6982\u89c8", source_text)
 
         stats = [
             ("\u8bf7\u6c42", compact_number(self.state.today_requests) if self.state else "0", Theme.amber_bright),
             ("Token", compact_number(self.state.today_tokens) if self.state else "0", Theme.cyan),
-            ("\u6210\u672c", money(self.state.today_account_cost) if self.state else "$0", Theme.violet),
+            ("\u6210\u672c", money(self.state.today_account_cost) if self.state else "$0", Theme.warn),
         ]
         col_w = (COL_R - COL_L) // 3
-        self._draw_rounded_rect(COL_L, y - 5, COL_R, y + 43, r=8,
-                                fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_panel(COL_L, y - 5, COL_R, y + 43, fill=Theme.ag_surface, radius=7)
         for i, (lbl, val, color) in enumerate(stats):
             cx = COL_L + col_w * i + col_w // 2
             if i:
@@ -3947,13 +4188,14 @@ class FloatingMonitorApp:
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         y += 10
-        c.create_text(COL_L, y, anchor="nw", text="Token \u8d8b\u52bf",
-                       font=self._fonts["font_section"], fill=Theme.amber)
         history = (self.state.cost_history if self.state else None) or summarize_trend_rows([])
-        c.create_text(COL_R, y + 1, anchor="ne",
-                       text=f"7\u65e5 {compact_number(history.get('seven_day_tokens', 0))} tok",
-                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
-        y += 22
+        y = self._draw_section_label(
+            COL_L,
+            COL_R,
+            y,
+            "Token \u8d8b\u52bf",
+            f"7D  {compact_number(history.get('seven_day_tokens', 0))} TOK",
+        )
         cost_stats = [
             ("\u4eca\u65e5", f"{compact_number(history.get('today_tokens', 0))} tok", Theme.ag_accent),
             ("\u6628\u65e5", f"{compact_number(history.get('yesterday_tokens', 0))} tok", Theme.ag_success),
@@ -4056,32 +4298,36 @@ class FloatingMonitorApp:
 
         y += 9
         c.create_text(COL_L, y + 2, anchor="nw", text="\u8d26\u53f7\u7528\u91cf",
-                       font=self._fonts["font_section"], fill=Theme.amber)
+                       font=self._fonts["font_section"], fill=Theme.text_primary)
         c.create_text(COL_L + 67, y + 5, anchor="nw", text=f"{len(top)} \u4e2a\u8d26\u53f7",
                       font=self._fonts["font_micro"], fill=Theme.text_muted)
 
         tab_specs = [
             ("rank_today", "\u4eca\u65e5", "today"),
-            ("rank_5h", "5h \u5468\u671f", "5h"),
-            ("rank_7d", "7d \u5468\u671f", "7d"),
-            ("rank_30d", "\u8fd1 30 \u5929", "30d"),
+            ("rank_5h", "5h", "5h"),
+            ("rank_7d", "7d", "7d"),
+            ("rank_30d", "30d", "30d"),
         ]
-        tab_w = 52
+        tab_w = 44
         tab_gap = 3
         tab_h = 21
         tabs_x = COL_R - (tab_w * len(tab_specs) + tab_gap * (len(tab_specs) - 1))
+        self._draw_rounded_rect(tabs_x - 3, y - 3, COL_R + 3, y + tab_h,
+                                r=7, fill=Theme.ag_bg, outline=Theme.border)
         for tab_index, (button_name, label, value) in enumerate(tab_specs):
             x1 = tabs_x + tab_index * (tab_w + tab_gap)
             x2 = x1 + tab_w
             self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
             selected = self._account_range == value
             hovered = self._hover_btn == button_name
-            fill = Theme.bg_hover if selected else (Theme.ag_surface_hover if hovered else Theme.ag_surface)
-            outline = Theme.bg_hover if selected else Theme.ag_border
-            text_color = Theme.text_primary if selected else (Theme.text_primary if hovered else Theme.ag_muted)
-            self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=6, fill=fill, outline=outline, width=1)
+            fill = Theme.bg_lift if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            text_color = Theme.text_primary if selected or hovered else Theme.ag_muted
+            self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=5, fill=fill, outline="")
+            if selected:
+                c.create_line(x1 + 9, y + tab_h - 1, x2 - 9, y + tab_h - 1,
+                              fill=Theme.data, width=2)
             c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
-                          font=self._fonts["font_micro"], fill=text_color)
+                          font=self._fonts["font_tiny"], fill=text_color)
         y += 27
         rank_list_top = y
 
@@ -4093,7 +4339,7 @@ class FloatingMonitorApp:
             c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
         window_mode = self._account_range in {"5h", "7d"}
-        row_h = 64 if window_mode else 39
+        row_h = self._account_rank_row_height()
         available_rank_rows = max(1, (H - 44 - y) // row_h)
         max_start_index = max(0, len(top) - available_rank_rows)
         max_scroll = max_start_index * row_h
@@ -4269,7 +4515,8 @@ class FloatingMonitorApp:
                 if reset_text:
                     c.create_text(COL_R - 4, y + 33, anchor="ne", text=reset_text,
                                   font=self._fonts["font_micro"], fill=Theme.text_muted)
-                c.create_line(COL_L + 8, y + 48, COL_R - 4, y + 48, fill=Theme.border, width=1)
+                divider_y = y + min(48, row_h - 5)
+                c.create_line(COL_L + 8, divider_y, COL_R - 4, divider_y, fill=Theme.border, width=1)
             else:
                 cost_w = self._text_width(cost, "font_label_bold")
                 c.create_text(COL_R - 4, y, anchor="ne", text=cost,
@@ -4361,7 +4608,7 @@ class FloatingMonitorApp:
 
     def _hit_button(self, x: int, y: int) -> str | None:
         for name, (x1, y1, x2, y2) in self._btn_rects.items():
-            if name.startswith("main_") and x1 - 6 <= x <= x2 + 6 and y1 - 8 <= y <= y2 + 8:
+            if name.startswith("main_") and x1 <= x <= x2 and y1 - 8 <= y <= y2 + 8:
                 return name
             if x1 <= x <= x2 and y1 <= y <= y2:
                 return name
@@ -4560,7 +4807,7 @@ class FloatingMonitorApp:
             return
         current = int(self._scroll_offsets.get(tab, 0) or 0)
         if tab == "accounts":
-            step = 64 if self._account_range in {"5h", "7d"} else 39
+            step = self._account_rank_row_height()
         else:
             step = 48
         self._scroll_offsets[tab] = max(0, min(limit, current + delta * step))
