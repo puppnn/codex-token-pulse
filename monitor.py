@@ -2947,17 +2947,14 @@ class FloatingMonitorApp:
                 return text
         return ""
 
-    def _draw_tooltip(self, W: int, H: int) -> None:
-        if not self._tooltip_text:
-            return
-        font = self._fonts["font_micro"]
-        max_text_width = max(80, W - 34)
+    @staticmethod
+    def _wrap_tooltip_lines(text: str, font: Any, max_text_width: int, max_lines: int = 4) -> list[str]:
         lines: list[str] = []
         truncated = False
-        raw_lines = self._tooltip_text.splitlines() or [self._tooltip_text]
+        raw_lines = text.splitlines() or [text]
         for raw_index, raw_line in enumerate(raw_lines):
             remaining = raw_line or " "
-            while remaining and len(lines) < 3:
+            while remaining and len(lines) < max_lines:
                 if font.measure(remaining) <= max_text_width:
                     lines.append(remaining)
                     remaining = ""
@@ -2972,16 +2969,24 @@ class FloatingMonitorApp:
                 split_at = max(1, low)
                 lines.append(remaining[:split_at])
                 remaining = remaining[split_at:]
-            if remaining or (len(lines) >= 3 and raw_index < len(raw_lines) - 1):
+            if remaining or (len(lines) >= max_lines and raw_index < len(raw_lines) - 1):
                 truncated = True
                 break
-        if not lines:
-            return
         if truncated:
             last_line = lines[-1]
             while last_line and font.measure(last_line + "...") > max_text_width:
                 last_line = last_line[:-1]
             lines[-1] = last_line + "..."
+        return lines
+
+    def _draw_tooltip(self, W: int, H: int) -> None:
+        if not self._tooltip_text:
+            return
+        font = self._fonts["font_micro"]
+        max_text_width = max(80, W - 34)
+        lines = self._wrap_tooltip_lines(self._tooltip_text, font, max_text_width)
+        if not lines:
+            return
         width = min(W - 16, max(font.measure(line) for line in lines) + 18)
         height = 18 * len(lines) + 8
         x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
@@ -3578,7 +3583,7 @@ class FloatingMonitorApp:
                 col = index % cols
                 tokens = float(item.get("tokens") or 0)
                 intensity = min(1.0, tokens / max_tokens) if tokens > 0 else 0.0
-                failed = bool(item.get("failure")) and tokens <= 0
+                failed = bool(item.get("failure"))
                 x1 = grid_x + col * (cell + cell_gap)
                 y1 = grid_y + row * (cell + cell_gap)
                 fill = Theme.ag_crit if failed else self._activity_color(intensity)
