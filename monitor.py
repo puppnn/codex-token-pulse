@@ -3732,6 +3732,7 @@ class Theme:
     font_label_bold = ("Microsoft YaHei UI", 9, "bold")
     font_value = ("Bahnschrift", 19, "bold")
     font_value_sm = ("Bahnschrift", 14, "bold")
+    font_value_xs = ("Bahnschrift", 12, "bold")
     font_tiny = ("Microsoft YaHei UI", 8, "normal")
     font_micro = ("Microsoft YaHei UI", 8, "normal")
     font_data = ("Cascadia Mono", 8, "normal")
@@ -3916,7 +3917,7 @@ class FloatingMonitorApp:
                     if not resolved_family:
                         if attr == "font_data":
                             fallback_names = ("Consolas", "Segoe UI")
-                        elif attr in {"font_title", "font_value", "font_value_sm"}:
+                        elif attr in {"font_title", "font_value", "font_value_sm", "font_value_xs"}:
                             fallback_names = ("Segoe UI Variable", "Segoe UI")
                         else:
                             fallback_names = ("Segoe UI Variable", "Segoe UI")
@@ -6336,21 +6337,23 @@ class FloatingMonitorApp:
         if display_name != str(hero_name):
             self._add_tooltip(COL_L + 14, y + 27, metric_l - 8, y + 48, str(hero_name))
         c.create_line(metric_l, y + 13, metric_l, y + 59, fill=Theme.ag_divider, width=1)
-        source_label = (
-            hero_type
-            if accounts and hero_type
-            else (
+        metric_x = (metric_l + COL_R) // 2
+        metric_value_y = y + 17
+        metric_label_y = y + 44
+        if not accounts:
+            source_label = (
                 "DIRECT"
                 if self.state and self.state.client_usage
                 else str(self.state.source_label if self.state else "WAIT").upper()
             )
-        )
-        c.create_text(COL_R - 12, y + 9, anchor="ne",
-                      text=self._truncate(source_label, "font_data", 54),
-                      font=self._fonts["font_data"], fill=Theme.data)
-        c.create_text(COL_R - 12, y + 28, anchor="ne", text=compact_number(total_current),
+            c.create_text(metric_x, y + 9, anchor="n",
+                          text=self._truncate(source_label, "font_data", 54),
+                          font=self._fonts["font_data"], fill=Theme.data)
+            metric_value_y = y + 28
+            metric_label_y = y + 51
+        c.create_text(metric_x, metric_value_y, anchor="n", text=compact_number(total_current),
                       font=self._fonts["font_value_sm"], fill=Theme.text_primary)
-        c.create_text(COL_R - 12, y + 51, anchor="ne", text="\u5e76\u53d1",
+        c.create_text(metric_x, metric_label_y, anchor="n", text="\u5e76\u53d1",
                       font=self._fonts["font_tiny"], fill=Theme.text_muted)
         y += 82
 
@@ -6550,17 +6553,42 @@ class FloatingMonitorApp:
                 f"\u4eca\u65e5\u6210\u672c\n{money(today_cost)}",
             ),
         ]
-        col_w = (COL_R - COL_L) // 3
+        overview_width = COL_R - COL_L
+        column_edges = (
+            COL_L,
+            COL_L + round(overview_width * 0.29),
+            COL_L + round(overview_width * 0.64),
+            COL_R,
+        )
+        col_w = overview_width // 3
         self._draw_panel(COL_L, y - 5, COL_R, y + 43, fill=Theme.ag_surface, radius=7)
         for i, (lbl, val, color, tooltip) in enumerate(stats):
-            stat_x1 = COL_L + col_w * i
-            stat_x2 = COL_R if i == len(stats) - 1 else stat_x1 + col_w
-            cx = COL_L + col_w * i + col_w // 2
+            stat_x1 = column_edges[i]
+            stat_x2 = column_edges[i + 1]
+            cx = (stat_x1 + stat_x2) // 2
             if i:
-                c.create_line(COL_L + col_w * i, y + 2, COL_L + col_w * i, y + 36,
+                c.create_line(stat_x1, y + 2, stat_x1, y + 36,
                               fill=Theme.ag_divider, width=1)
-            c.create_text(cx, y, anchor="n", text=val,
-                           font=self._fonts["font_value"], fill=color)
+            available_width = max(32, stat_x2 - stat_x1 - 10)
+            display_value = val
+            value_font_key = "font_value_xs"
+            value_width = 0
+            for candidate in ("font_value", "font_value_sm", "font_value_xs"):
+                candidate_width = self._fonts[candidate].measure(display_value)
+                if candidate_width <= available_width:
+                    value_font_key = candidate
+                    value_width = candidate_width
+                    break
+            if value_width <= 0:
+                display_value = self._truncate(
+                    display_value,
+                    value_font_key,
+                    available_width,
+                )
+                value_width = self._fonts[value_font_key].measure(display_value)
+            value_y = y + (3 if value_font_key != "font_value" else 0)
+            c.create_text(cx, value_y, anchor="n", text=display_value,
+                           font=self._fonts[value_font_key], fill=color)
             c.create_text(cx, y + 26, anchor="n", text=lbl,
                            font=self._fonts["font_tiny"], fill=Theme.text_secondary)
             self._add_tooltip(stat_x1, y - 5, stat_x2, y + 43, tooltip)
@@ -6998,7 +7026,7 @@ class FloatingMonitorApp:
         has_recent_samples = bool(getattr(self, "_token_flow_samples", []))
         meter_level = float(getattr(self, "_token_flow_meter_display_level", 0.0))
         meter_animating = self._main_tab == "stats" and meter_level > 0.01
-        badge_animating = (
+        badge_animating = self._main_tab == "stats" and (
             self._token_delta_badge_visual()[2]
             or self._cost_delta_badge_visual()[2]
         )
