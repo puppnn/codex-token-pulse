@@ -14,7 +14,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -996,6 +996,19 @@ def today_key() -> str:
 
 def date_key(days_ago: int) -> str:
     return (datetime.now(CN_TZ).date() - timedelta(days=days_ago)).isoformat()
+
+
+def trend_chart_day_label(date_value: str, index: int, total: int = 7) -> str:
+    """Return a compact, unambiguous label for a daily trend bar."""
+    if index == total - 1:
+        return "今日"
+    if index == total - 2:
+        return "昨日"
+    try:
+        parsed = date.fromisoformat(str(date_value))
+        return f"{parsed.month}/{parsed.day}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def load_usage_history() -> dict[str, Any]:
@@ -6827,7 +6840,7 @@ class FloatingMonitorApp:
         history = (self.state.cost_history if self.state else None) or summarize_trend_rows([])
         seven_day_tokens = float(history.get("seven_day_tokens") or 0)
         trend_header_y = y
-        trend_meta = f"7D  {compact_number(seven_day_tokens)} TOK"
+        trend_meta = f"近 7 日  {compact_number(seven_day_tokens)} TOK"
         y = self._draw_section_label(
             COL_L,
             COL_R,
@@ -6877,8 +6890,8 @@ class FloatingMonitorApp:
             self._add_tooltip(metric_x1, y - 3, metric_x2, y + 38, tooltip)
         series = history.get("series") if isinstance(history, dict) else []
         if isinstance(series, list) and series:
-            bar_y = y + 42
-            bar_h = 22
+            bar_y = y + 40
+            bar_h = 34
             gap = 5
             bar_w = max(8, int((COL_R - COL_L - gap * 6) / 7))
             max_cost = max([float(item.get("tokens") or 0) for item in series if isinstance(item, dict)], default=0) or 1
@@ -6891,14 +6904,22 @@ class FloatingMonitorApp:
                 self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill=Theme.ag_bg, outline="")
                 color = self._trend_token_color(intensity, index == 6)
                 self._draw_rounded_rect(x1, bar_y + bar_h - fill_h, x2, bar_y + bar_h, r=3, fill=color, outline="")
+                c.create_text(
+                    (x1 + x2) / 2,
+                    bar_y + bar_h + 4,
+                    anchor="n",
+                    text=trend_chart_day_label(str(item.get("date") or ""), index, min(7, len(series))),
+                    font=self._fonts["font_micro"],
+                    fill=color if index >= 5 else Theme.text_muted,
+                )
                 self._add_tooltip(
                     x1,
                     bar_y,
                     x2,
-                    bar_y + bar_h,
+                    bar_y + bar_h + 18,
                     f"{item.get('date', '-')}\n{exact_token_count(cost)} Token\n{int(item.get('requests') or 0):,} calls · {money(item.get('cost', 0))}",
                 )
-            y += 72
+            y += 94
         else:
             y += 46
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
