@@ -5323,8 +5323,30 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
 
         self.assertEqual(
             targets,
-            [date(2026, 7, 10), date(2026, 7, 11), date(2026, 7, 12)],
+            [
+                date(2026, 7, 6),
+                date(2026, 7, 7),
+                date(2026, 7, 8),
+                date(2026, 7, 9),
+                date(2026, 7, 10),
+                date(2026, 7, 11),
+                date(2026, 7, 12),
+            ],
         )
+
+    def test_reconcile_backfills_missing_days_before_first_saved_chart_row(self) -> None:
+        now = datetime(2026, 7, 15, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                "2026-07-14": self.history_row(date(2026, 7, 14), 100),
+            },
+        }
+
+        targets = client_usage_export.offline_history_dates_to_reconcile(history, now)
+
+        self.assertIn(date(2026, 7, 13), targets)
+        self.assertEqual(targets[0], date(2026, 7, 8))
 
     def test_reconcile_does_not_rescan_last_day_after_today_success(self) -> None:
         last_day = date(2026, 7, 12)
@@ -5346,7 +5368,18 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
             max_days=31,
         )
 
-        self.assertEqual(targets, [])
+        self.assertEqual(
+            targets,
+            [
+                date(2026, 7, 6),
+                date(2026, 7, 7),
+                date(2026, 7, 8),
+                date(2026, 7, 9),
+                date(2026, 7, 10),
+                date(2026, 7, 11),
+            ],
+        )
+        self.assertNotIn(last_day, targets)
 
     def test_reconcile_never_reduces_existing_high_water(self) -> None:
         day = date(2026, 7, 10)

@@ -4182,6 +4182,18 @@ def offline_history_dates_to_reconcile(
             if cursor.isoformat() not in days:
                 targets.add(cursor)
             cursor += timedelta(days=1)
+
+    # The floating monitor always renders a seven-day chart. A history file can
+    # be created after local logs already exist, so looking only forward from
+    # the earliest persisted row leaves older chart slots permanently empty.
+    # Reconcile every missing closed day in the visible chart window once;
+    # zero-usage rows are persisted too, preventing repeated scans.
+    chart_floor = max(floor, today - timedelta(days=7))
+    cursor = chart_floor
+    while cursor <= last_complete_day:
+        if cursor.isoformat() not in days:
+            targets.add(cursor)
+        cursor += timedelta(days=1)
     return sorted(day for day in targets if floor <= day < today)
 
 
