@@ -1727,6 +1727,74 @@ class LatestRequestFallbackTests(unittest.TestCase):
 
         self.assertEqual(label, "Codex local - midnight@example.com")
 
+    def test_api_service_time_index_preserves_fuzzy_match_result(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 0, 0, 21, 677000),
+            model="gpt-test",
+            input_tokens=1_032,
+            cached_tokens=205_568,
+            output_tokens=41,
+            session_id="indexed-session",
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=event.when - timedelta(hours=3) + timedelta(seconds=index),
+                label=f"Codex local - distractor-{index}@example.com",
+                total_tokens=event.total_tokens + 100,
+            )
+            for index in range(200)
+        ]
+        expected = client_usage_export.AccountMarker(
+            when=event.when + timedelta(seconds=9),
+            label="Codex local - indexed@example.com",
+            total_tokens=event.total_tokens + 100,
+        )
+        markers.insert(75, expected)
+
+        legacy = client_usage_export.concrete_api_service_account_marker(
+            event,
+            markers,
+        )
+        indexed = client_usage_export.concrete_api_service_account_marker(
+            event,
+            markers,
+            client_usage_export.account_markers_by_total_tokens(markers),
+        )
+
+        self.assertIs(legacy, expected)
+        self.assertIs(indexed, expected)
+
+    def test_api_service_time_index_matches_brute_force_across_many_events(self) -> None:
+        base = datetime(2026, 7, 12, 12, 0, 0)
+        markers = [
+            client_usage_export.AccountMarker(
+                when=base + timedelta(seconds=index * 3 - 450),
+                label=f"Codex local - account-{index}@example.com",
+                total_tokens=20_000 + (index % 19) * 137,
+            )
+            for index in range(300)
+        ]
+        marker_index = client_usage_export.account_markers_by_total_tokens(markers)
+        for index in range(120):
+            total_tokens = 20_000 + (index % 23) * 131
+            event = client_usage_export.UsageEvent(
+                when=base + timedelta(seconds=index * 5 - 300),
+                model="gpt-test",
+                input_tokens=total_tokens - 1,
+                cached_tokens=0,
+                output_tokens=1,
+            )
+            brute = client_usage_export.concrete_api_service_account_marker(
+                event,
+                markers,
+            )
+            indexed = client_usage_export.concrete_api_service_account_marker(
+                event,
+                markers,
+                marker_index,
+            )
+            self.assertIs(indexed, brute)
+
     def test_api_service_latest_request_reuses_confirmed_session_account(self) -> None:
         event = client_usage_export.UsageEvent(
             when=datetime(2026, 7, 11, 21, 0, 0),
@@ -3156,6 +3224,170 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(result[label]["window_rolling_7d"]["tokens"], 66_000_000)
 
 
+class CodexEventRowCacheTests(unittest.TestCase):
+    @staticmethod
+    def token_row(timestamp: str, total_tokens: int, cumulative_tokens: int) -> dict:
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": total_tokens - 10,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "total_tokens": total_tokens,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": cumulative_tokens - 10,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "total_tokens": cumulative_tokens,
+                    },
+                },
+            },
+        }
+
+    def test_persistent_cache_reuses_unchanged_rows_and_reads_only_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            cache_path = root / "events-cache.json"
+            rows = [
+                {"type": "session_meta", "payload": {"id": "session"}},
+                {
+                    "type": "response_item",
+                    "payload": {"text": "conversation text must not be cached"},
+                },
+                self.token_row("2026-07-15T10:00:00Z", 50, 50),
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"CLIENT_USAGE_CODEX_EVENT_CACHE": str(cache_path)},
+            ):
+                first = client_usage_export.CodexEventRowCache(cache_path)
+                cached_rows = first.rows_for_path(path)
+                self.assertEqual(len(cached_rows), 2)
+                self.assertNotIn("response_item", {row["type"] for row in cached_rows})
+                first.flush()
+
+                second = client_usage_export.CodexEventRowCache(cache_path)
+                with patch.object(
+                    second,
+                    "_read_complete_rows",
+                    wraps=second._read_complete_rows,
+                ) as read_rows:
+                    self.assertEqual(len(second.rows_for_path(path)), 2)
+                read_rows.assert_not_called()
+
+                old_size = path.stat().st_size
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(self.token_row("2026-07-15T10:00:01Z", 75, 125))
+                        + "\n"
+                    )
+                with patch.object(
+                    second,
+                    "_read_complete_rows",
+                    wraps=second._read_complete_rows,
+                ) as read_rows:
+                    cached_rows = second.rows_for_path(path)
+                self.assertEqual(len(cached_rows), 3)
+                self.assertEqual(read_rows.call_args.args[1], old_size)
+
+    def test_incomplete_last_json_row_is_retried_after_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            cache = client_usage_export.CodexEventRowCache(root / "cache.json")
+            path.write_text(
+                '{"type":"session_meta","payload":{"id":"session"}}\n'
+                '{"type":"event_msg","payload":',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(len(cache.rows_for_path(path)), 1)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    '{"type":"token_count","info":{"last_token_usage":'
+                    '{"input_tokens":40,"cached_input_tokens":0,'
+                    '"output_tokens":10,"total_tokens":50}}}}\n'
+                )
+
+            rows = cache.rows_for_path(path)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[-1]["payload"]["type"], "token_count")
+
+    def test_truncated_file_discards_cached_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            cache = client_usage_export.CodexEventRowCache(root / "cache.json")
+            path.write_text(
+                json.dumps(self.token_row("2026-07-15T10:00:00Z", 500, 500)) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(len(cache.rows_for_path(path)), 1)
+
+            path.write_text(
+                json.dumps(self.token_row("2026-07-15T10:00:01Z", 25, 25)) + "\n",
+                encoding="utf-8",
+            )
+            rows = cache.rows_for_path(path)
+
+            usage = rows[0]["payload"]["info"]["last_token_usage"]
+            self.assertEqual(usage["total_tokens"], 25)
+
+    def test_state_database_indexes_sessions_but_not_archived_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_root = Path(directory) / ".codex"
+            sessions_root = codex_root / "sessions"
+            session_path = sessions_root / "2026" / "07" / "15" / (
+                "rollout-2026-07-15T10-00-00-"
+                "019f54a2-9034-7651-a517-89989e6d6b1b.jsonl"
+            )
+            archived_path = codex_root / "archived_sessions" / (
+                "rollout-2026-07-15T09-00-00-"
+                "019f54a2-9034-7651-a517-89989e6d6b1c.jsonl"
+            )
+            session_path.parent.mkdir(parents=True)
+            archived_path.parent.mkdir(parents=True)
+            session_path.write_text("{}\n", encoding="utf-8")
+            archived_path.write_text("{}\n", encoding="utf-8")
+            database = codex_root / "state_5.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at_ms INTEGER)"
+            )
+            now_ms = int(datetime.now().timestamp() * 1000)
+            connection.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?)",
+                (
+                    (
+                        "session",
+                        f"\\\\?\\{session_path}" if os.name == "nt" else str(session_path),
+                        now_ms,
+                    ),
+                    ("archived", str(archived_path), now_ms),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            paths, available = client_usage_export.codex_state_rollout_paths(
+                sessions_root,
+                datetime.now() - timedelta(hours=1),
+            )
+
+            self.assertTrue(available)
+            self.assertEqual(paths, [session_path.resolve()])
+
+
 class CodexUsageFileWatcherTests(unittest.TestCase):
     @staticmethod
     def append_text(path: Path, text: str) -> None:
@@ -3378,6 +3610,82 @@ class CodexUsageFileWatcherTests(unittest.TestCase):
                 len(data),
                 monitor.LIVE_USAGE_WATCH_OVERLAP_BYTES + (end - start),
             )
+
+    def test_windows_notification_buffer_decodes_relative_jsonl_paths(self) -> None:
+        def record(name: str, *, last: bool) -> bytes:
+            encoded = name.encode("utf-16-le")
+            length = 12 + len(encoded)
+            padded = (length + 3) & ~3
+            next_offset = 0 if last else padded
+            return (
+                next_offset.to_bytes(4, "little")
+                + (3).to_bytes(4, "little")
+                + len(encoded).to_bytes(4, "little")
+                + encoded
+                + b"\x00" * (padded - length)
+            )
+
+        data = record("2026\\07\\15\\rollout-a.jsonl", last=False) + record(
+            "2026\\07\\15\\rollout-b.jsonl",
+            last=True,
+        )
+
+        self.assertEqual(
+            monitor.WindowsDirectoryChangeSignal._decode_paths(data),
+            [
+                "2026\\07\\15\\rollout-a.jsonl",
+                "2026\\07\\15\\rollout-b.jsonl",
+            ],
+        )
+
+    def test_native_change_signal_feeds_existing_incremental_parser(self) -> None:
+        class FakeSignal:
+            def __init__(self, path: Path) -> None:
+                self.path = path
+
+            def drain(self) -> tuple[set[Path], bool]:
+                path, self.path = self.path, Path()
+                return ({path} if str(path) != "." else set()), False
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+            path.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll_events()
+            watcher._hot_files.clear()
+            watcher._last_full_scan_at = monitor.time.monotonic()
+            token_row = {
+                "timestamp": "2026-07-15T10:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 40,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 10,
+                            "total_tokens": 50,
+                        }
+                    },
+                },
+            }
+            self.append_text(path, json.dumps(token_row) + "\n")
+            watcher._directory_changes = FakeSignal(path)
+
+            with patch.object(watcher, "_discover_recent_paths", return_value=set()), patch.object(
+                watcher,
+                "_full_scan_paths",
+                wraps=watcher._full_scan_paths,
+            ) as full_scan:
+                events = watcher.poll_events()
+
+            full_scan.assert_not_called()
+            self.assertEqual([event["total_tokens"] for event in events], [50])
+            watcher.close()
 
     def test_hot_poll_does_not_repeat_the_full_directory_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

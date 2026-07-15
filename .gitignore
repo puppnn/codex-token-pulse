@@ -15,6 +15,7 @@ client_usage_attribution_ledger.json
 client_usage_route_labels.json
 client_usage_model_prices.json
 client_usage_official_quota_cache.json
+client_usage_codex_event_cache.json
 usage_history.json
 .venv/
 venv/

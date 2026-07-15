@@ -23,7 +23,8 @@
 - 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
 - 两个中文页签：`账号`、`用量统计`。
 - 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
-- 实时用量刷新：后台以冷热双层轮询观察 Codex 会话日志，活跃时只快速检查少量热文件，空闲后自动降频，并用低频全目录扫描补漏；发现新的 `token_count` 后先即时更新界面，再由完整导出结果校正。
+- 实时用量刷新：Windows 下优先使用系统目录变更通知定位发生变化的 Codex 会话日志，并由冷热双层轮询消费事件；空闲后自动降频，每 30 秒全目录扫描补漏。发现新的 `token_count` 后先即时更新界面，再由完整导出结果校正。
+- 增量日志缓存：通过 `state_5.sqlite` 的 `rollout_path` 定位原有 sessions 范围内的候选文件；只缓存统计所需的 session 元数据、模型上下文、生命周期和 Token 事件，不保存对话正文。文件追加时从上次偏移继续，半条 JSON 等待写完整，文件截断或重写时自动重建。
 - Token 流量脉冲：账号页将每个新增 `token_count` 绘制为从左向右移动的心电图脉冲，Token 越多波峰越高，约 10 秒走完整条轨迹；用量统计页使用单列分段流量柱，柱身保持亮色，仅柱顶约 8 像素渐变并以约 60 FPS 连续升降。两处均展示最近 10 秒 Token 流量。
 - 账号排行：按今日、5h额度、7d额度、30d查看账号用量与额度状态；“额度”命名用于和用量统计中的滚动时间范围区分。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
@@ -137,6 +138,8 @@ SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS=90
 TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS=100
 TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS=250
 TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS=500
+TOKEN_PULSE_NATIVE_FILE_WATCH=auto
+TOKEN_PULSE_LIVE_USAGE_FULL_SCAN_SECONDS=30
 TOKEN_PULSE_LIVE_VERIFY_THRESHOLD_TOKENS=50000000
 TOKEN_PULSE_LIVE_VERIFY_WINDOW_SECONDS=5
 TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS=30
@@ -145,11 +148,13 @@ SUB2API_INCLUDE_LOCAL_USAGE=false
 SUB2API_MONITOR_USAGE_SOURCE=auto
 ```
 
+本地 JSONL 事件索引默认保存在 `client_usage_codex_event_cache.json`。缓存按文件独立压缩并原子写入，只用于加速重复扫描；删除后会从原始日志自动重建，不会改变 Token、账号归属、模型或成本口径。可通过 `CLIENT_USAGE_CODEX_EVENT_CACHE` 指定位置，通过 `TOKEN_PULSE_NATIVE_FILE_WATCH=0` 关闭 Windows 原生目录通知；关闭后仍使用原有轮询与 30 秒兜底扫描。
+
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
 
 运行过程中，实时增量在 5 秒内累计达到 `TOKEN_PULSE_LIVE_VERIFY_THRESHOLD_TOKENS`（默认 `50,000,000`）时不会立即加入今日总量，而是先触发只读完整扫描；扫描截止时间覆盖这批事件后，才按去重后的权威结果更新。可通过 `TOKEN_PULSE_LIVE_VERIFY_WINDOW_SECONDS` 调整累计窗口。软件刚启动时从历史日志恢复当日用量不经过这项运行期防护，因此不会把正常的启动加载误判为突增。
 
-实时监听采用自适应冷热双层轮询：有日志活动时按 `TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS`（默认 `100` 毫秒）检查最多 16 个热文件；空闲 10 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS`（默认 `250` 毫秒），空闲 60 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS`（默认 `500` 毫秒）。程序每 20 秒只遍历一次完整目录以补充新文件，不重复读取历史日志内容。即时层只在内存中更新顶部 Token/请求总量和今日 Token 构成，不写入 provider、模型、成本、Activity、历史或统计缓存；随后仍由原有后台完整解析、fork replay 去重、账号归属和计费流程生成权威结果。
+实时监听采用 Windows 原生目录通知与自适应冷热轮询协同工作：目录通知直接提供发生变化的 JSONL 路径；有日志活动时按 `TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS`（默认 `100` 毫秒）消费事件，空闲 10 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS`（默认 `250` 毫秒），空闲 60 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS`（默认 `500` 毫秒）。程序每 30 秒遍历一次完整目录补漏。即时层只在内存中更新顶部 Token/请求总量和今日 Token 构成，不写入 provider、模型、成本、Activity、历史或统计缓存；随后仍由原有后台完整解析、fork replay 去重、账号归属和计费流程生成权威结果。
 
 `TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS` 默认为 `30` 秒。活跃会话仍在写日志时，常规完整扫描会暂缓；日志安静达到该时间后再更新账号归属、模型和成本。额度周期变化或完整快照超过 `TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS`（默认 10 分钟）时仍会强制校正一次，悬浮窗上的手动刷新按钮也不受此限制。
 

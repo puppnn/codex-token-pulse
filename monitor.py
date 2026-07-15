@@ -72,7 +72,10 @@ LIVE_USAGE_WATCH_COLD_INTERVAL_MS = max(
 )
 LIVE_USAGE_WATCH_HOT_SECONDS = 10.0
 LIVE_USAGE_WATCH_IDLE_SECONDS = 60.0
-LIVE_USAGE_WATCH_FULL_SCAN_SECONDS = 20.0
+LIVE_USAGE_WATCH_FULL_SCAN_SECONDS = max(
+    5.0,
+    float(os.environ.get("TOKEN_PULSE_LIVE_USAGE_FULL_SCAN_SECONDS", "30")),
+)
 LIVE_USAGE_WATCH_HOT_FILE_LIMIT = 16
 AUTH_SWITCH_WATCH_INTERVAL_MS = max(
     500,
@@ -1506,6 +1509,163 @@ def _live_usage_event_id(
     )
 
 
+class WindowsDirectoryChangeSignal:
+    """Small ReadDirectoryChangesW bridge used only as a change signal."""
+
+    BUFFER_BYTES = 64 * 1024
+    CHANGE_FILTER = 0x00000001 | 0x00000002 | 0x00000008 | 0x00000010 | 0x00000040
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.available = False
+        self._closed = False
+        self._overflow = False
+        self._paths: set[Path] = set()
+        self._lock = threading.Lock()
+        self._handle: int | None = None
+        self._kernel32: Any = None
+        self._thread: threading.Thread | None = None
+        if os.name != "nt" or not root.is_dir():
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = (
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            )
+            kernel32.CreateFileW.restype = ctypes.c_void_p
+            kernel32.ReadDirectoryChangesW.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_bool,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+            kernel32.ReadDirectoryChangesW.restype = ctypes.c_bool
+            kernel32.CancelIoEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+            kernel32.CancelIoEx.restype = ctypes.c_bool
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = ctypes.c_bool
+            handle = kernel32.CreateFileW(
+                str(root),
+                0x0001,
+                0x00000001 | 0x00000002 | 0x00000004,
+                None,
+                3,
+                0x02000000,
+                None,
+            )
+            invalid_handle = ctypes.c_void_p(-1).value
+            if not handle or int(handle) == int(invalid_handle or -1):
+                return
+            self._kernel32 = kernel32
+            self._handle = int(handle)
+            self.available = True
+            self._thread = threading.Thread(
+                target=self._run,
+                name="TokenPulseDirectoryChanges",
+                daemon=True,
+            )
+            self._thread.start()
+        except (AttributeError, OSError, TypeError, ValueError):
+            self.available = False
+
+    @staticmethod
+    def _decode_paths(data: bytes) -> list[str]:
+        names: list[str] = []
+        offset = 0
+        while offset + 12 <= len(data):
+            next_offset = int.from_bytes(data[offset : offset + 4], "little")
+            name_length = int.from_bytes(data[offset + 8 : offset + 12], "little")
+            name_start = offset + 12
+            name_end = name_start + name_length
+            if name_length < 0 or name_end > len(data):
+                break
+            name = data[name_start:name_end].decode("utf-16-le", errors="ignore")
+            if name:
+                names.append(name)
+            if next_offset <= 0:
+                break
+            offset += next_offset
+        return names
+
+    def _mark_overflow(self) -> None:
+        with self._lock:
+            self._overflow = True
+
+    def _run(self) -> None:
+        try:
+            import ctypes
+
+            buffer = ctypes.create_string_buffer(self.BUFFER_BYTES)
+            while not self._closed and self._handle is not None:
+                returned = ctypes.c_uint32(0)
+                ok = self._kernel32.ReadDirectoryChangesW(
+                    ctypes.c_void_p(self._handle),
+                    buffer,
+                    self.BUFFER_BYTES,
+                    True,
+                    self.CHANGE_FILTER,
+                    ctypes.byref(returned),
+                    None,
+                    None,
+                )
+                if not ok:
+                    if not self._closed:
+                        self._mark_overflow()
+                    break
+                if returned.value <= 0:
+                    self._mark_overflow()
+                    continue
+                changed = {
+                    self.root / Path(name)
+                    for name in self._decode_paths(buffer.raw[: returned.value])
+                    if name.lower().endswith(".jsonl")
+                }
+                if changed:
+                    with self._lock:
+                        self._paths.update(changed)
+        except (AttributeError, OSError, TypeError, ValueError):
+            if not self._closed:
+                self._mark_overflow()
+
+    def drain(self) -> tuple[set[Path], bool]:
+        with self._lock:
+            paths = set(self._paths)
+            overflow = self._overflow
+            self._paths.clear()
+            self._overflow = False
+        return paths, overflow
+
+    def close(self) -> None:
+        self._closed = True
+        handle = self._handle
+        self._handle = None
+        if handle is not None and self._kernel32 is not None:
+            try:
+                import ctypes
+
+                native_handle = ctypes.c_void_p(handle)
+                self._kernel32.CancelIoEx(native_handle, None)
+                self._kernel32.CloseHandle(native_handle)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.25)
+        self.available = False
+
+
 class CodexUsageFileWatcher:
     """Detect appended token_count records with hot-file and fallback scans."""
 
@@ -1525,6 +1685,24 @@ class CodexUsageFileWatcher:
         self.reconciliation_needed = False
         self._reconciliation_paths: dict[Path, float] = {}
         self._last_reconciliation_change_at = float("-inf")
+        self._directory_changes: WindowsDirectoryChangeSignal | None = None
+        native_setting = os.environ.get("TOKEN_PULSE_NATIVE_FILE_WATCH", "auto").strip().lower()
+        native_enabled = native_setting not in {"0", "false", "no", "off"}
+        if native_enabled and os.name == "nt":
+            try:
+                sessions_root.resolve().relative_to((Path.home() / ".codex").resolve())
+                is_default_root = True
+            except (OSError, ValueError):
+                is_default_root = native_setting in {"1", "true", "yes", "on"}
+            if is_default_root:
+                signal = WindowsDirectoryChangeSignal(sessions_root)
+                if signal.available:
+                    self._directory_changes = signal
+
+    def close(self) -> None:
+        if self._directory_changes is not None:
+            self._directory_changes.close()
+            self._directory_changes = None
 
     @staticmethod
     def _eligible(path: Path) -> bool:
@@ -1718,9 +1896,18 @@ class CodexUsageFileWatcher:
                 self._reconciliation_paths.pop(watched_path, None)
         activity_detected = False
         paths = set(self._hot_files)
+        native_overflow = False
+        if self._directory_changes is not None:
+            notified_paths, native_overflow = self._directory_changes.drain()
+            paths.update(
+                path
+                for path in notified_paths
+                if self._eligible(path)
+            )
         paths.update(self._discover_recent_paths())
         full_scan_due = (
             not was_primed
+            or native_overflow
             or now - self._last_full_scan_at >= LIVE_USAGE_WATCH_FULL_SCAN_SECONDS
         )
         if full_scan_due:
@@ -8695,6 +8882,9 @@ class FloatingMonitorApp:
     def close_app(self) -> None:
         self.closed = True
         self._persist_live_usage_checkpoint(force=True)
+        live_watcher = getattr(self, "_live_usage_watcher", None)
+        if isinstance(live_watcher, CodexUsageFileWatcher):
+            live_watcher.close()
         for name in (
             "_live_active_executor",
             "_live_usage_executor",

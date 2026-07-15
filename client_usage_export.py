@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+import zlib
 from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -87,6 +90,19 @@ ATTRIBUTION_LEDGER_PATH = Path(os.environ.get("CLIENT_USAGE_ATTRIBUTION_LEDGER")
 USAGE_HISTORY_PATH = Path(os.environ.get("USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
 MODEL_PRICE_CACHE_PATH = Path(
     os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE") or APP_DIR / "client_usage_model_prices.json"
+)
+CODEX_EVENT_CACHE_PATH = Path(
+    os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE")
+    or APP_DIR / "client_usage_codex_event_cache.json"
+)
+CODEX_EVENT_CACHE_SCHEMA = 2
+CODEX_EVENT_CACHE_HASH_BYTES = max(
+    1024,
+    int(os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE_HASH_BYTES", "4096")),
+)
+CODEX_EVENT_CACHE_MAX_ENTRIES = max(
+    128,
+    int(os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE_MAX_ENTRIES", "4096")),
 )
 MODEL_PRICE_SOURCE_URL = os.environ.get(
     "CLIENT_USAGE_MODEL_PRICE_URL",
@@ -922,6 +938,353 @@ CODEX_TOKEN_USAGE_FIELDS = (
     "total_tokens",
 )
 
+CODEX_RELEVANT_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "task_complete",
+        "task_started",
+        "token_count",
+        "turn_aborted",
+        "turn_complete",
+        "turn_started",
+    }
+)
+
+
+def compact_codex_cache_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep only fields needed by the usage scanner; never cache conversation text."""
+    row_type = str(row.get("type") or "")
+    payload = row.get("payload") or {}
+    if row_type == "session_meta":
+        return {
+            "type": row_type,
+            "timestamp": row.get("timestamp"),
+            "payload": {
+                key: payload.get(key)
+                for key in ("id", "session_id", "forked_from_id", "timestamp")
+                if payload.get(key) is not None
+            },
+        }
+    if row_type == "turn_context":
+        compact = {"type": row_type}
+        if row.get("model") is not None:
+            compact["model"] = row.get("model")
+        if payload.get("model") is not None:
+            compact["payload"] = {"model": payload.get("model")}
+        return compact
+    if row_type != "event_msg":
+        return None
+    payload_type = str(payload.get("type") or "")
+    if payload_type not in CODEX_RELEVANT_EVENT_TYPES:
+        return None
+
+    compact_payload: dict[str, Any] = {"type": payload_type}
+    if payload.get("turn_id") is not None:
+        compact_payload["turn_id"] = payload.get("turn_id")
+    if payload.get("model") is not None:
+        compact_payload["model"] = payload.get("model")
+    if payload_type == "token_count":
+        info = payload.get("info") or {}
+        compact_info: dict[str, Any] = {}
+        for key in ("total_token_usage", "last_token_usage"):
+            usage = info.get(key)
+            if isinstance(usage, dict):
+                compact_info[key] = {
+                    field: usage.get(field)
+                    for field in CODEX_TOKEN_USAGE_FIELDS
+                    if usage.get(field) is not None
+                }
+        if compact_info:
+            compact_payload["info"] = compact_info
+    elif payload_type == "error":
+        if payload.get("codex_error_info") is not None:
+            compact_payload["codex_error_info"] = payload.get("codex_error_info")
+    elif isinstance(payload.get("error"), dict):
+        error_info = payload["error"].get("codex_error_info")
+        if error_info is not None:
+            compact_payload["error"] = {"codex_error_info": error_info}
+
+    compact_row: dict[str, Any] = {
+        "type": row_type,
+        "timestamp": row.get("timestamp"),
+        "payload": compact_payload,
+    }
+    if row.get("model") is not None:
+        compact_row["model"] = row.get("model")
+    return compact_row
+
+
+class CodexEventRowCache:
+    """Persistent append-only cache for scanner-relevant JSONL records."""
+
+    def __init__(self, cache_path: Path = CODEX_EVENT_CACHE_PATH) -> None:
+        self.cache_path = cache_path
+        self.entries: dict[str, dict[str, Any]] = {}
+        self._persistent_keys: set[str] = set()
+        self._loaded = False
+        self._dirty = False
+
+    @staticmethod
+    def _key(path: Path) -> str:
+        try:
+            value = str(path.resolve())
+        except OSError:
+            value = str(path)
+        return os.path.normcase(value)
+
+    @staticmethod
+    def _is_default_codex_path(path: Path) -> bool:
+        if os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE"):
+            return True
+        try:
+            path.resolve().relative_to((Path.home() / ".codex").resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if int(payload.get("schema") or 0) != CODEX_EVENT_CACHE_SCHEMA:
+            return
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            return
+        for key, entry in entries.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            if not isinstance(entry.get("rows_zlib"), str):
+                continue
+            self.entries[key] = entry
+        self._persistent_keys.update(self.entries)
+
+    @staticmethod
+    def _entry_rows(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = entry.get("rows")
+        if isinstance(rows, list):
+            return rows
+        encoded = entry.get("rows_zlib")
+        if not isinstance(encoded, str) or not encoded:
+            rows = []
+        else:
+            try:
+                raw = zlib.decompress(base64.b64decode(encoded.encode("ascii")))
+                decoded = json.loads(raw.decode("utf-8"))
+                rows = decoded if isinstance(decoded, list) else []
+            except (ValueError, TypeError, zlib.error, json.JSONDecodeError, UnicodeDecodeError):
+                rows = []
+        entry["rows"] = rows
+        return rows
+
+    @staticmethod
+    def _serialized_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            key: value
+            for key, value in entry.items()
+            if key not in {"rows", "rows_zlib", "_rows_dirty"}
+        }
+        encoded = entry.get("rows_zlib")
+        if not isinstance(encoded, str) or bool(entry.get("_rows_dirty")):
+            raw = json.dumps(
+                CodexEventRowCache._entry_rows(entry),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.b64encode(zlib.compress(raw, level=6)).decode("ascii")
+            entry["rows_zlib"] = encoded
+            entry["_rows_dirty"] = False
+        result["rows_zlib"] = encoded
+        return result
+
+    @staticmethod
+    def _hash_range(path: Path, start: int, length: int) -> str:
+        if length <= 0:
+            return ""
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, int(start)))
+                data = handle.read(max(0, int(length)))
+        except OSError:
+            return ""
+        return hashlib.sha256(data).hexdigest()
+
+    def _append_is_valid(self, path: Path, entry: dict[str, Any], size: int) -> bool:
+        try:
+            old_size = int(entry.get("size") or 0)
+            processed = int(entry.get("processed_length") or 0)
+            head_length = int(entry.get("head_length") or 0)
+            boundary_start = int(entry.get("boundary_start") or 0)
+            boundary_length = int(entry.get("boundary_length") or 0)
+        except (TypeError, ValueError):
+            return False
+        if old_size > size or processed < 0 or processed > old_size:
+            return False
+        if head_length and self._hash_range(path, 0, head_length) != entry.get("head_hash"):
+            return False
+        if (
+            boundary_length
+            and self._hash_range(path, boundary_start, boundary_length)
+            != entry.get("boundary_hash")
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _read_complete_rows(path: Path, start: int, end: int) -> tuple[list[dict[str, Any]], int]:
+        rows: list[dict[str, Any]] = []
+        processed = max(0, int(start))
+        try:
+            with path.open("rb") as handle:
+                handle.seek(processed)
+                while handle.tell() < end:
+                    line_start = handle.tell()
+                    raw_line = handle.readline(max(0, end - line_start))
+                    if not raw_line:
+                        processed = line_start
+                        break
+                    terminated = raw_line.endswith(b"\n")
+                    try:
+                        row = json.loads(raw_line.decode("utf-8", errors="ignore"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        if not terminated:
+                            processed = line_start
+                            break
+                        processed = handle.tell()
+                        continue
+                    processed = handle.tell()
+                    if not isinstance(row, dict):
+                        continue
+                    compact = compact_codex_cache_row(row)
+                    if compact is not None:
+                        rows.append(compact)
+        except OSError:
+            return [], max(0, int(start))
+        return rows, processed
+
+    def rows_for_path(self, path: Path) -> list[dict[str, Any]]:
+        persistent = self._is_default_codex_path(path)
+        if persistent:
+            self._load()
+        key = self._key(path)
+        if persistent:
+            self._persistent_keys.add(key)
+        try:
+            stat = path.stat()
+        except OSError:
+            self.entries.pop(key, None)
+            self._persistent_keys.discard(key)
+            return []
+        size = max(0, int(stat.st_size))
+        modified_ns = int(stat.st_mtime_ns)
+        entry = self.entries.get(key)
+        if (
+            entry is not None
+            and int(entry.get("size") or -1) == size
+            and int(entry.get("mtime_ns") or -1) == modified_ns
+        ):
+            return self._entry_rows(entry)
+
+        append = bool(
+            entry is not None
+            and size > int(entry.get("size") or 0)
+            and self._append_is_valid(path, entry, size)
+        )
+        if append:
+            rows = list(self._entry_rows(entry))
+            start = int(entry.get("processed_length") or 0)
+        else:
+            rows = []
+            start = 0
+        added, processed = self._read_complete_rows(path, start, size)
+        rows.extend(added)
+
+        head_length = min(CODEX_EVENT_CACHE_HASH_BYTES, processed)
+        boundary_start = max(0, processed - CODEX_EVENT_CACHE_HASH_BYTES)
+        boundary_length = max(0, processed - boundary_start)
+        self.entries[key] = {
+            "size": size,
+            "mtime_ns": modified_ns,
+            "processed_length": processed,
+            "head_length": head_length,
+            "head_hash": self._hash_range(path, 0, head_length),
+            "boundary_start": boundary_start,
+            "boundary_length": boundary_length,
+            "boundary_hash": self._hash_range(path, boundary_start, boundary_length),
+            "rows": rows,
+            "_rows_dirty": True,
+        }
+        if persistent:
+            self._dirty = True
+        return rows
+
+    def flush(self) -> None:
+        if not self._dirty or not self._persistent_keys:
+            return
+        keys = sorted(
+            (key for key in self._persistent_keys if key in self.entries),
+            key=lambda key: int(self.entries[key].get("mtime_ns") or 0),
+            reverse=True,
+        )[:CODEX_EVENT_CACHE_MAX_ENTRIES]
+        payload = {
+            "schema": CODEX_EVENT_CACHE_SCHEMA,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "entries": {
+                key: self._serialized_entry(self.entries[key])
+                for key in keys
+            },
+        }
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.cache_path.with_name(f".{self.cache_path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.cache_path)
+            self._dirty = False
+            self._persistent_keys = set(keys)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+_CODEX_EVENT_ROW_CACHE = CodexEventRowCache()
+atexit.register(_CODEX_EVENT_ROW_CACHE.flush)
+
+
+def codex_relevant_rows_from_path(path: Path) -> list[dict[str, Any]]:
+    return _CODEX_EVENT_ROW_CACHE.rows_for_path(path)
+
+
+def codex_session_header_from_rows(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    for row in rows:
+        if row.get("type") != "session_meta":
+            continue
+        payload = row.get("payload") or {}
+        return (
+            str(payload.get("id") or payload.get("session_id") or "").strip(),
+            str(payload.get("forked_from_id") or "").strip(),
+        )
+    return "", ""
+
+
+def codex_fork_replay_cutoff_from_rows(rows: list[dict[str, Any]]) -> datetime | None:
+    _session_id, parent_id = codex_session_header_from_rows(rows)
+    if not parent_id:
+        return None
+    for row in rows:
+        if row.get("type") == "session_meta":
+            started = parse_dt(row.get("timestamp"))
+            return started + timedelta(seconds=2) if started is not None else None
+    return None
+
 
 def codex_token_count_signature(payload: dict[str, Any]) -> tuple[int, ...]:
     info = payload.get("info") or {}
@@ -936,21 +1299,91 @@ def codex_token_count_signature(payload: dict[str, Any]) -> tuple[int, ...]:
 
 def codex_token_count_signatures_from_path(path: Path) -> list[tuple[int, ...]]:
     signatures: list[tuple[int, ...]] = []
-    try:
-        with path.open(encoding="utf-8", errors="ignore") as handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("type") != "event_msg":
-                    continue
-                payload = row.get("payload") or {}
-                if payload.get("type") == "token_count":
-                    signatures.append(codex_token_count_signature(payload))
-    except OSError:
-        return []
+    for row in codex_relevant_rows_from_path(path):
+        if row.get("type") != "event_msg":
+            continue
+        payload = row.get("payload") or {}
+        if payload.get("type") == "token_count":
+            signatures.append(codex_token_count_signature(payload))
     return signatures
+
+
+def codex_state_rollout_paths(
+    root: Path,
+    start: datetime,
+    session_paths: dict[str, Path] | None = None,
+) -> tuple[list[Path], bool]:
+    """Use Codex's thread index to avoid recursively walking every session file."""
+    codex_root = root.parent
+    try:
+        sessions_root = root.resolve()
+    except OSError:
+        sessions_root = root
+    databases = (
+        codex_root / "state_5.sqlite",
+        codex_root / "sqlite" / "state_5.sqlite",
+    )
+    threshold_ms = int(
+        (start - timedelta(hours=2)).replace(tzinfo=LOCAL_TZ).timestamp() * 1000
+    )
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    database_available = False
+    for database in databases:
+        if not database.exists():
+            continue
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(threads)").fetchall()
+            }
+            if "id" not in columns or "rollout_path" not in columns:
+                connection.close()
+                connection = None
+                continue
+            rows = connection.execute(
+                """
+                SELECT id, rollout_path
+                FROM threads
+                WHERE rollout_path IS NOT NULL AND rollout_path != ''
+                """
+            ).fetchall()
+            database_available = True
+        except sqlite3.Error:
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+        for session_id, raw_path in rows:
+            path_text = str(raw_path or "")
+            if os.name == "nt" and path_text.startswith("\\\\?\\UNC\\"):
+                path_text = "\\\\" + path_text[8:]
+            elif os.name == "nt" and path_text.startswith("\\\\?\\"):
+                path_text = path_text[4:]
+            path = Path(path_text).expanduser()
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            try:
+                resolved.relative_to(sessions_root)
+            except ValueError:
+                # Preserve Token Pulse's existing sessions-only data boundary.
+                continue
+            if session_paths is not None and session_id:
+                session_paths.setdefault(str(session_id).lower(), resolved)
+            try:
+                stat = resolved.stat()
+            except OSError:
+                continue
+            modified_ms = int(stat.st_mtime * 1000)
+            if modified_ms < threshold_ms or resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(resolved)
+    return candidates, database_available
 
 
 def iter_recent_jsonl(
@@ -959,7 +1392,7 @@ def iter_recent_jsonl(
     *,
     session_paths: dict[str, Path] | None = None,
 ) -> list[Path]:
-    if not root.exists():
+    if not root.exists() and not root.parent.exists():
         return []
     paths: list[Path] = []
     seen: set[Path] = set()
@@ -984,41 +1417,60 @@ def iter_recent_jsonl(
         resolved = resolve_path(path)
         if resolved is None or resolved in seen:
             return
+        if session_paths is not None:
+            match = CODEX_SESSION_FILE_ID_RE.search(resolved.name)
+            if match is not None:
+                preferred = session_paths.get(match.group("id").lower())
+                if preferred is not None and preferred != resolved and preferred.exists():
+                    return
         seen.add(resolved)
         paths.append(resolved)
 
-    day_dir = root / f"{start.year:04d}" / f"{start.month:02d}" / f"{start.day:02d}"
-    if day_dir.exists():
-        for path in day_dir.glob("*.jsonl"):
-            add_path(path)
-    for path in root.rglob("*.jsonl"):
-        resolved = resolve_path(path)
-        if resolved is None:
-            continue
-        try:
-            modified = datetime.fromtimestamp(resolved.stat().st_mtime)
-        except OSError:
-            continue
-        if modified >= start - timedelta(hours=2):
-            add_path(resolved)
+    indexed_paths, database_available = codex_state_rollout_paths(
+        root,
+        start,
+        session_paths,
+    )
+    for path in indexed_paths:
+        add_path(path)
+
+    # New rollouts can appear before state_5.sqlite commits the corresponding row.
+    today = datetime.now().date()
+    current_day = start.date()
+    days_checked = 0
+    while current_day <= today and days_checked < 62:
+        day_dir = (
+            root
+            / f"{current_day.year:04d}"
+            / f"{current_day.month:02d}"
+            / f"{current_day.day:02d}"
+        )
+        if day_dir.exists():
+            for path in day_dir.glob("*.jsonl"):
+                add_path(path)
+        current_day += timedelta(days=1)
+        days_checked += 1
+
+    if not database_available and root.exists():
+        for path in root.rglob("*.jsonl"):
+            resolved = resolve_path(path)
+            if resolved is None:
+                continue
+            try:
+                modified = datetime.fromtimestamp(resolved.stat().st_mtime)
+            except OSError:
+                continue
+            if modified >= start - timedelta(hours=2):
+                add_path(resolved)
     return paths
 
 
 def codex_session_headers(paths: list[Path]) -> dict[Path, tuple[str, str]]:
     headers: dict[Path, tuple[str, str]] = {}
     for path in paths:
-        try:
-            with path.open(encoding="utf-8", errors="ignore") as handle:
-                lines = []
-                for _ in range(20):
-                    line = handle.readline()
-                    if not line:
-                        break
-                    lines.append(line)
-        except OSError:
-            headers[path] = ("", "")
-            continue
-        headers[path] = codex_session_header(lines)
+        headers[path] = codex_session_header_from_rows(
+            codex_relevant_rows_from_path(path)
+        )
     return headers
 
 
@@ -1216,11 +1668,8 @@ def scan_codex_events(
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
         current_model = CODEX_DEFAULT_MODEL
         seen: set[tuple[int, int, int, int]] = set()
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        session_id, parent_id = headers.get(path) or codex_session_header(lines)
+        rows = codex_relevant_rows_from_path(path)
+        session_id, parent_id = headers.get(path) or codex_session_header_from_rows(rows)
         parent_signatures: list[tuple[int, ...]] = []
         if parent_id:
             parent_signatures = signature_cache.get(parent_id.lower(), [])
@@ -1232,15 +1681,11 @@ def scan_codex_events(
         session_signatures: list[tuple[int, ...]] = []
         parent_prefix_index = 0
         parent_prefix_open = bool(parent_signatures)
-        fork_replay_cutoff = codex_fork_replay_cutoff(lines)
+        fork_replay_cutoff = codex_fork_replay_cutoff_from_rows(rows)
         session_key = session_id or str(path)
         active_turn_id = ""
         active_turn_started_at: datetime | None = None
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for row in rows:
             row_type = row.get("type")
             payload = row.get("payload") or {}
             if row_type == "turn_context":
@@ -3768,11 +4213,38 @@ def is_api_service_mirror_label(label: str) -> bool:
     return name in API_SERVICE_MIRROR_LABELS
 
 
+def account_marker_epoch(value: datetime) -> float:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=LOCAL_TZ)
+    return aware.timestamp()
+
+
+class AccountMarkerTokenIndex(dict[int, list[AccountMarker]]):
+    def __init__(self, markers: list[AccountMarker]) -> None:
+        super().__init__()
+        timed: list[tuple[float, int, AccountMarker]] = []
+        for position, marker in enumerate(markers):
+            if marker.kind != "request":
+                continue
+            timed.append((account_marker_epoch(marker.when), position, marker))
+            if marker.total_tokens > 0:
+                self.setdefault(marker.total_tokens, []).append(marker)
+        timed.sort(key=lambda item: (item[0], item[1]))
+        self.timed = timed
+        self.times = [item[0] for item in timed]
+
+    def near_time(self, when: datetime, seconds: float) -> list[AccountMarker]:
+        center = account_marker_epoch(when)
+        left = bisect_left(self.times, center - seconds)
+        right = bisect_right(self.times, center + seconds)
+        # Preserve the original marker order for exact tie behavior.
+        return [
+            item[2]
+            for item in sorted(self.timed[left:right], key=lambda item: item[1])
+        ]
+
+
 def account_markers_by_total_tokens(markers: list[AccountMarker]) -> dict[int, list[AccountMarker]]:
-    indexed: dict[int, list[AccountMarker]] = {}
-    for marker in markers:
-        if marker.kind == "request" and marker.total_tokens > 0:
-            indexed.setdefault(marker.total_tokens, []).append(marker)
+    indexed: dict[int, list[AccountMarker]] = AccountMarkerTokenIndex(markers)
     return indexed
 
 
@@ -3801,9 +4273,14 @@ def concrete_api_service_account_marker(
     if nearby:
         return min(nearby, key=lambda marker: abs((marker.when - event_time).total_seconds()))
     fuzzy_token_delta = max(256, int(event.total_tokens * 0.005))
+    fuzzy_pool = (
+        marker_index.near_time(event_time, 30)
+        if isinstance(marker_index, AccountMarkerTokenIndex)
+        else markers
+    )
     fuzzy_candidates = [
         marker
-        for marker in markers
+        for marker in fuzzy_pool
         if marker.kind == "request"
         and abs((marker.when - event_time).total_seconds()) <= 30
         and abs(marker.total_tokens - event.total_tokens) <= fuzzy_token_delta
