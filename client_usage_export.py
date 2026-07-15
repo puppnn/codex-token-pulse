@@ -2536,6 +2536,28 @@ def quota_row_needs_official_refresh(quota: Any) -> bool:
     return any(window.get("quota_stale") or not window.get("resets_at") for window in available_windows)
 
 
+def stale_official_quota_snapshot(quota: Any) -> dict[str, dict[str, Any]] | None:
+    if not isinstance(quota, dict):
+        return None
+    stale: dict[str, dict[str, Any]] = {}
+    has_last_known_value = False
+    for window_key in ("window_5h", "window_7d", "window_cycle"):
+        raw_window = quota.get(window_key)
+        if not isinstance(raw_window, dict):
+            continue
+        window = dict(raw_window)
+        if (
+            window.get("quota_available")
+            or window.get("quota_unlimited")
+            or window.get("remaining_percent") is not None
+            or window.get("utilization") is not None
+        ):
+            has_last_known_value = True
+        window["quota_stale"] = True
+        stale[window_key] = window
+    return stale if has_last_known_value else None
+
+
 def load_official_quota_cache() -> dict[str, Any]:
     try:
         data = json.loads(COCKPIT_OFFICIAL_QUOTA_CACHE_PATH.read_text(encoding="utf-8"))
@@ -2631,6 +2653,11 @@ def cockpit_official_quota_by_account(
         auth = read_cockpit_sidecar_auth(home, account_id)
         if auth is not None:
             pending[account_id] = (auth, str(account.get("plan_type") or ""))
+        else:
+            previous_quota = cached.get("quota") if isinstance(cached, dict) else None
+            stale_quota = stale_official_quota_snapshot(previous_quota)
+            if stale_quota is not None:
+                result[account_id] = stale_quota
 
     if pending:
         worker_count = min(COCKPIT_OFFICIAL_QUOTA_MAX_WORKERS, len(pending))
@@ -2645,13 +2672,37 @@ def cockpit_official_quota_by_account(
                     quota = future.result()
                 except Exception:
                     quota = None
-                cache[account_id] = {
-                    "checked_at": now_epoch,
-                    "quota": quota if isinstance(quota, dict) else None,
-                }
-                cache_changed = True
+                previous_entry = cache.get(account_id)
+                previous_quota = (
+                    previous_entry.get("quota")
+                    if isinstance(previous_entry, dict)
+                    else None
+                )
                 if isinstance(quota, dict):
+                    cache[account_id] = {
+                        "checked_at": now_epoch,
+                        "last_success_at": now_epoch,
+                        "quota": quota,
+                    }
                     result[account_id] = quota
+                else:
+                    stale_quota = stale_official_quota_snapshot(previous_quota)
+                    cache_entry: dict[str, Any] = {
+                        "checked_at": now_epoch,
+                        "quota": stale_quota,
+                        "refresh_failed": True,
+                    }
+                    if isinstance(previous_entry, dict):
+                        last_success_at = (
+                            previous_entry.get("last_success_at")
+                            or previous_entry.get("checked_at")
+                        )
+                        if last_success_at not in (None, ""):
+                            cache_entry["last_success_at"] = last_success_at
+                    cache[account_id] = cache_entry
+                    if stale_quota is not None:
+                        result[account_id] = stale_quota
+                cache_changed = True
 
     if cache_changed:
         active_ids = set(accounts)
@@ -4854,6 +4905,10 @@ def apply_quota_countdown_state(
     idle_until_first_use: bool,
 ) -> None:
     if window.get("quota_unlimited"):
+        window["quota_idle"] = False
+        window["countdown_active"] = False
+        return
+    if window.get("quota_stale"):
         window["quota_idle"] = False
         window["countdown_active"] = False
         return

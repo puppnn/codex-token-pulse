@@ -85,8 +85,8 @@ LIVE_USAGE_EXPORT_IDLE_SECONDS = max(
     int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS", "30")),
 )
 QUOTA_REFRESH_SECONDS = max(
-    15,
-    int(os.environ.get("TOKEN_PULSE_QUOTA_REFRESH_SECONDS", "60")),
+    10,
+    int(os.environ.get("TOKEN_PULSE_QUOTA_REFRESH_SECONDS", "10")),
 )
 QUOTA_REFRESH_TIMEOUT_SECONDS = max(
     10,
@@ -121,6 +121,11 @@ if not CLIENT_USAGE_JSON.exists():
     fallback_json = APP_DIR.parent / "client-token-importer" / "client_usage_today.json"
     if fallback_json.exists():
         CLIENT_USAGE_JSON = fallback_json
+MODEL_PRICE_CACHE_JSON = Path(
+    os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE")
+    or APP_DIR / "client_usage_model_prices.json"
+)
+_LIVE_MODEL_PRICE_CACHE: tuple[str, int, dict[str, dict[str, float]]] | None = None
 CLIENT_USAGE_PYTHON = os.environ.get("SUB2API_CLIENT_USAGE_PYTHON") or sys.executable
 if Path(CLIENT_USAGE_PYTHON).name.lower() == "pythonw.exe":
     console_python = Path(CLIENT_USAGE_PYTHON).with_name("python.exe")
@@ -850,6 +855,78 @@ def money(value: float | int | None) -> str:
     if 0 < number < 0.01:
         return f"${number:.6f}"
     return f"${number:.2f}"
+
+
+def _load_live_model_prices() -> dict[str, dict[str, float]]:
+    global _LIVE_MODEL_PRICE_CACHE
+    try:
+        modified_ns = int(MODEL_PRICE_CACHE_JSON.stat().st_mtime_ns)
+        cache_path = str(MODEL_PRICE_CACHE_JSON.resolve())
+    except OSError:
+        return {}
+    if (
+        _LIVE_MODEL_PRICE_CACHE is not None
+        and _LIVE_MODEL_PRICE_CACHE[0] == cache_path
+        and _LIVE_MODEL_PRICE_CACHE[1] == modified_ns
+    ):
+        return _LIVE_MODEL_PRICE_CACHE[2]
+    try:
+        payload = json.loads(MODEL_PRICE_CACHE_JSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw_models = payload.get("models") if isinstance(payload, dict) else {}
+    prices: dict[str, dict[str, float]] = {}
+    for raw_name, raw_detail in raw_models.items() if isinstance(raw_models, dict) else []:
+        if not isinstance(raw_detail, dict):
+            continue
+        detail: dict[str, float] = {}
+        for field in (
+            "input_cost_per_token",
+            "cache_read_input_token_cost",
+            "output_cost_per_token",
+        ):
+            try:
+                rate = max(0.0, float(raw_detail.get(field) or 0.0))
+            except (TypeError, ValueError):
+                rate = 0.0
+            if rate > 0:
+                detail[field] = rate
+        name = str(raw_name or "").strip().lower()
+        if name and detail.get("input_cost_per_token") and detail.get("output_cost_per_token"):
+            prices[name] = detail
+            if name.startswith(("openai/", "anthropic/")):
+                prices.setdefault(name.split("/", 1)[1], detail)
+    _LIVE_MODEL_PRICE_CACHE = (cache_path, modified_ns, prices)
+    return prices
+
+
+def estimate_live_usage_cost(
+    usage: dict[str, Any],
+    model: str,
+    *,
+    fallback_cost_per_token: float = 0.0,
+) -> float:
+    raw_input = max(0, int(usage.get("input_tokens") or 0))
+    cached_input = min(raw_input, max(0, int(usage.get("cached_tokens") or 0)))
+    output_tokens = max(0, int(usage.get("output_tokens") or 0))
+    total_tokens = max(0, int(usage.get("total_tokens") or raw_input + output_tokens))
+    normalized_model = str(model or "").strip().lower()
+    candidates = [normalized_model]
+    if "/" in normalized_model:
+        candidates.append(normalized_model.split("/", 1)[1])
+    prices = _load_live_model_prices()
+    detail = next((prices[name] for name in candidates if name in prices), None)
+    if detail is not None:
+        input_rate = float(detail.get("input_cost_per_token") or 0.0)
+        cache_rate = float(detail.get("cache_read_input_token_cost") or input_rate)
+        output_rate = float(detail.get("output_cost_per_token") or 0.0)
+        return max(
+            0.0,
+            (raw_input - cached_input) * input_rate
+            + cached_input * cache_rate
+            + output_tokens * output_rate,
+        )
+    return max(0.0, total_tokens * max(0.0, float(fallback_cost_per_token or 0.0)))
 
 
 def quota_color(utilization: float | int | None) -> str:
@@ -3758,6 +3835,9 @@ class FloatingMonitorApp:
         self._token_delta_value = 0
         self._token_delta_started_at = 0.0
         self._token_delta_last_event_at = 0.0
+        self._cost_delta_value = 0.0
+        self._cost_delta_started_at = 0.0
+        self._cost_delta_last_event_at = 0.0
         self._fade_alpha = 0.0
         self._drag_data = {"x": 0, "y": 0}
         self._resize_data = {"x": 0, "y": 0, "w": self.WIDTH, "h": self.HEIGHT}
@@ -4220,6 +4300,58 @@ class FloatingMonitorApp:
         if len(items) != 1:
             return False
         text, color, visible = self._token_delta_badge_visual()
+        self.canvas.itemconfigure(
+            items[0],
+            text=text,
+            fill=color,
+            state="normal" if visible else "hidden",
+        )
+        return True
+
+    def _record_cost_delta_badge(
+        self,
+        cost: float,
+        *,
+        now: float | None = None,
+    ) -> None:
+        cost = max(0.0, float(cost or 0.0))
+        if cost <= 0:
+            return
+        current_time = time.monotonic() if now is None else float(now)
+        last_event_at = float(getattr(self, "_cost_delta_last_event_at", 0.0))
+        if current_time - last_event_at <= TOKEN_DELTA_BADGE_MERGE_SECONDS:
+            self._cost_delta_value = float(getattr(self, "_cost_delta_value", 0.0)) + cost
+        else:
+            self._cost_delta_value = cost
+        self._cost_delta_started_at = current_time
+        self._cost_delta_last_event_at = current_time
+        if hasattr(self, "root"):
+            self._ensure_pulse_animation()
+
+    def _cost_delta_badge_visual(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[str, str, bool]:
+        value = max(0.0, float(getattr(self, "_cost_delta_value", 0.0)))
+        started_at = float(getattr(self, "_cost_delta_started_at", 0.0))
+        current_time = time.monotonic() if now is None else float(now)
+        elapsed = max(0.0, current_time - started_at)
+        if value <= 0 or started_at <= 0 or elapsed >= TOKEN_DELTA_BADGE_DURATION_SECONDS:
+            return "", Theme.ag_surface, False
+        progress = elapsed / TOKEN_DELTA_BADGE_DURATION_SECONDS
+        smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+        color = self._blend_hex_colors(Theme.warn, Theme.ag_surface, smooth_progress)
+        decimals = 3 if value < 0.1 else 2
+        return f"+${value:,.{decimals}f}", color, True
+
+    def _redraw_cost_delta_badge(self) -> bool:
+        if self._main_tab != "stats":
+            return False
+        items = self.canvas.find_withtag("cost_delta_badge")
+        if len(items) != 1:
+            return False
+        text, color, visible = self._cost_delta_badge_visual()
         self.canvas.itemconfigure(
             items[0],
             text=text,
@@ -5630,6 +5762,59 @@ class FloatingMonitorApp:
                 c.create_text(x1, reset_y, anchor="nw", text=self._truncate(reset, "font_micro", max(40, x2 - x1)),
                               font=self._fonts["font_micro"], fill=Theme.ag_muted)
 
+    @staticmethod
+    def _usage_overview_needs_compact_values(
+        col_l: int,
+        col_r: int,
+        left_group_width: int,
+        right_group_width: int,
+    ) -> bool:
+        available = max(1, int(col_r) - int(col_l) - 24)
+        minimum_chrome_width = 7  # Three gaps plus the narrowest useful meter.
+        return (
+            max(0, int(left_group_width))
+            + max(0, int(right_group_width))
+            + minimum_chrome_width
+            > available
+        )
+
+    @staticmethod
+    def _usage_overview_columns(
+        col_l: int,
+        col_r: int,
+        left_group_width: int,
+        right_group_width: int,
+    ) -> tuple[int, int, int, int]:
+        inner_l = int(col_l) + 12
+        inner_r = max(inner_l + 1, int(col_r) - 12)
+        available = inner_r - inner_l
+        left_width = max(0, int(left_group_width))
+        right_width = max(0, int(right_group_width))
+        spare = max(0, available - left_width - right_width)
+        if spare >= 58:
+            left_gap, divider_gap, cost_gap = 6, 5, 8
+            meter_width = 39
+        elif spare >= 16:
+            left_gap = divider_gap = cost_gap = 2
+            meter_width = min(39, spare - 6)
+        else:
+            left_gap = divider_gap = cost_gap = 1
+            meter_width = max(4, spare - 3)
+        used = (
+            left_width
+            + left_gap
+            + meter_width
+            + divider_gap
+            + cost_gap
+            + right_width
+        )
+        leading_extra = max(0, available - used) // 2
+        meter_l = inner_l + left_width + left_gap + leading_extra
+        meter_r = meter_l + meter_width
+        divider_x = meter_r + divider_gap
+        cost_x = divider_x + cost_gap
+        return meter_l, meter_r, divider_x, cost_x
+
     def _draw_usage_stats_page(self, col_l: int, col_r: int, y: int, H: int) -> None:
         c = self.canvas
         summary = self._usage_range_summary(self._usage_range)
@@ -5658,21 +5843,43 @@ class FloatingMonitorApp:
 
         compact_layout = H < 700
         hero_h = 82 if compact_layout else 86
-        mid = col_l + (col_r - col_l) // 2
-        meter_l = mid - 34
-        meter_r = mid + 5
-        divider_x = mid + 12
-        self._draw_panel(col_l, y, col_r, y + hero_h, fill=Theme.ag_surface, radius=8)
-        c.create_text(col_l + 12, y + 9, anchor="nw", text="\u603b TOKEN",
-                      font=self._fonts["font_tiny"], fill=Theme.ag_muted)
+        token_x = col_l + 12
         compact_tokens = compact_number(summary["tokens"])
-        c.create_text(col_l + 12, y + 23, anchor="nw", text=compact_tokens,
-                      font=self._fonts["font_value"], fill=Theme.ag_accent)
         delta_text, delta_color, delta_visible = self._token_delta_badge_visual()
-        delta_x = min(
-            meter_l - 5,
-            col_l + 17 + self._fonts["font_value"].measure(compact_tokens),
+        cost_text = money(summary["cost"])
+        cost_delta_text, cost_delta_color, cost_delta_visible = self._cost_delta_badge_visual()
+        token_delta_width = max(
+            self._fonts["font_delta"].measure(delta_text),
+            self._fonts["font_delta"].measure("+000,000"),
         )
+        cost_delta_width = max(
+            self._fonts["font_delta"].measure(cost_delta_text),
+            self._fonts["font_delta"].measure("+$0.000"),
+        )
+        value_font_key = "font_value"
+        token_value_width = self._fonts[value_font_key].measure(compact_tokens)
+        cost_value_width = self._fonts[value_font_key].measure(cost_text)
+        if self._usage_overview_needs_compact_values(
+            col_l,
+            col_r,
+            token_value_width + 5 + token_delta_width,
+            cost_value_width + 5 + cost_delta_width,
+        ):
+            value_font_key = "font_value_sm"
+            token_value_width = self._fonts[value_font_key].measure(compact_tokens)
+            cost_value_width = self._fonts[value_font_key].measure(cost_text)
+        meter_l, meter_r, divider_x, cost_x = self._usage_overview_columns(
+            col_l,
+            col_r,
+            token_value_width + 5 + token_delta_width,
+            cost_value_width + 5 + cost_delta_width,
+        )
+        self._draw_panel(col_l, y, col_r, y + hero_h, fill=Theme.ag_surface, radius=8)
+        c.create_text(token_x, y + 9, anchor="nw", text="\u603b TOKEN",
+                      font=self._fonts["font_tiny"], fill=Theme.ag_muted)
+        c.create_text(token_x, y + 23, anchor="nw", text=compact_tokens,
+                      font=self._fonts[value_font_key], fill=Theme.ag_accent)
+        delta_x = token_x + token_value_width + 5
         c.create_text(
             delta_x,
             y + 26,
@@ -5683,17 +5890,28 @@ class FloatingMonitorApp:
             state="normal" if delta_visible else "hidden",
             tags=("token_delta_badge",),
         )
-        c.create_text(col_l + 12, y + 50, anchor="nw", text=exact_token_count(summary["tokens"]),
+        c.create_text(token_x, y + 50, anchor="nw", text=exact_token_count(summary["tokens"]),
                       font=self._fonts["font_data"], fill=Theme.text_secondary)
-        c.create_text(col_l + 12, y + 67, anchor="nw", text=f"{compact_number(summary['requests'])} \u6b21\u8bf7\u6c42",
+        c.create_text(token_x, y + 67, anchor="nw", text=f"{compact_number(summary['requests'])} \u6b21\u8bf7\u6c42",
                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         c.create_line(divider_x, y + 12, divider_x, y + hero_h - 12, fill=Theme.ag_divider, width=1)
         self._draw_token_flow_meter(meter_l, y + 12, meter_r, y + hero_h - 10, bars=10)
-        c.create_text(mid + 24, y + 9, anchor="nw", text="\u9884\u4f30\u6210\u672c",
+        c.create_text(cost_x, y + 9, anchor="nw", text="\u9884\u4f30\u6210\u672c",
                       font=self._fonts["font_tiny"], fill=Theme.ag_muted)
-        c.create_text(mid + 24, y + 25, anchor="nw", text=money(summary["cost"]),
-                      font=self._fonts["font_value"], fill=Theme.warn)
-        c.create_text(mid + 24, y + 58, anchor="nw", text=f"{summary['label']} \u65f6\u95f4\u7a97\u53e3",
+        cost_delta_x = cost_x + cost_value_width + 5
+        c.create_text(cost_x, y + 25, anchor="nw", text=cost_text,
+                      font=self._fonts[value_font_key], fill=Theme.warn)
+        c.create_text(
+            cost_delta_x,
+            y + 26,
+            anchor="nw",
+            text=cost_delta_text,
+            font=self._fonts["font_delta"],
+            fill=cost_delta_color,
+            state="normal" if cost_delta_visible else "hidden",
+            tags=("cost_delta_badge",),
+        )
+        c.create_text(cost_x, y + 58, anchor="nw", text=f"{summary['label']} \u65f6\u95f4\u7a97\u53e3",
                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         self._add_tooltip(
             col_l,
@@ -6446,8 +6664,8 @@ class FloatingMonitorApp:
         }.get(self._account_range)
         range_label = {
             "today": "\u4eca\u65e5",
-            "5h": "\u6700\u8fd1 5 \u5c0f\u65f6",
-            "7d": "7d \u5468\u671f",
+            "5h": "5h \u989d\u5ea6\u7a97\u53e3",
+            "7d": "7d \u989d\u5ea6\u7a97\u53e3",
             "30d": "\u8fd1 30 \u5929",
         }.get(self._account_range, "\u4eca\u65e5")
         if self._account_range == "30d" and not self._needs_server_account_30d():
@@ -6503,8 +6721,8 @@ class FloatingMonitorApp:
 
         tab_specs = [
             ("rank_today", "\u4eca\u65e5", "today"),
-            ("rank_5h", "5h", "5h"),
-            ("rank_7d", "7d", "7d"),
+            ("rank_5h", "5h\u989d\u5ea6", "5h"),
+            ("rank_7d", "7d\u989d\u5ea6", "7d"),
             ("rank_30d", "30d", "30d"),
         ]
         tab_w = 44
@@ -6780,7 +6998,10 @@ class FloatingMonitorApp:
         has_recent_samples = bool(getattr(self, "_token_flow_samples", []))
         meter_level = float(getattr(self, "_token_flow_meter_display_level", 0.0))
         meter_animating = self._main_tab == "stats" and meter_level > 0.01
-        badge_animating = self._token_delta_badge_visual()[2]
+        badge_animating = (
+            self._token_delta_badge_visual()[2]
+            or self._cost_delta_badge_visual()[2]
+        )
         if (
             not self._loading
             and flow_level <= 0.01
@@ -6800,6 +7021,7 @@ class FloatingMonitorApp:
                 self._redraw_token_flow_trace(),
                 self._redraw_token_flow_meter(),
                 self._redraw_token_delta_badge(),
+                self._redraw_cost_delta_badge(),
             ))
         if redrawn:
             interval_ms = TOKEN_FLOW_ANIMATION_INTERVAL_MS
@@ -7817,7 +8039,12 @@ class FloatingMonitorApp:
             }
             self._live_usage_overlay = overlay
         accepted_tokens = 0
+        accepted_cost = 0.0
         client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+        fallback_cost_per_token = (
+            max(0.0, float(self.state.today_account_cost or 0.0))
+            / max(1, int(self.state.today_tokens or 0))
+        )
         api_service_current = bool(client_usage.get("api_service_routed"))
         cockpit_markers = (
             _load_live_cockpit_markers(COCKPIT_REQUEST_LOG_DB, now_utc)
@@ -7836,7 +8063,6 @@ class FloatingMonitorApp:
             output = max(0, int(event.get("output_tokens") or 0))
             overlay["tokens"] += tokens
             overlay["requests"] += 1
-            overlay["cost"] += event_cost
             overlay["input_tokens"] += max(0, raw_input - cached_input)
             overlay["cached_input_tokens"] += cached_input
             overlay["output_tokens"] += output
@@ -7852,27 +8078,44 @@ class FloatingMonitorApp:
             provider = _concrete_live_provider(event.get("provider"))
             model = str(event.get("model") or "")
             matched_marker = _match_live_cockpit_marker(event, cockpit_markers)
+            provider_usage = event
+            record_provider = bool(provider)
             if matched_marker is not None:
                 cockpit_markers.remove(matched_marker)
                 provider = str(matched_marker.get("label") or "")
                 model = str(matched_marker.get("model") or "")
-                self._record_live_provider_overlay(
-                    overlay,
-                    provider,
-                    matched_marker,
-                    event["when"],
-                )
-            elif provider:
-                self._record_live_provider_overlay(overlay, provider, event, event["when"])
-            else:
-                provider, model = self._live_event_request_context(event)
+                provider_usage = matched_marker
+                record_provider = bool(provider)
+            context_provider, context_model = ("", "")
+            if not provider or not model:
+                context_provider, context_model = self._live_event_request_context(event)
+            if not model:
+                model = context_model
+            if not provider:
+                provider = context_provider
                 if api_service_current:
                     # Cockpit may write its routing marker a moment after the
                     # Codex token event. Keep the total optimistic, but never
                     # guess which pool account should receive it.
                     provider = ""
-                elif provider:
-                    self._record_live_provider_overlay(overlay, provider, event, event["when"])
+                record_provider = bool(provider)
+            if event_cost <= 0:
+                event_cost = estimate_live_usage_cost(
+                    provider_usage,
+                    model,
+                    fallback_cost_per_token=fallback_cost_per_token,
+                )
+            event["cost"] = event_cost
+            provider_usage["cost"] = event_cost
+            overlay["cost"] += event_cost
+            accepted_cost += event_cost
+            if record_provider and provider:
+                self._record_live_provider_overlay(
+                    overlay,
+                    provider,
+                    provider_usage,
+                    event["when"],
+                )
             if provider:
                 event["provider"] = provider
             if model:
@@ -7882,6 +8125,7 @@ class FloatingMonitorApp:
                 latest_model = model
         if animate:
             self._record_token_delta_badge(accepted_tokens, now=sample_clock)
+            self._record_cost_delta_badge(accepted_cost, now=sample_clock)
         if not latest_model:
             _provider, latest_model = self._live_event_request_context(latest_event)
             if not latest_provider and not api_service_current:

@@ -535,6 +535,106 @@ class CompactNumberTests(unittest.TestCase):
         self.assertNotEqual(middle_color, monitor.Theme.ag_surface)
         self.assertEqual(expired, ("", monitor.Theme.ag_surface, False))
 
+    def test_live_cost_estimate_uses_cached_model_token_rates(self) -> None:
+        prices = {
+            "schema": 2,
+            "models": {
+                "gpt-test": {
+                    "input_cost_per_token": 0.000001,
+                    "cache_read_input_token_cost": 0.0000001,
+                    "output_cost_per_token": 0.000002,
+                }
+            },
+        }
+        usage = {
+            "total_tokens": 110,
+            "input_tokens": 100,
+            "cached_tokens": 40,
+            "output_tokens": 10,
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(monitor, "_LIVE_MODEL_PRICE_CACHE", None),
+        ):
+            cache_path = Path(directory) / "prices.json"
+            cache_path.write_text(json.dumps(prices), encoding="utf-8")
+            with patch.object(monitor, "MODEL_PRICE_CACHE_JSON", cache_path):
+                cost = monitor.estimate_live_usage_cost(usage, "gpt-test")
+
+        self.assertAlmostEqual(cost, 0.000084)
+
+    def test_cost_delta_badge_merges_and_fades(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._record_cost_delta_badge(0.04, now=10.0)
+        app._record_cost_delta_badge(0.03, now=10.2)
+
+        merged = app._cost_delta_badge_visual(now=10.2)
+        middle = app._cost_delta_badge_visual(
+            now=10.2 + monitor.TOKEN_DELTA_BADGE_DURATION_SECONDS / 2
+        )
+        expired = app._cost_delta_badge_visual(
+            now=10.2 + monitor.TOKEN_DELTA_BADGE_DURATION_SECONDS
+        )
+
+        self.assertEqual(merged, ("+$0.070", monitor.Theme.warn, True))
+        self.assertEqual(middle[0], "+$0.070")
+        self.assertTrue(middle[2])
+        self.assertNotEqual(middle[1], monitor.Theme.warn)
+        self.assertEqual(expired, ("", monitor.Theme.ag_surface, False))
+
+    def test_usage_overview_columns_fit_both_delta_groups_at_minimum_width(self) -> None:
+        meter_l, meter_r, divider_x, cost_x = (
+            monitor.FloatingMonitorApp._usage_overview_columns(
+                14,
+                346,
+                147,
+                147,
+            )
+        )
+
+        self.assertGreater(meter_l, 26 + 147)
+        self.assertGreater(meter_r, meter_l)
+        self.assertGreater(divider_x, meter_r)
+        self.assertGreater(cost_x, divider_x)
+        self.assertLessEqual(cost_x + 147, 334)
+
+    def test_usage_overview_compacts_when_both_values_gain_a_digit(self) -> None:
+        needs_compact = monitor.FloatingMonitorApp._usage_overview_needs_compact_values(
+            14,
+            346,
+            144,
+            165,
+        )
+        meter_l, meter_r, divider_x, cost_x = (
+            monitor.FloatingMonitorApp._usage_overview_columns(
+                14,
+                346,
+                124,
+                136,
+            )
+        )
+
+        self.assertTrue(needs_compact)
+        self.assertGreater(meter_r, meter_l)
+        self.assertGreater(divider_x, meter_r)
+        self.assertLessEqual(cost_x + 136, 334)
+
+    def test_usage_overview_columns_share_extra_space_on_wide_windows(self) -> None:
+        meter_l, meter_r, divider_x, cost_x = (
+            monitor.FloatingMonitorApp._usage_overview_columns(
+                14,
+                506,
+                147,
+                147,
+            )
+        )
+        left_space = meter_l - (26 + 147)
+        right_space = 494 - (cost_x + 147)
+
+        self.assertGreaterEqual(meter_r - meter_l, 39)
+        self.assertLessEqual(abs(left_space - right_space), 6)
+        self.assertGreater(divider_x, meter_r)
+
     def test_common_models_prioritize_five_rows_and_one_provider_row(self) -> None:
         visible = monitor.FloatingMonitorApp._top_model_visible_count(
             model_count=5,
@@ -2412,6 +2512,128 @@ class WindowSemanticsTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertNotIn("secret-access-token", cache_path.read_text(encoding="utf-8"))
 
+    def test_official_quota_failure_retains_last_percent_as_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth_dir = (
+                root
+                / ".antigravity_cockpit"
+                / "codex_local_access_sidecar"
+                / "auths"
+            )
+            auth_dir.mkdir(parents=True)
+            account_id = "codex_stale"
+            (auth_dir / f"{account_id}.json").write_text(
+                json.dumps(
+                    {
+                        "access_token": "expired-access-token",
+                        "account_id": "chatgpt-account-id",
+                        "expired": datetime.now().timestamp() + 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cache_path = root / "official-quota-cache.json"
+            checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+            previous_checked_at = checked_at - timedelta(minutes=11)
+            previous_quota = client_usage_export.official_quota_from_usage_response(
+                {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "primary_window": {
+                            "limit_window_seconds": 7 * 24 * 60 * 60,
+                            "reset_at": checked_at.timestamp() + 2 * 24 * 60 * 60,
+                            "used_percent": 74,
+                        },
+                        "secondary_window": None,
+                    },
+                },
+                previous_checked_at,
+            )
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "accounts": {
+                            account_id: {
+                                "checked_at": previous_checked_at.timestamp(),
+                                "quota": previous_quota,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            accounts = {account_id: {"plan_type": "plus"}}
+            with (
+                patch.object(client_usage_export, "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH", cache_path),
+                patch.object(client_usage_export, "fetch_cockpit_official_quota", return_value=None) as fetch,
+            ):
+                failed = client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    accounts,
+                    checked_at,
+                )
+                cached = client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    accounts,
+                    checked_at + timedelta(minutes=1),
+                )
+
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(failed[account_id]["window_7d"]["remaining_percent"], 26.0)
+            self.assertTrue(failed[account_id]["window_7d"]["quota_stale"])
+            self.assertEqual(cached, failed)
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))["accounts"][account_id]
+            self.assertTrue(saved["refresh_failed"])
+            self.assertEqual(saved["quota"]["window_7d"]["remaining_percent"], 26.0)
+
+    def test_missing_auth_retains_expired_cached_percent_as_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "official-quota-cache.json"
+            checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+            previous_checked_at = checked_at - timedelta(minutes=11)
+            previous_quota = {
+                "window_5h": {"quota_available": False, "quota_unlimited": True},
+                "window_7d": {
+                    "quota_available": True,
+                    "remaining_percent": 42.0,
+                    "utilization": 58.0,
+                    "resets_at": (checked_at + timedelta(days=2)).isoformat(),
+                },
+                "window_cycle": {"quota_available": False},
+            }
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "accounts": {
+                            "codex_no_auth": {
+                                "checked_at": previous_checked_at.timestamp(),
+                                "quota": previous_quota,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                client_usage_export,
+                "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH",
+                cache_path,
+            ):
+                result = client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    {"codex_no_auth": {"plan_type": "plus"}},
+                    checked_at,
+                )
+
+            quota = result["codex_no_auth"]
+            self.assertEqual(quota["window_7d"]["remaining_percent"], 42.0)
+            self.assertTrue(quota["window_7d"]["quota_stale"])
+            self.assertTrue(quota["window_5h"]["quota_unlimited"])
+
     def test_plus_primary_7d_maps_to_official_7d_and_unlimited_5h(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -2756,6 +2978,31 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertTrue(window["countdown_active"])
         self.assertIsNone(window["remaining_percent"])
         self.assertIsNone(window["utilization"])
+
+    def test_failed_stale_snapshot_keeps_last_percentage_after_reset(self) -> None:
+        now = datetime(2026, 7, 12, 19, 18, 0)
+        window = {
+            "quota_available": True,
+            "quota_stale": True,
+            "remaining_percent": 26.0,
+            "utilization": 74.0,
+            "resets_at": "2026-07-12T18:00:00+08:00",
+            "window_minutes": 7 * 24 * 60,
+            "requests": 1,
+            "tokens": 100,
+            "cost": 0.01,
+        }
+
+        client_usage_export.apply_quota_countdown_state(
+            window,
+            now,
+            idle_until_first_use=False,
+        )
+
+        self.assertEqual(window["remaining_percent"], 26.0)
+        self.assertEqual(window["utilization"], 74.0)
+        self.assertFalse(window["quota_idle"])
+        self.assertFalse(window["countdown_active"])
 
     def test_quota_windows_use_quota_cycle_boundaries(self) -> None:
         now = datetime(2026, 6, 22, 12, 0, 0)
@@ -3902,13 +4149,22 @@ class LiveUsageOverlayTests(unittest.TestCase):
         second["cached_tokens"] = 0
         second["output_tokens"] = 0
 
-        with patch.object(app, "_record_token_delta_badge") as record_badge:
+        with (
+            patch.object(app, "_record_token_delta_badge") as record_badge,
+            patch.object(app, "_record_cost_delta_badge") as record_cost_badge,
+            patch.object(app, "_live_event_request_context", return_value=("", "gpt-test")),
+            patch.object(monitor, "estimate_live_usage_cost", return_value=0.25),
+        ):
             app._record_live_usage_events([first, second])
 
         record_badge.assert_called_once()
         self.assertEqual(record_badge.call_args.args, (125,))
         self.assertIsInstance(record_badge.call_args.kwargs["now"], float)
+        record_cost_badge.assert_called_once()
+        self.assertEqual(record_cost_badge.call_args.args, (0.5,))
+        self.assertIsInstance(record_cost_badge.call_args.kwargs["now"], float)
         self.assertEqual(app.state.today_tokens, 225)
+        self.assertAlmostEqual(app.state.today_account_cost, 0.5)
 
     def test_historical_catchup_accepts_old_event_and_deduplicates_it(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -4601,6 +4857,29 @@ class LiveUsageOverlayTests(unittest.TestCase):
             17,
             text="+12,345",
             fill="#3A8A72",
+            state="normal",
+        )
+
+    def test_stats_cost_delta_badge_reuses_one_canvas_text_item(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._main_tab = "stats"
+        app.canvas = MagicMock()
+        app.canvas.find_withtag.return_value = (23,)
+
+        with patch.object(
+            app,
+            "_cost_delta_badge_visual",
+            return_value=("+$0.25", "#B78E48", True),
+        ):
+            redrawn = app._redraw_cost_delta_badge()
+
+        self.assertTrue(redrawn)
+        app.canvas.delete.assert_not_called()
+        app.canvas.create_text.assert_not_called()
+        app.canvas.itemconfigure.assert_called_once_with(
+            23,
+            text="+$0.25",
+            fill="#B78E48",
             state="normal",
         )
 
