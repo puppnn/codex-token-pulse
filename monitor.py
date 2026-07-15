@@ -68,9 +68,37 @@ LIVE_USAGE_MAX_SINGLE_EVENT_TOKENS = max(
     1,
     int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000")),
 )
+LIVE_USAGE_VERIFY_THRESHOLD_TOKENS = max(
+    LIVE_USAGE_MAX_SINGLE_EVENT_TOKENS,
+    int(os.environ.get("TOKEN_PULSE_LIVE_VERIFY_THRESHOLD_TOKENS", "50000000")),
+)
+LIVE_USAGE_VERIFY_WINDOW_SECONDS = max(
+    1.0,
+    float(os.environ.get("TOKEN_PULSE_LIVE_VERIFY_WINDOW_SECONDS", "5")),
+)
+LIVE_USAGE_VERIFY_DELAY_MS = max(
+    1_000,
+    int(os.environ.get("TOKEN_PULSE_LIVE_VERIFY_DELAY_MS", "1000")),
+)
 LIVE_USAGE_EXPORT_IDLE_SECONDS = max(
     5,
     int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS", "30")),
+)
+QUOTA_REFRESH_SECONDS = max(
+    15,
+    int(os.environ.get("TOKEN_PULSE_QUOTA_REFRESH_SECONDS", "60")),
+)
+QUOTA_REFRESH_TIMEOUT_SECONDS = max(
+    10,
+    int(os.environ.get("TOKEN_PULSE_QUOTA_REFRESH_TIMEOUT_SECONDS", "60")),
+)
+FULL_USAGE_REFRESH_MAX_STALE_SECONDS = max(
+    QUOTA_REFRESH_SECONDS,
+    int(os.environ.get("TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS", "600")),
+)
+FULL_USAGE_REFRESH_RETRY_SECONDS = max(
+    30,
+    int(os.environ.get("TOKEN_PULSE_FULL_USAGE_RETRY_SECONDS", "60")),
 )
 TOKEN_FLOW_ANIMATION_INTERVAL_MS = 16
 TOKEN_FLOW_FULL_REDRAW_INTERVAL_MS = 90
@@ -99,6 +127,35 @@ if Path(CLIENT_USAGE_PYTHON).name.lower() == "pythonw.exe":
     if console_python.exists():
         CLIENT_USAGE_PYTHON = str(console_python)
 USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
+ACCOUNT_TYPE_HISTORY_JSON = Path(
+    os.environ.get("TOKEN_PULSE_ACCOUNT_TYPE_HISTORY_JSON")
+    or APP_DIR / "client_usage_account_types.json"
+)
+LIVE_USAGE_CHECKPOINT_JSON = Path(
+    os.environ.get("TOKEN_PULSE_LIVE_USAGE_CHECKPOINT_JSON")
+    or APP_DIR / "client_usage_live_checkpoint.json"
+)
+LIVE_USAGE_CHECKPOINT_SCHEMA = 2
+LIVE_USAGE_CHECKPOINT_WRITE_SECONDS = max(
+    0.25,
+    float(os.environ.get("TOKEN_PULSE_LIVE_CHECKPOINT_WRITE_SECONDS", "1")),
+)
+LIVE_USAGE_RECONCILE_DELAY_MS = max(
+    1_000,
+    int(os.environ.get("TOKEN_PULSE_LIVE_RECONCILE_DELAY_MS", "5000")),
+)
+LIVE_USAGE_INITIAL_RECHECK_MS = max(
+    LIVE_USAGE_RECONCILE_DELAY_MS,
+    int(os.environ.get("TOKEN_PULSE_LIVE_INITIAL_RECHECK_MS", "10000")),
+)
+LIVE_USAGE_NEW_ROLLOUT_WATCH_SECONDS = max(
+    5.0,
+    float(os.environ.get("TOKEN_PULSE_NEW_ROLLOUT_WATCH_SECONDS", "20")),
+)
+LIVE_USAGE_RECONCILE_MIN_INTERVAL_SECONDS = max(
+    10.0,
+    float(os.environ.get("TOKEN_PULSE_RECONCILE_MIN_INTERVAL_SECONDS", "30")),
+)
 CLIENT_USAGE_ROUTE_LABELS_JSON = Path(
     os.environ.get("CLIENT_USAGE_ROUTE_LABELS_JSON") or APP_DIR / "client_usage_route_labels.json"
 )
@@ -535,29 +592,85 @@ def _account_type_lookup_key(value: Any) -> str:
     return ranking_account_display_name(str(value or "")).strip().casefold()
 
 
-def local_account_type_map() -> dict[str, str]:
-    global _ACCOUNT_TYPE_CACHE_SIGNATURE, _ACCOUNT_TYPE_CACHE
-    paths = [
-        Path.home() / ".antigravity_cockpit" / "codex_accounts.json",
-        Path.home() / ".codex" / "auth.json",
-        Path.home() / ".codex" / ".cockpit_codex_auth.json",
-    ]
+def _account_type_source_signature(paths: list[Path]) -> tuple[tuple[str, int], ...]:
     signature: list[tuple[str, int]] = []
     for path in paths:
         try:
             signature.append((str(path), int(path.stat().st_mtime_ns)))
         except OSError:
             signature.append((str(path), -1))
-    signature_key = tuple(signature)
-    if signature_key == _ACCOUNT_TYPE_CACHE_SIGNATURE:
-        return _ACCOUNT_TYPE_CACHE
+    return tuple(signature)
 
-    account_types: dict[str, str] = {}
-    manifest_path = paths[0]
+
+def load_account_type_history() -> dict[str, str]:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="ignore"))
+        data = json.loads(ACCOUNT_TYPE_HISTORY_JSON.read_text(encoding="utf-8", errors="ignore"))
     except (OSError, json.JSONDecodeError):
-        manifest = {}
+        return {}
+    rows = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    result: dict[str, str] = {}
+    for identity, value in rows.items():
+        raw_label = value.get("plan_type") if isinstance(value, dict) else value
+        key = _account_type_lookup_key(identity)
+        label = normalize_account_plan_type(raw_label)
+        if key and key != "-" and label:
+            result[key] = label
+    return result
+
+
+def save_account_type_history(account_types: dict[str, str]) -> bool:
+    saved = load_account_type_history()
+    normalized = {
+        key: normalize_account_plan_type(label)
+        for identity, label in account_types.items()
+        if (key := _account_type_lookup_key(identity)) and key != "-"
+    }
+    normalized = {key: label for key, label in normalized.items() if label}
+    if normalized == saved:
+        return False
+    now_text = datetime.now(CN_TZ).isoformat(timespec="seconds")
+    try:
+        existing_data = json.loads(
+            ACCOUNT_TYPE_HISTORY_JSON.read_text(encoding="utf-8", errors="ignore")
+        )
+    except (OSError, json.JSONDecodeError):
+        existing_data = {}
+    existing_rows = existing_data.get("accounts") if isinstance(existing_data, dict) else {}
+    existing_rows = existing_rows if isinstance(existing_rows, dict) else {}
+    rows: dict[str, dict[str, str]] = {}
+    for identity, label in sorted(normalized.items()):
+        previous = existing_rows.get(identity)
+        previous_label = normalize_account_plan_type(
+            previous.get("plan_type") if isinstance(previous, dict) else previous
+        )
+        previous_at = str(previous.get("updated_at") or "") if isinstance(previous, dict) else ""
+        rows[identity] = {
+            "plan_type": label,
+            "updated_at": previous_at if previous_label == label and previous_at else now_text,
+        }
+    write_json_atomic(
+        ACCOUNT_TYPE_HISTORY_JSON,
+        {
+            "schema": 1,
+            "updated_at": now_text,
+            "accounts": rows,
+        },
+    )
+    return True
+
+
+def _add_manifest_account_types(
+    path: Path,
+    account_types: dict[str, str],
+    *,
+    overwrite: bool,
+) -> None:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return
     rows = manifest.get("accounts") if isinstance(manifest, dict) else None
     for account in rows if isinstance(rows, list) else []:
         if not isinstance(account, dict):
@@ -576,21 +689,85 @@ def local_account_type_map() -> dict[str, str]:
             account.get("id"),
         ):
             key = _account_type_lookup_key(identity)
-            if key and key != "-":
+            if not key or key == "-":
+                continue
+            if overwrite or key not in account_types:
                 account_types[key] = plan_label
 
-    for auth_path in paths[1:]:
-        try:
-            auth_data = json.loads(auth_path.read_text(encoding="utf-8", errors="ignore"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(auth_data, dict):
-            continue
-        identity = codex_auth_identity(auth_data)
-        plan_label = codex_auth_plan_type(auth_data)
-        key = _account_type_lookup_key(identity)
-        if key and key != "-" and plan_label:
-            account_types[key] = plan_label
+
+def _add_auth_account_type(
+    path: Path,
+    account_types: dict[str, str],
+    *,
+    overwrite: bool,
+) -> None:
+    try:
+        auth_data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(auth_data, dict):
+        return
+    identity = codex_auth_identity(auth_data)
+    plan_label = codex_auth_plan_type(auth_data)
+    key = _account_type_lookup_key(identity)
+    if key and key != "-" and plan_label and (overwrite or key not in account_types):
+        account_types[key] = plan_label
+
+
+def local_account_type_map() -> dict[str, str]:
+    global _ACCOUNT_TYPE_CACHE_SIGNATURE, _ACCOUNT_TYPE_CACHE
+    cockpit_root = Path.home() / ".antigravity_cockpit"
+    manifest_path = cockpit_root / "codex_accounts.json"
+    sidecar_auth_dir = cockpit_root / "codex_local_access_sidecar" / "auths"
+    current_auth_paths = [
+        Path.home() / ".codex" / "auth.json",
+        Path.home() / ".codex" / ".cockpit_codex_auth.json",
+    ]
+    signature_paths = [
+        ACCOUNT_TYPE_HISTORY_JSON,
+        manifest_path,
+        cockpit_root,
+        sidecar_auth_dir,
+        *current_auth_paths,
+    ]
+    signature_key = _account_type_source_signature(signature_paths)
+    if signature_key == _ACCOUNT_TYPE_CACHE_SIGNATURE:
+        return _ACCOUNT_TYPE_CACHE
+
+    account_types = load_account_type_history()
+
+    # Cockpit keeps deleted-account snapshots and sidecar auth backups. Import
+    # them only as missing history; current metadata below remains authoritative.
+    try:
+        manifest_backups = sorted(
+            (
+                path
+                for path in cockpit_root.glob("codex_accounts.json*")
+                if path != manifest_path and path.is_file()
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+    except OSError:
+        manifest_backups = []
+    for backup_path in manifest_backups:
+        _add_manifest_account_types(backup_path, account_types, overwrite=False)
+
+    try:
+        sidecar_auth_paths = sorted(
+            (path for path in sidecar_auth_dir.glob("*.json*") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+    except OSError:
+        sidecar_auth_paths = []
+    for auth_path in sidecar_auth_paths:
+        _add_auth_account_type(auth_path, account_types, overwrite=False)
+
+    _add_manifest_account_types(manifest_path, account_types, overwrite=True)
+    for auth_path in current_auth_paths:
+        _add_auth_account_type(auth_path, account_types, overwrite=True)
+
+    if save_account_type_history(account_types):
+        signature_key = _account_type_source_signature(signature_paths)
 
     _ACCOUNT_TYPE_CACHE_SIGNATURE = signature_key
     _ACCOUNT_TYPE_CACHE = account_types
@@ -805,6 +982,68 @@ def detailed_usage_from_client_usage(client_usage: dict[str, Any] | None) -> dic
     return {"models": model_totals, "providers": provider_rows}
 
 
+def detailed_usage_from_account_rows(rows: list[dict[str, Any]] | None) -> dict[str, Any]:
+    aggregated: dict[str, dict[str, Any]] = {}
+    for source in rows if isinstance(rows, list) else []:
+        if not isinstance(source, dict) or source.get("is_pool_aggregate"):
+            continue
+        requests_count = max(0, int(source.get("requests") or 0))
+        tokens = max(0, int(source.get("tokens") or 0))
+        cost = max(0.0, float(source.get("cost") or 0))
+        if requests_count <= 0 and tokens <= 0 and cost <= 0:
+            continue
+        name = str(source.get("name") or "Local client")
+        key = account_display_key(name) or name.casefold()
+        target = aggregated.setdefault(
+            key,
+            {
+                "name": name,
+                "plan_type": str(source.get("plan_type") or ""),
+                "requests": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "models": {},
+            },
+        )
+        target["requests"] += requests_count
+        target["tokens"] += tokens
+        target["cost"] += cost
+        models = source.get("models") if isinstance(source.get("models"), dict) else {}
+        for model, amount in models.items():
+            value = max(0, int(amount or 0))
+            if value > 0:
+                model_name = str(model or "unknown")
+                target["models"][model_name] = target["models"].get(model_name, 0) + value
+
+    model_totals: dict[str, int] = {}
+    providers = list(aggregated.values())
+    for provider in providers:
+        provider["cost"] = round(float(provider.get("cost") or 0), 6)
+        for model, amount in provider["models"].items():
+            model_totals[model] = model_totals.get(model, 0) + int(amount or 0)
+    return {"models": model_totals, "providers": providers}
+
+
+def detailed_usage_from_state(state: Any) -> dict[str, Any]:
+    client_details = detailed_usage_from_client_usage(
+        state.client_usage if isinstance(getattr(state, "client_usage", None), dict) else None
+    )
+    account_details = detailed_usage_from_account_rows(
+        state.top_accounts if isinstance(getattr(state, "top_accounts", None), list) else None
+    )
+    account_rows = account_details.get("providers") or []
+    if not account_rows:
+        return client_details
+    target_tokens = max(0, int(getattr(state, "today_tokens", 0) or 0))
+    client_tokens = sum(int(row.get("tokens") or 0) for row in client_details.get("providers") or [])
+    account_tokens = sum(int(row.get("tokens") or 0) for row in account_rows)
+    return (
+        account_details
+        if abs(account_tokens - target_tokens) <= abs(client_tokens - target_tokens)
+        else client_details
+    )
+
+
 def summarize_usage_history(history: dict[str, Any]) -> dict[str, Any]:
     days = history.get("days") if isinstance(history, dict) else {}
     if not isinstance(days, dict):
@@ -927,7 +1166,7 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         source_date = str(state.client_usage.get("date") or "").strip()
     existing_source_date = str(existing.get("source_date") or "").strip()
     mix = token_mix_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
-    details = detailed_usage_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
+    details = detailed_usage_from_state(state)
     preserve_existing_details = False
 
     # Same-day client usage is reconstructed from local logs and account
@@ -1050,6 +1289,12 @@ def account_usage_sort_key(row: dict[str, Any], account_range: str) -> tuple[Any
     return (-tokens, -requests, name)
 
 
+def account_row_available_for_range(row: dict[str, Any], account_range: str) -> bool:
+    if row.get("is_unattributed_gap"):
+        return False
+    return not (account_range == "today" and row.get("window_only"))
+
+
 def account_display_key(value: Any) -> str:
     name = str(value or "").strip().lower()
     for prefix in ("codex local - ", "local - "):
@@ -1135,6 +1380,26 @@ def _read_jsonl_tail(path: Path, max_bytes: int = LIVE_ACTIVE_TAIL_BYTES) -> lis
 TOKEN_COUNT_BYTES_RE = re.compile(rb'"type"\s*:\s*"token_count"')
 
 
+def _live_usage_event_id(
+    when: datetime,
+    session_id: str,
+    input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+) -> str:
+    aware = when if when.tzinfo is not None else when.replace(tzinfo=CN_TZ)
+    timestamp_us = int(round(aware.timestamp() * 1_000_000))
+    return "|".join(
+        (
+            str(session_id or ""),
+            str(timestamp_us),
+            str(max(0, int(input_tokens or 0))),
+            str(max(0, int(cached_tokens or 0))),
+            str(max(0, int(output_tokens or 0))),
+        )
+    )
+
+
 class CodexUsageFileWatcher:
     """Detect appended token_count records with hot-file and fallback scans."""
 
@@ -1146,10 +1411,14 @@ class CodexUsageFileWatcher:
         self._recent_dir_mtimes: dict[Path, int] = {}
         self._seen_events: dict[tuple[Any, ...], None] = {}
         self._last_cumulative_by_path: dict[Path, tuple[int, int, int, int]] = {}
+        self._fork_replay_cutoffs: dict[Path, datetime | None] = {}
         self._last_full_scan_at = float("-inf")
         self._last_activity_at = time.monotonic()
         self._primed = False
         self.token_count_changed = False
+        self.reconciliation_needed = False
+        self._reconciliation_paths: dict[Path, float] = {}
+        self._last_reconciliation_change_at = float("-inf")
 
     @staticmethod
     def _eligible(path: Path) -> bool:
@@ -1177,6 +1446,32 @@ class CodexUsageFileWatcher:
         while len(self._hot_files) > LIVE_USAGE_WATCH_HOT_FILE_LIMIT:
             coldest = min(self._hot_files, key=self._hot_files.get)
             self._hot_files.pop(coldest, None)
+
+    def _fork_replay_cutoff(self, path: Path) -> datetime | None:
+        if path in self._fork_replay_cutoffs:
+            return self._fork_replay_cutoffs[path]
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                for _ in range(4):
+                    line = handle.readline()
+                    if not line:
+                        return None
+                    row = json.loads(line)
+                    if row.get("type") != "session_meta":
+                        continue
+                    payload = row.get("payload") or {}
+                    if not payload.get("forked_from_id"):
+                        self._fork_replay_cutoffs[path] = None
+                        return None
+                    started = _parse_time(str(row.get("timestamp") or payload.get("timestamp") or ""))
+                    if started is None:
+                        return None
+                    cutoff = started + timedelta(seconds=2)
+                    self._fork_replay_cutoffs[path] = cutoff
+                    return cutoff
+        except (OSError, json.JSONDecodeError):
+            return None
+        return None
 
     def _recent_session_directories(self) -> list[Path]:
         today = datetime.now()
@@ -1235,8 +1530,23 @@ class CodexUsageFileWatcher:
             return LIVE_USAGE_WATCH_IDLE_INTERVAL_MS
         return LIVE_USAGE_WATCH_COLD_INTERVAL_MS
 
+    def has_recent_activity(self, window_seconds: float) -> bool:
+        return time.monotonic() - self._last_activity_at <= max(0.0, float(window_seconds))
+
+    def reconciliation_ready(self, quiet_seconds: float) -> bool:
+        if not self.reconciliation_needed:
+            return True
+        now = time.monotonic()
+        if self._reconciliation_paths:
+            return now >= max(self._reconciliation_paths.values())
+        return now - self._last_reconciliation_change_at >= max(0.0, float(quiet_seconds))
+
+    def mark_reconciled(self) -> None:
+        self.reconciliation_needed = False
+
     def _extract_live_events(self, path: Path, data: bytes) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        fork_replay_cutoff = self._fork_replay_cutoff(path)
         session_match = re.search(
             r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
             path.stem,
@@ -1250,6 +1560,8 @@ class CodexUsageFileWatcher:
                 continue
             usage = _live_token_usage(row)
             if usage is None:
+                continue
+            if fork_replay_cutoff is not None and usage["when"] <= fork_replay_cutoff:
                 continue
             payload = row.get("payload") or {}
             info = payload.get("info") or {}
@@ -1278,6 +1590,13 @@ class CodexUsageFileWatcher:
             self._seen_events[event_key] = None
             if session_id:
                 usage["session_id"] = session_id
+            usage["event_id"] = _live_usage_event_id(
+                usage["when"],
+                session_id,
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("cached_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+            )
             events.append(usage)
         while len(self._seen_events) > 4096:
             self._seen_events.pop(next(iter(self._seen_events)))
@@ -1288,6 +1607,9 @@ class CodexUsageFileWatcher:
         token_count_changed = False
         was_primed = self._primed
         now = time.monotonic()
+        for watched_path, expires_at in list(self._reconciliation_paths.items()):
+            if now >= expires_at:
+                self._reconciliation_paths.pop(watched_path, None)
         activity_detected = False
         paths = set(self._hot_files)
         paths.update(self._discover_recent_paths())
@@ -1302,6 +1624,7 @@ class CodexUsageFileWatcher:
             for missing in set(self._files) - scanned_paths:
                 self._files.pop(missing, None)
                 self._hot_files.pop(missing, None)
+                self._fork_replay_cutoffs.pop(missing, None)
 
         for path in paths:
             try:
@@ -1309,6 +1632,7 @@ class CodexUsageFileWatcher:
             except OSError:
                 self._files.pop(path, None)
                 self._hot_files.pop(path, None)
+                self._fork_replay_cutoffs.pop(path, None)
                 continue
             size = max(0, int(stat.st_size))
             modified_ns = int(stat.st_mtime_ns)
@@ -1318,6 +1642,9 @@ class CodexUsageFileWatcher:
             self._remember_hot_file(path, modified_ns)
             if previous == current:
                 continue
+            if was_primed and path in self._reconciliation_paths:
+                self.reconciliation_needed = True
+                self._last_reconciliation_change_at = now
             if was_primed:
                 activity_detected = True
             if not was_primed:
@@ -1335,9 +1662,14 @@ class CodexUsageFileWatcher:
                 continue
             token_count_changed = True
             extracted = self._extract_live_events(path, data)
-            # A brand-new rollout may contain a copied fork prefix. Let the full
-            # exporter classify it before applying any optimistic UI delta.
-            if previous is not None:
+            # A brand-new rollout may contain a copied fork prefix. Keep all of
+            # its events provisional during the observation window so delayed
+            # fork metadata cannot make the visible total jump and then fall.
+            if previous is None:
+                self.reconciliation_needed = True
+                self._reconciliation_paths[path] = now + LIVE_USAGE_NEW_ROLLOUT_WATCH_SECONDS
+                self._last_reconciliation_change_at = now
+            elif path not in self._reconciliation_paths:
                 live_events.extend(extracted)
 
         if activity_detected:
@@ -2031,6 +2363,8 @@ def load_client_usage(
         "active_sessions": data.get("active_sessions") or [],
         "latest_request": data.get("latest_request") or {},
         "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
+        "scan_status": data.get("scan_status") if isinstance(data.get("scan_status"), dict) else {},
+        "api_service_routed": bool(data.get("api_service_routed")),
         "updated_at": data.get("updated_at") or "",
         "date": data_date,
         "stale": bool(sync_status.get("cache_used")),
@@ -2539,6 +2873,7 @@ def build_local_monitor_state(
                     "app_speed": provider.get("app_speed") or "",
                     "cost_multiplier": provider.get("cost_multiplier") or 1,
                     "speed_badge": provider.get("speed_badge") or "",
+                    "models": dict(provider.get("models") or {}),
                     "latest_at": provider.get("latest_at") or "",
                     "latest_model": provider.get("latest_model") or "",
                     "window_5h": provider.get("window_5h") or {},
@@ -2547,6 +2882,7 @@ def build_local_monitor_state(
                     "window_30d": provider.get("window_30d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
                     "active_now": False,
+                    "window_only": bool(provider.get("window_only")),
                     "is_unattributed_gap": bool(provider.get("is_unattributed_gap")),
                     "is_latest": str(provider.get("name") or "") == latest_provider_name,
                 }
@@ -3171,6 +3507,7 @@ class Sub2APIClient:
                     "app_speed": provider.get("app_speed") or "",
                     "cost_multiplier": provider.get("cost_multiplier") or 1,
                     "speed_badge": provider.get("speed_badge") or "",
+                    "models": dict(provider.get("models") or {}),
                     "latest_at": provider.get("latest_at") or "",
                     "latest_model": provider.get("latest_model") or "",
                     "window_5h": provider.get("window_5h") or {},
@@ -3179,6 +3516,7 @@ class Sub2APIClient:
                     "window_30d": provider.get("window_30d") or {},
                     "window_cycle": provider.get("window_cycle") or {},
                     "active_now": False,
+                    "window_only": bool(provider.get("window_only")),
                     "is_unattributed_gap": bool(provider.get("is_unattributed_gap")),
                     "is_latest": provider_name == latest_provider_name,
                 }
@@ -3365,6 +3703,11 @@ class FloatingMonitorApp:
         self._refresh_pending = False
         self._live_active_lock = threading.Lock()
         self._live_usage_lock = threading.Lock()
+        self._live_catchup_lock = threading.Lock()
+        self._quota_refresh_lock = threading.Lock()
+        self._last_quota_refresh_at = 0.0
+        self._full_refresh_requested = False
+        self._last_forced_full_refresh_at = float("-inf")
         self._live_active_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="active-session-watch",
@@ -3377,6 +3720,14 @@ class FloatingMonitorApp:
             max_workers=1,
             thread_name_prefix="token-usage-watch",
         )
+        self._live_catchup_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="token-usage-catchup",
+        )
+        self._quota_refresh_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="quota-refresh",
+        )
         self._last_auth_identity = ""
         self._capture_auth_switch(refresh_active=False)
         self._live_usage_watcher = CodexUsageFileWatcher(Path.home() / ".codex" / "sessions")
@@ -3385,6 +3736,17 @@ class FloatingMonitorApp:
         except Exception:
             pass
         self._live_usage_overlay: dict[str, Any] | None = None
+        self._live_usage_seen_ids: dict[str, None] = {}
+        self._live_usage_event_records: dict[str, dict[str, Any]] = {}
+        self._live_usage_rate_samples: list[tuple[float, int]] = []
+        self._live_usage_verification_pending = False
+        self._live_usage_verification_latest_when: datetime | None = None
+        self._live_usage_verification_pending_tokens = 0
+        self._last_live_checkpoint_write_at = float("-inf")
+        self._live_reconcile_scheduled = False
+        self._live_initial_recheck_scheduled = False
+        self._last_live_reconcile_at = float("-inf")
+        self._restore_live_usage_checkpoint()
         self._pulse_phase = 0.0
         self._pulse_tick_scheduled = False
         self._token_flow_samples: list[tuple[float, int]] = []
@@ -3511,6 +3873,7 @@ class FloatingMonitorApp:
         self._schedule_live_active_refresh()
         self._schedule_auth_switch_refresh()
         self._schedule_live_usage_refresh()
+        self._refresh_live_usage_catchup_async()
         self._schedule_midnight_refresh()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3901,10 +4264,72 @@ class FloatingMonitorApp:
             )
             half_height = max(
                 2,
-                int(max_half_height * (0.28 + 0.72 * event_level)),
+                int(max_half_height * (0.38 + 0.62 * event_level)),
             )
             pulses.append((pulse_x, half_height, event_level))
         return pulses
+
+    @staticmethod
+    def _token_flow_ecg_points(
+        width: int,
+        height: int,
+        pulses: list[tuple[float, int, float]],
+    ) -> list[tuple[float, float]]:
+        width = max(1, int(width))
+        height = max(5, int(height))
+        center_y = height / 2.0
+        # P-QRS-T profile. The R peak uses the full event-scaled height.
+        profile = (
+            (-1.00, 0.00),
+            (-0.72, 0.00),
+            (-0.56, -0.18),
+            (-0.40, 0.00),
+            (-0.22, 0.00),
+            (-0.10, 0.36),
+            (0.00, -1.00),
+            (0.12, 0.56),
+            (0.28, 0.00),
+            (0.52, 0.00),
+            (0.70, -0.24),
+            (0.90, 0.00),
+            (1.00, 0.00),
+        )
+        half_span = max(9.0, min(18.0, width / 14.0))
+        profile_offsets = tuple(
+            (float(round(profile_x * half_span)), profile_y)
+            for profile_x, profile_y in profile
+        )
+        events: list[tuple[float, int]] = []
+        positions = {0.0, float(width)}
+        for pulse_x, half_height, _event_level in pulses:
+            pulse_x = min(float(width), max(0.0, float(pulse_x)))
+            events.append((pulse_x, max(2, int(half_height))))
+            for profile_offset, _profile_y in profile_offsets:
+                positions.add(
+                    min(float(width), max(0.0, pulse_x + profile_offset))
+                )
+
+        points: list[tuple[float, float]] = []
+        for point_x in sorted(positions):
+            offset = 0.0
+            for pulse_x, half_height in events:
+                phase = (point_x - pulse_x) / half_span
+                if phase < -1.0 or phase > 1.0:
+                    continue
+                wave = 0.0
+                for index in range(len(profile) - 1):
+                    left_x, left_y = profile[index]
+                    right_x, right_y = profile[index + 1]
+                    if phase > right_x:
+                        continue
+                    ratio = (phase - left_x) / max(0.001, right_x - left_x)
+                    wave = left_y + (right_y - left_y) * ratio
+                    break
+                event_offset = wave * half_height
+                if abs(event_offset) > abs(offset):
+                    offset = event_offset
+            points.append((point_x, center_y + offset))
+        return points
 
     def _draw_token_flow_trace(
         self,
@@ -3919,32 +4344,23 @@ class FloatingMonitorApp:
             self._token_flow_trace_rect = (x1, y1, x2, y2)
         width = max(1, x2 - x1)
         height = max(5, y2 - y1)
-        center_y = y1 + height // 2
         level, recent_tokens = self._token_flow_snapshot()
         pulses = self._token_flow_trace_pulses(width, height)
-        baseline_color = Theme.live if pulses or level > 0.02 else "#284B49"
+        points = self._token_flow_ecg_points(width, height, pulses)
+        coords = [
+            coordinate
+            for point_x, point_y in points
+            for coordinate in (x1 + point_x, y1 + point_y)
+        ]
+        signal_color = Theme.live if pulses or level > 0.02 else "#284B49"
         self.canvas.create_line(
-            x1,
-            center_y,
-            x2,
-            center_y,
-            fill=baseline_color,
-            width=2,
+            *coords,
+            fill=signal_color,
+            width=1,
             capstyle="round",
-            tags=("token_flow_trace", "token_flow_trace_baseline"),
+            joinstyle="round",
+            tags=("token_flow_trace", "token_flow_trace_signal"),
         )
-        for pulse_x, half_height, event_level in pulses:
-            color = Theme.live if event_level >= 0.35 else "#4FB895"
-            self.canvas.create_line(
-                x1 + pulse_x,
-                center_y - half_height,
-                x1 + pulse_x,
-                center_y + half_height,
-                fill=color,
-                width=2,
-                capstyle="round",
-                tags=("token_flow_trace", "token_flow_trace_pulse"),
-            )
         if register:
             self._add_tooltip(
                 x1,
@@ -3961,46 +4377,23 @@ class FloatingMonitorApp:
         x1, y1, x2, y2 = rect
         width = max(1, x2 - x1)
         height = max(5, y2 - y1)
-        center_y = y1 + height // 2
         level, _recent_tokens = self._token_flow_snapshot()
         pulses = self._token_flow_trace_pulses(width, height)
-        baseline_color = Theme.live if pulses or level > 0.02 else "#284B49"
+        points = self._token_flow_ecg_points(width, height, pulses)
+        coords = [
+            coordinate
+            for point_x, point_y in points
+            for coordinate in (x1 + point_x, y1 + point_y)
+        ]
+        signal_color = Theme.live if pulses or level > 0.02 else "#284B49"
 
-        baseline_items = self.canvas.find_withtag("token_flow_trace_baseline")
-        if not baseline_items:
+        signal_items = self.canvas.find_withtag("token_flow_trace_signal")
+        if not signal_items:
             self._draw_token_flow_trace(*rect, register=False)
             return True
-        baseline_item = baseline_items[0]
-        self.canvas.coords(baseline_item, x1, center_y, x2, center_y)
-        self.canvas.itemconfigure(baseline_item, fill=baseline_color, state="normal")
-
-        pulse_items = list(self.canvas.find_withtag("token_flow_trace_pulse"))
-        while len(pulse_items) < len(pulses):
-            pulse_items.append(
-                self.canvas.create_line(
-                    x1,
-                    center_y,
-                    x1,
-                    center_y,
-                    fill=Theme.live,
-                    width=2,
-                    capstyle="round",
-                    tags=("token_flow_trace", "token_flow_trace_pulse"),
-                )
-            )
-        for item, (pulse_x, half_height, event_level) in zip(pulse_items, pulses):
-            color = Theme.live if event_level >= 0.35 else "#4FB895"
-            px = x1 + pulse_x
-            self.canvas.coords(
-                item,
-                px,
-                center_y - half_height,
-                px,
-                center_y + half_height,
-            )
-            self.canvas.itemconfigure(item, fill=color, state="normal")
-        for item in pulse_items[len(pulses):]:
-            self.canvas.itemconfigure(item, state="hidden")
+        signal_item = signal_items[0]
+        self.canvas.coords(signal_item, *coords)
+        self.canvas.itemconfigure(signal_item, fill=signal_color, state="normal")
         return True
 
     def _draw_section_label(
@@ -4390,13 +4783,9 @@ class FloatingMonitorApp:
 
     def _usage_range_providers(self, range_key: str) -> list[dict[str, Any]]:
         if range_key == "24h":
-            return [
-                provider
-                for provider in self._client_providers()
-                if int(provider.get("requests") or 0) > 0
-                or int(provider.get("tokens") or 0) > 0
-                or float(provider.get("cost") or 0) > 0
-            ]
+            details = detailed_usage_from_state(self.state) if self.state is not None else {}
+            providers = details.get("providers") if isinstance(details, dict) else []
+            return [provider for provider in providers if isinstance(provider, dict)]
 
         history = load_usage_history()
         days = history.get("days") if isinstance(history, dict) else {}
@@ -4524,6 +4913,40 @@ class FloatingMonitorApp:
             rows.append(row)
         return rows
 
+    def _history_7d_fallback_rows(
+        self,
+        existing_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        existing_keys = {
+            account_display_key(row.get("name"))
+            for row in existing_rows
+            if isinstance(row, dict)
+        }
+        fallback: list[dict[str, Any]] = []
+        for row in self._filter_account_display_rows(self._history_account_rows("7d")):
+            key = account_display_key(row.get("name"))
+            if not key or "@" not in key or key in existing_keys:
+                continue
+            if (
+                int(row.get("requests") or 0) <= 0
+                and int(row.get("tokens") or 0) <= 0
+                and float(row.get("cost") or 0) <= 0
+            ):
+                continue
+            item = dict(row)
+            item.update(
+                {
+                    "quota_available": False,
+                    "quota_unlimited": False,
+                    "quota_stale": False,
+                    "quota_reset_unavailable": False,
+                    "quota_idle": False,
+                    "historical_fallback": True,
+                }
+            )
+            fallback.append(item)
+        return fallback
+
     def _needs_server_account_30d(self) -> bool:
         return any(
             isinstance(row, dict) and str(row.get("source_badge") or "") == "SUB"
@@ -4650,10 +5073,10 @@ class FloatingMonitorApp:
             live_delta = self._live_usage_summary_delta(authoritative_tokens)
             live_tokens = int(self.state.today_tokens if self.state else 0)
             return {
-                "label": "24h",
+                "label": "今日",
                 "requests": int(self.state.today_requests if self.state else 0),
                 "tokens": live_tokens,
-                "breakdown_tokens": authoritative_tokens + live_delta["tokens"],
+                "breakdown_tokens": live_tokens,
                 "input_tokens": mix["input"] + live_delta["input_tokens"],
                 "cached_input_tokens": mix["cached"] + live_delta["cached_input_tokens"],
                 "cache_creation_input_tokens": mix["cache_create"],
@@ -5212,7 +5635,7 @@ class FloatingMonitorApp:
         summary = self._usage_range_summary(self._usage_range)
         c.create_text(col_l, y, anchor="nw", text="\u7528\u91cf\u6982\u89c8",
                       font=self._fonts["font_section"], fill=Theme.text_primary)
-        range_buttons = [("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("\u5168\u90e8", "all")]
+        range_buttons = [("今日", "24h"), ("7d", "7d"), ("30d", "30d"), ("\u5168\u90e8", "all")]
         btn_w = 38
         gap = 2
         x = col_r - (btn_w * len(range_buttons) + gap * (len(range_buttons) - 1))
@@ -5545,6 +5968,9 @@ class FloatingMonitorApp:
         #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
         sync_state = str((self.state.usage_sync or {}).get("state") or "") if self.state else ""
+        verifying_live_usage = bool(
+            getattr(self, "_live_usage_verification_pending", False)
+        )
         y = 12
         if self._loading:
             phase = (math.sin(self._pulse_phase) + 1.0) / 2.0
@@ -5554,6 +5980,8 @@ class FloatingMonitorApp:
                 int(79 + 94 * phase),
             )
             pulse_color = "#%02x%02x%02x" % pulse_rgb
+        elif verifying_live_usage:
+            pulse_color = Theme.warn
         elif self.state:
             if sync_state in {"timeout", "error", "unavailable", "stale"}:
                 pulse_color = Theme.coral
@@ -5570,14 +5998,31 @@ class FloatingMonitorApp:
                       font=self._fonts["font_title"], fill=Theme.text_primary)
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
-        if self._refresh_pending:
+        if verifying_live_usage:
+            pending_tokens = max(
+                0,
+                int(getattr(self, "_live_usage_verification_pending_tokens", 0) or 0),
+            )
+            updated = f"核对 {compact_number(pending_tokens)} Token"
+        elif self._refresh_pending:
             updated = "\u5237\u65b0\u5df2\u6392\u961f"
         else:
             updated = "\u6b63\u5728\u5237\u65b0" if self._loading else "\u7b49\u5f85\u5237\u65b0"
-        if self.state and self.state.updated_at and not self._loading and not self._refresh_pending:
+        if (
+            self.state
+            and self.state.updated_at
+            and not self._loading
+            and not self._refresh_pending
+            and not verifying_live_usage
+        ):
             updated = relative_time(datetime.fromtimestamp(self.state.updated_at, timezone.utc).isoformat())
         sync_label = usage_sync_label(self.state.usage_sync if self.state else None)
-        if sync_label and not self._loading and not self._refresh_pending:
+        if (
+            sync_label
+            and not self._loading
+            and not self._refresh_pending
+            and not verifying_live_usage
+        ):
             updated = sync_label
         subtitle = f"\u6d3b\u8dc3 {active_count}  \u00b7  {updated}"
         c.create_text(title_x, y + 24, anchor="nw", text=subtitle,
@@ -5664,7 +6109,7 @@ class FloatingMonitorApp:
         c.create_oval(COL_L + 13, y + 13, COL_L + 21, y + 21, fill=hero_color, outline="")
         c.create_text(COL_L + 28, y + 10, anchor="nw", text="\u5f53\u524d\u8def\u7531",
                       font=self._fonts["font_tiny"], fill=Theme.text_muted)
-        self._draw_token_flow_trace(COL_L + 92, y + 8, metric_l - 12, y + 25)
+        self._draw_token_flow_trace(COL_L + 92, y + 5, metric_l - 12, y + 26)
         display_name = self._truncate(str(hero_name), "font_hero", metric_l - COL_L - 42)
         c.create_text(COL_L + 14, y + 29, anchor="nw", text=display_name,
                       font=self._fonts["font_hero"], fill=Theme.text_primary)
@@ -5991,7 +6436,7 @@ class FloatingMonitorApp:
         raw_top = [
             account
             for account in (list(self.state.top_accounts or []) if self.state else [])
-            if not account.get("is_unattributed_gap")
+            if account_row_available_for_range(account, self._account_range)
         ]
         raw_top = self._filter_account_display_rows(raw_top)
         range_key = {
@@ -6044,6 +6489,8 @@ class FloatingMonitorApp:
                 item["quota_reset_unavailable"] = bool(window.get("quota_reset_unavailable"))
                 item["quota_idle"] = bool(window.get("quota_idle")) if self._account_range == "5h" else False
                 top.append(item)
+            if self._account_range == "7d":
+                top.extend(self._history_7d_fallback_rows(top))
             top.sort(key=lambda row: account_usage_sort_key(row, self._account_range))
         else:
             top = raw_top
@@ -6135,6 +6582,7 @@ class FloatingMonitorApp:
             quota_stale = bool(acc.get("quota_stale")) if window_mode else False
             quota_reset_unavailable = bool(acc.get("quota_reset_unavailable")) if window_mode else False
             quota_idle = bool(acc.get("quota_idle")) if window_mode else False
+            historical_fallback = bool(acc.get("historical_fallback")) if window_mode else False
             cycle_window = acc.get("window_cycle") if isinstance(acc.get("window_cycle"), dict) else {}
             has_cycle_quota = bool(cycle_window.get("quota_available"))
             if window_mode and quota_unlimited:
@@ -6169,6 +6617,8 @@ class FloatingMonitorApp:
                         percentage_text = "--%"
                 elif has_cycle_quota and self._account_range in {"5h", "7d"}:
                     percentage_text = "\u5468\u671f\u8d26\u53f7"
+                elif historical_fallback:
+                    percentage_text = "\u8fd17\u65e5"
                 else:
                     percentage_text = "\u6682\u65e0\u989d\u5ea6"
                 percentage_color = (
@@ -6219,6 +6669,9 @@ class FloatingMonitorApp:
                 elif has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
                     right_detail = "\u770b\u5468\u671f\u9875"
                     right_color = Theme.amber_bright
+                elif historical_fallback:
+                    right_detail = f"\u5386\u53f2 \u00b7 {reqs} \u6b21"
+                    right_color = Theme.text_muted
                 elif not quota_available:
                     right_detail = "\u65e0\u8be5\u7a97\u53e3\u989d\u5ea6"
                     right_color = Theme.text_muted
@@ -6247,6 +6700,8 @@ class FloatingMonitorApp:
                         reset_text = f"\u5468\u671f \u00b7 {reset_text}"
                     elif self._account_range == "5h" and reset_text and not quota_idle:
                         reset_text = f"5h \u9650\u989d \u00b7 {reset_text}"
+                elif historical_fallback:
+                    reset_text = "\u65e0\u5b98\u65b9\u5468\u989d\u5ea6 \u00b7 \u8fd17\u65e5\u6c47\u603b"
                 elif self._account_range == "7d":
                     reset_text = "\u8be5\u8d26\u53f7\u4f7f\u7528\u5468\u671f\u989d\u5ea6" if has_cycle_quota else "\u672a\u63d0\u4f9b\u5468\u989d\u5ea6"
                 elif self._account_range == "cycle":
@@ -6692,6 +7147,422 @@ class FloatingMonitorApp:
             self._schedule_auth_switch_refresh,
         )
 
+    @staticmethod
+    def _checkpoint_json_value(value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.astimezone(CN_TZ).isoformat(timespec="microseconds")
+        if isinstance(value, dict):
+            return {
+                str(key): FloatingMonitorApp._checkpoint_json_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [FloatingMonitorApp._checkpoint_json_value(item) for item in value]
+        return value
+
+    def _clear_live_usage_checkpoint(self) -> None:
+        try:
+            LIVE_USAGE_CHECKPOINT_JSON.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _persist_live_usage_checkpoint(self, *, force: bool = False) -> bool:
+        overlay = getattr(self, "_live_usage_overlay", None)
+        if not isinstance(overlay, dict) or not hasattr(self, "_last_live_checkpoint_write_at"):
+            return False
+        now_clock = time.monotonic()
+        if (
+            not force
+            and now_clock - float(getattr(self, "_last_live_checkpoint_write_at", float("-inf")))
+            < LIVE_USAGE_CHECKPOINT_WRITE_SECONDS
+        ):
+            return False
+        payload = {
+            "schema": LIVE_USAGE_CHECKPOINT_SCHEMA,
+            "date": today_key(),
+            "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
+            "overlay": self._checkpoint_json_value(overlay),
+        }
+        try:
+            write_json_atomic(LIVE_USAGE_CHECKPOINT_JSON, payload)
+        except OSError:
+            return False
+        self._last_live_checkpoint_write_at = now_clock
+        return True
+
+    def _restore_live_usage_checkpoint(self) -> bool:
+        if self.state is None:
+            return False
+        try:
+            payload = json.loads(
+                LIVE_USAGE_CHECKPOINT_JSON.read_text(encoding="utf-8", errors="ignore")
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != LIVE_USAGE_CHECKPOINT_SCHEMA
+            or str(payload.get("date") or "") != today_key()
+        ):
+            self._clear_live_usage_checkpoint()
+            return False
+        raw_overlay = payload.get("overlay")
+        if not isinstance(raw_overlay, dict):
+            return False
+        try:
+            base_tokens = max(0, int(raw_overlay.get("base_today_tokens") or 0))
+            delta_tokens = max(0, int(raw_overlay.get("tokens") or 0))
+            base_requests = max(0, int(raw_overlay.get("base_today_requests") or 0))
+            delta_requests = max(0, int(raw_overlay.get("requests") or 0))
+            base_cost = max(0.0, float(raw_overlay.get("base_today_cost") or 0.0))
+            delta_cost = max(0.0, float(raw_overlay.get("cost") or 0.0))
+        except (TypeError, ValueError):
+            return False
+        target_tokens = base_tokens + delta_tokens
+        target_requests = base_requests + delta_requests
+        target_cost = base_cost + delta_cost
+        current_tokens = max(0, int(self.state.today_tokens or 0))
+        current_requests = max(0, int(self.state.today_requests or 0))
+        current_cost = max(0.0, float(self.state.today_account_cost or 0.0))
+        if current_tokens >= target_tokens:
+            self._clear_live_usage_checkpoint()
+            return False
+
+        overlay = dict(raw_overlay)
+        latest_when = _parse_time(str(overlay.get("latest_when") or ""))
+        if latest_when is not None:
+            overlay["latest_when"] = latest_when
+        providers = overlay.get("providers")
+        if isinstance(providers, dict):
+            for target in providers.values():
+                if not isinstance(target, dict):
+                    continue
+                parsed = _parse_time(str(target.get("latest_when") or ""))
+                if parsed is not None:
+                    target["latest_when"] = parsed
+
+        exact_base = current_tokens == base_tokens and current_requests == base_requests
+        if not exact_base:
+            remaining_tokens = max(0, target_tokens - current_tokens)
+            ratio = remaining_tokens / delta_tokens if delta_tokens > 0 else 0.0
+            overlay.update(
+                {
+                    "base_today_tokens": current_tokens,
+                    "base_today_requests": current_requests,
+                    "base_today_cost": current_cost,
+                    "base_authoritative_tokens": int(
+                        (self.state.client_usage or {}).get("tokens") or current_tokens
+                    ) if isinstance(self.state.client_usage, dict) else current_tokens,
+                    "tokens": remaining_tokens,
+                    "requests": max(0, target_requests - current_requests),
+                    "cost": max(0.0, target_cost - current_cost),
+                    "input_tokens": int(max(0, int(overlay.get("input_tokens") or 0)) * ratio),
+                    "cached_input_tokens": int(max(0, int(overlay.get("cached_input_tokens") or 0)) * ratio),
+                    "output_tokens": int(max(0, int(overlay.get("output_tokens") or 0)) * ratio),
+                    "providers": {},
+                }
+            )
+        self._live_usage_overlay = overlay
+        self._apply_live_usage_overlay(self.state)
+        self._last_live_checkpoint_write_at = time.monotonic()
+        return True
+
+    def _live_usage_catchup_since(self) -> datetime | None:
+        if self.state is None or self.state.usage_source != "local":
+            return None
+        candidates: list[tuple[datetime, bool]] = []
+        overlay = self._live_usage_overlay
+        if isinstance(overlay, dict):
+            parsed = overlay.get("latest_when")
+            if isinstance(parsed, datetime):
+                candidates.append((parsed, False))
+        client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+        scan_status = client_usage.get("scan_status") if isinstance(client_usage.get("scan_status"), dict) else {}
+        for value in (
+            (self.state.latest_request or {}).get("created_at") if isinstance(self.state.latest_request, dict) else "",
+            (client_usage.get("latest_request") or {}).get("created_at")
+            if isinstance(client_usage.get("latest_request"), dict)
+            else "",
+            scan_status.get("through"),
+            client_usage.get("updated_at"),
+        ):
+            raw_value = str(value or "")
+            try:
+                local_value = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+                if local_value.tzinfo is None:
+                    local_value = local_value.replace(tzinfo=CN_TZ)
+                parsed = local_value.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                has_fraction = bool(re.search(r"T\d{2}:\d{2}:\d{2}\.\d+", raw_value))
+                candidates.append((parsed, not has_fraction))
+        now = datetime.now(CN_TZ)
+        day_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=CN_TZ)
+        if candidates:
+            since, second_precision = max(candidates, key=lambda item: item[0])
+            if second_precision:
+                since += timedelta(seconds=1)
+        else:
+            since = day_start
+        if since < day_start:
+            return day_start
+        return min(since, now)
+
+    def _complete_live_usage_verification(self, through: datetime | None) -> bool:
+        if not bool(getattr(self, "_live_usage_verification_pending", False)):
+            return False
+        if through is None:
+            return False
+        pending_latest = getattr(self, "_live_usage_verification_latest_when", None)
+        if isinstance(pending_latest, datetime) and through < pending_latest:
+            return False
+        self._live_usage_verification_pending = False
+        self._live_usage_verification_latest_when = None
+        self._live_usage_verification_pending_tokens = 0
+        samples = getattr(self, "_live_usage_rate_samples", None)
+        if isinstance(samples, list):
+            samples.clear()
+        return True
+
+    def _apply_live_usage_catchup(self, payload: dict[str, Any] | None) -> None:
+        try:
+            if self.closed or not isinstance(payload, dict):
+                return
+            summary = payload.get("summary")
+            if not isinstance(summary, dict) or self.state is None:
+                return
+            through = _parse_time(str(payload.get("through") or ""))
+            if through is None:
+                return
+
+            seen_ids = getattr(self, "_live_usage_seen_ids", None)
+            if not isinstance(seen_ids, dict):
+                seen_ids = {}
+                self._live_usage_seen_ids = seen_ids
+            payload_event_ids: set[str] = set()
+            rows = payload.get("events")
+            for row in rows if isinstance(rows, list) else []:
+                if isinstance(row, dict) and row.get("event_id"):
+                    event_id = str(row["event_id"])
+                    payload_event_ids.add(event_id)
+                    seen_ids[event_id] = None
+
+            provider_targets: dict[str, dict[str, Any]] = {}
+            for provider in payload.get("providers") if isinstance(payload.get("providers"), list) else []:
+                if not isinstance(provider, dict):
+                    continue
+                name = str(provider.get("name") or "").strip()
+                if name:
+                    provider_targets[name] = dict(provider)
+
+            target = {
+                "tokens": max(0, int(summary.get("tokens") or 0)),
+                "requests": max(0, int(summary.get("requests") or 0)),
+                "cost": max(0.0, float(summary.get("cost") or 0.0)),
+                "input_tokens": max(0, int(summary.get("input_tokens") or 0)),
+                "cached_input_tokens": max(0, int(summary.get("cached_input_tokens") or 0)),
+                "output_tokens": max(0, int(summary.get("output_tokens") or 0)),
+            }
+            latest_when = _parse_time(str(summary.get("latest_at") or ""))
+            latest_provider = ""
+            latest_model = str(summary.get("latest_model") or "")
+            records = getattr(self, "_live_usage_event_records", {})
+            tail_tokens = 0
+            for event_id, event in records.items() if isinstance(records, dict) else []:
+                if event_id in payload_event_ids:
+                    continue
+                when = event.get("when")
+                if not isinstance(when, datetime) or when < through:
+                    continue
+                raw_input = max(0, int(event.get("input_tokens") or 0))
+                cached = min(raw_input, max(0, int(event.get("cached_tokens") or 0)))
+                output = max(0, int(event.get("output_tokens") or 0))
+                tokens = max(0, int(event.get("total_tokens") or 0))
+                event_cost = max(0.0, float(event.get("cost") or 0.0))
+                target["tokens"] += tokens
+                tail_tokens += tokens
+                target["requests"] += 1
+                target["cost"] += event_cost
+                target["input_tokens"] += max(0, raw_input - cached)
+                target["cached_input_tokens"] += cached
+                target["output_tokens"] += output
+                provider_name = str(event.get("provider") or "").strip()
+                if provider_name:
+                    provider = provider_targets.setdefault(
+                        provider_name,
+                        {
+                            "name": provider_name,
+                            "tokens": 0,
+                            "requests": 0,
+                            "cost": 0.0,
+                            "input_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                        },
+                    )
+                    provider["tokens"] = int(provider.get("tokens") or 0) + tokens
+                    provider["requests"] = int(provider.get("requests") or 0) + 1
+                    provider["cost"] = float(provider.get("cost") or 0.0) + event_cost
+                    provider["input_tokens"] = int(provider.get("input_tokens") or 0) + max(0, raw_input - cached)
+                    provider["cached_input_tokens"] = int(provider.get("cached_input_tokens") or 0) + cached
+                    provider["output_tokens"] = int(provider.get("output_tokens") or 0) + output
+                    provider["latest_at"] = when.astimezone(CN_TZ).isoformat(timespec="seconds")
+                if latest_when is None or when > latest_when:
+                    latest_when = when
+                    latest_provider = provider_name
+                    latest_model = str(event.get("model") or latest_model)
+
+            client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+            authoritative_tokens = max(0, int(client_usage.get("tokens") or 0))
+            authoritative_requests = max(0, int(client_usage.get("requests") or 0))
+            authoritative_cost = max(0.0, float(client_usage.get("cost") or 0.0))
+            self.state.today_tokens = authoritative_tokens
+            self.state.today_requests = authoritative_requests
+            self.state.today_account_cost = authoritative_cost
+            overlay: dict[str, Any] = {
+                "base_today_tokens": authoritative_tokens,
+                "base_today_requests": authoritative_requests,
+                "base_today_cost": authoritative_cost,
+                "base_authoritative_tokens": authoritative_tokens,
+                "base_updated_at": str(client_usage.get("updated_at") or ""),
+                "tokens": max(0, target["tokens"] - authoritative_tokens),
+                "requests": max(0, target["requests"] - authoritative_requests),
+                "cost": max(0.0, target["cost"] - authoritative_cost),
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "latest_when": latest_when or through,
+                "providers": {},
+                "catchup_summary_tokens": int(summary.get("tokens") or 0),
+                "catchup_tail_tokens": tail_tokens,
+                "catchup_through": through,
+            }
+            raw_providers = client_usage.get("providers") if isinstance(client_usage.get("providers"), list) else []
+            top_accounts = self.state.top_accounts if isinstance(self.state.top_accounts, list) else []
+            for provider_name, desired in provider_targets.items():
+                provider_key = account_display_key(provider_name)
+                raw_row = next(
+                    (
+                        row for row in raw_providers
+                        if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key
+                    ),
+                    {},
+                )
+                top_row = next(
+                    (
+                        row for row in top_accounts
+                        if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key
+                    ),
+                    {},
+                )
+                desired_tokens = max(0, int(desired.get("tokens") or 0))
+                desired_requests = max(0, int(desired.get("requests") or 0))
+                desired_cost = max(0.0, float(desired.get("cost") or 0.0))
+                desired_values = {
+                    "tokens": desired_tokens,
+                    "requests": desired_requests,
+                    "cost": desired_cost,
+                    "input_tokens": max(0, int(desired.get("input_tokens") or 0)),
+                    "cached_input_tokens": max(0, int(desired.get("cached_input_tokens") or 0)),
+                    "output_tokens": max(0, int(desired.get("output_tokens") or 0)),
+                }
+                if isinstance(raw_row, dict):
+                    raw_row.update(desired_values)
+                    raw_row["latest_at"] = str(desired.get("latest_at") or raw_row.get("latest_at") or "")
+                if isinstance(top_row, dict):
+                    top_row["tokens"] = desired_tokens
+                    top_row["requests"] = desired_requests
+                    top_row["cost"] = desired_cost
+                    top_row["latest_at"] = str(desired.get("latest_at") or top_row.get("latest_at") or "")
+
+            self._live_usage_overlay = overlay
+            self._apply_live_usage_overlay(self.state)
+            self._complete_live_usage_verification(through)
+            if latest_when is not None:
+                self.state.latest_request = {
+                    "kind": "success",
+                    "model": latest_model or "-",
+                    "created_at": latest_when.astimezone(CN_TZ).isoformat(timespec="seconds"),
+                    "source": "CLIENT",
+                }
+            if latest_provider:
+                self.state.latest_account_name = latest_provider
+            self._persist_live_usage_checkpoint(force=True)
+            self._last_live_reconcile_at = time.monotonic()
+            self._draw()
+            if not bool(getattr(self, "_live_initial_recheck_scheduled", False)):
+                self._live_initial_recheck_scheduled = True
+                self._schedule_live_usage_reconcile(LIVE_USAGE_INITIAL_RECHECK_MS)
+        finally:
+            try:
+                self._live_catchup_lock.release()
+            except RuntimeError:
+                pass
+            if (
+                bool(getattr(self, "_live_usage_verification_pending", False))
+                and not self.closed
+                and hasattr(self, "root")
+            ):
+                self._schedule_live_usage_reconcile(LIVE_USAGE_VERIFY_DELAY_MS)
+
+    def _refresh_live_usage_catchup_async(self) -> bool:
+        since = self._live_usage_catchup_since()
+        if since is None or not CLIENT_USAGE_EXPORT.exists():
+            return False
+        if not self._live_catchup_lock.acquire(blocking=False):
+            return False
+        through = datetime.now(CN_TZ)
+        if through <= since + timedelta(milliseconds=50):
+            self._live_catchup_lock.release()
+            return False
+
+        def _worker() -> None:
+            payload: dict[str, Any] | None = None
+            try:
+                completed = subprocess.run(
+                    [
+                        CLIENT_USAGE_PYTHON,
+                        str(CLIENT_USAGE_EXPORT),
+                        "--output",
+                        str(CLIENT_USAGE_JSON),
+                        "--live-since",
+                        since.isoformat(timespec="microseconds"),
+                        "--live-through",
+                        through.isoformat(timespec="microseconds"),
+                    ],
+                    cwd=str(APP_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                lines = [line for line in str(completed.stdout or "").splitlines() if line.strip()]
+                if completed.returncode == 0 and lines:
+                    candidate = json.loads(lines[-1])
+                    if isinstance(candidate, dict):
+                        payload = candidate
+            except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+                payload = None
+            try:
+                self.root.after(0, lambda: self._apply_live_usage_catchup(payload))
+            except tk.TclError:
+                try:
+                    self._live_catchup_lock.release()
+                except RuntimeError:
+                    pass
+
+        try:
+            self._live_catchup_executor.submit(_worker)
+        except RuntimeError:
+            self._live_catchup_lock.release()
+            return False
+        return True
+
     def _refresh_live_usage_async(self) -> bool:
         if not self._live_usage_lock.acquire(blocking=False):
             return False
@@ -6748,58 +7619,273 @@ class FloatingMonitorApp:
         model = model or str(existing.get("model") or "-")
         return provider, model
 
-    def _record_live_usage_events(self, events: list[dict[str, Any]]) -> bool:
+    def _record_live_provider_overlay(
+        self,
+        overlay: dict[str, Any],
+        provider: str,
+        usage: dict[str, Any],
+        when: datetime,
+    ) -> None:
+        provider = str(provider or "").strip()
+        if not provider:
+            return
+        targets = overlay.setdefault("providers", {})
+        target = targets.get(provider)
+        if not isinstance(target, dict):
+            provider_key = account_display_key(provider)
+            client_usage = self.state.client_usage if self.state and isinstance(self.state.client_usage, dict) else {}
+            raw_providers = client_usage.get("providers")
+            raw_provider_rows = raw_providers if isinstance(raw_providers, list) else []
+            top_account_rows = self.state.top_accounts if self.state and isinstance(self.state.top_accounts, list) else []
+            raw_row = next(
+                (
+                    row
+                    for row in raw_provider_rows
+                    if isinstance(row, dict)
+                    and account_display_key(row.get("name")) == provider_key
+                ),
+                {},
+            )
+            top_row = next(
+                (
+                    row
+                    for row in top_account_rows
+                    if isinstance(row, dict)
+                    and account_display_key(row.get("name")) == provider_key
+                ),
+                {},
+            )
+            target = {
+                "base_tokens": max(int(raw_row.get("tokens") or 0), int(top_row.get("tokens") or 0)),
+                "base_requests": max(int(raw_row.get("requests") or 0), int(top_row.get("requests") or 0)),
+                "base_cost": max(float(raw_row.get("cost") or 0.0), float(top_row.get("cost") or 0.0)),
+                "base_input_tokens": int(raw_row.get("input_tokens") or 0),
+                "base_cached_input_tokens": int(raw_row.get("cached_input_tokens") or 0),
+                "base_output_tokens": int(raw_row.get("output_tokens") or 0),
+                "tokens": 0,
+                "requests": 0,
+                "cost": 0.0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "latest_when": when,
+            }
+            targets[provider] = target
+        total_tokens = max(0, int(usage.get("total_tokens") or 0))
+        raw_input = max(0, int(usage.get("input_tokens") or 0))
+        cached_input = min(raw_input, max(0, int(usage.get("cached_tokens") or 0)))
+        output_tokens = max(0, int(usage.get("output_tokens") or 0))
+        target["tokens"] += total_tokens
+        target["requests"] += 1
+        target["cost"] += max(0.0, float(usage.get("cost") or 0.0))
+        target["input_tokens"] += max(0, raw_input - cached_input)
+        target["cached_input_tokens"] += cached_input
+        target["output_tokens"] += output_tokens
+        target["latest_when"] = max(target["latest_when"], when)
+
+    def _live_usage_batch_requires_verification(
+        self,
+        events: list[dict[str, Any]],
+        now_clock: float,
+    ) -> bool:
+        samples = getattr(self, "_live_usage_rate_samples", None)
+        if not isinstance(samples, list):
+            samples = []
+            self._live_usage_rate_samples = samples
+        cutoff = now_clock - LIVE_USAGE_VERIFY_WINDOW_SECONDS
+        samples[:] = [
+            (timestamp, tokens)
+            for timestamp, tokens in samples
+            if timestamp >= cutoff
+        ]
+        batch_tokens = sum(max(0, int(event.get("total_tokens") or 0)) for event in events)
+        projected_tokens = sum(tokens for _timestamp, tokens in samples) + batch_tokens
+        verification_pending = bool(
+            getattr(self, "_live_usage_verification_pending", False)
+        )
+        if not verification_pending and projected_tokens < LIVE_USAGE_VERIFY_THRESHOLD_TOKENS:
+            samples.append((now_clock, batch_tokens))
+            return False
+
+        self._live_usage_verification_pending = True
+        self._live_usage_verification_pending_tokens = max(
+            0,
+            int(getattr(self, "_live_usage_verification_pending_tokens", 0) or 0),
+        ) + batch_tokens
+        latest_when = max(
+            (
+                event.get("when")
+                for event in events
+                if isinstance(event.get("when"), datetime)
+            ),
+            default=None,
+        )
+        previous_latest = getattr(self, "_live_usage_verification_latest_when", None)
+        if latest_when is not None and (
+            not isinstance(previous_latest, datetime) or latest_when > previous_latest
+        ):
+            self._live_usage_verification_latest_when = latest_when
+        samples.clear()
+
+        watcher = getattr(self, "_live_usage_watcher", None)
+        if isinstance(watcher, CodexUsageFileWatcher):
+            watcher.reconciliation_needed = True
+            watcher._last_reconciliation_change_at = now_clock
+        if hasattr(self, "root"):
+            self._schedule_live_usage_reconcile(LIVE_USAGE_VERIFY_DELAY_MS)
+        return True
+
+    def _record_live_usage_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        allow_historical: bool = False,
+        animate: bool = True,
+    ) -> bool:
         if self.state is None:
             return False
         now_utc = datetime.now(timezone.utc)
-        recent = [
-            event
-            for event in events
-            if isinstance(event.get("when"), datetime)
-            and -30 <= (now_utc - event["when"].astimezone(timezone.utc)).total_seconds() <= 600
-            and 0 < int(event.get("total_tokens") or 0) <= LIVE_USAGE_MAX_SINGLE_EVENT_TOKENS
-        ]
+        today = now_utc.astimezone(CN_TZ).date()
+        seen_ids = getattr(self, "_live_usage_seen_ids", None)
+        if not isinstance(seen_ids, dict):
+            seen_ids = {}
+            self._live_usage_seen_ids = seen_ids
+        recent: list[dict[str, Any]] = []
+        for event in events:
+            when = event.get("when")
+            if not isinstance(when, datetime):
+                continue
+            age_seconds = (now_utc - when.astimezone(timezone.utc)).total_seconds()
+            if age_seconds < -30:
+                continue
+            if allow_historical:
+                if when.astimezone(CN_TZ).date() != today:
+                    continue
+            elif age_seconds > 600:
+                continue
+            total_tokens = int(event.get("total_tokens") or 0)
+            if not 0 < total_tokens <= LIVE_USAGE_MAX_SINGLE_EVENT_TOKENS:
+                continue
+            event_id = str(event.get("event_id") or "")
+            if not event_id:
+                event_id = _live_usage_event_id(
+                    when,
+                    str(event.get("session_id") or ""),
+                    int(event.get("input_tokens") or 0),
+                    int(event.get("cached_tokens") or 0),
+                    int(event.get("output_tokens") or 0),
+                )
+                event["event_id"] = event_id
+            if event_id in seen_ids:
+                continue
+            seen_ids[event_id] = None
+            recent.append(event)
+        while len(seen_ids) > 16_384:
+            seen_ids.pop(next(iter(seen_ids)))
         if not recent:
             return False
+        sample_clock = time.monotonic()
+        if not allow_historical and self._live_usage_batch_requires_verification(
+            recent,
+            sample_clock,
+        ):
+            return False
+        records = getattr(self, "_live_usage_event_records", None)
+        if not isinstance(records, dict):
+            records = {}
+            self._live_usage_event_records = records
+        for event in recent:
+            records[str(event["event_id"])] = event
+        while len(records) > 16_384:
+            records.pop(next(iter(records)))
         overlay = self._live_usage_overlay
         if overlay is None:
             client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
             overlay = {
                 "base_today_tokens": int(self.state.today_tokens or 0),
                 "base_today_requests": int(self.state.today_requests or 0),
+                "base_today_cost": float(self.state.today_account_cost or 0.0),
                 "base_authoritative_tokens": int(client_usage.get("tokens") or 0),
+                "base_updated_at": str(client_usage.get("updated_at") or ""),
                 "tokens": 0,
                 "requests": 0,
+                "cost": 0.0,
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
                 "output_tokens": 0,
                 "latest_when": recent[0]["when"],
             }
             self._live_usage_overlay = overlay
-        sample_clock = time.monotonic()
         accepted_tokens = 0
+        client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+        api_service_current = bool(client_usage.get("api_service_routed"))
+        cockpit_markers = (
+            _load_live_cockpit_markers(COCKPIT_REQUEST_LOG_DB, now_utc)
+            if api_service_current
+            else []
+        )
+        latest_event = max(recent, key=lambda item: item["when"])
+        latest_provider = ""
+        latest_model = ""
         for event_index, event in enumerate(recent):
             tokens = int(event.get("total_tokens") or 0)
             accepted_tokens += tokens
+            event_cost = max(0.0, float(event.get("cost") or 0.0))
             raw_input = max(0, int(event.get("input_tokens") or 0))
             cached_input = max(0, int(event.get("cached_tokens") or 0))
             output = max(0, int(event.get("output_tokens") or 0))
             overlay["tokens"] += tokens
             overlay["requests"] += 1
+            overlay["cost"] += event_cost
             overlay["input_tokens"] += max(0, raw_input - cached_input)
             overlay["cached_input_tokens"] += cached_input
             overlay["output_tokens"] += output
             overlay["latest_when"] = max(overlay["latest_when"], event["when"])
-            if not hasattr(self, "_token_flow_samples"):
-                self._token_flow_samples = []
-            # Statistics retain the log timestamp, while the trace starts when
-            # the watcher detects the event. A tiny capped offset keeps events
-            # discovered in the same poll visually distinct at the left edge.
-            visual_offset = min(0.12, event_index * 0.02)
-            self._token_flow_samples.append((sample_clock - visual_offset, tokens))
-        self._record_token_delta_badge(accepted_tokens, now=sample_clock)
-        latest_event = max(recent, key=lambda event: event["when"])
-        latest_provider, latest_model = self._live_event_request_context(latest_event)
+            if animate:
+                if not hasattr(self, "_token_flow_samples"):
+                    self._token_flow_samples = []
+                # Statistics retain the log timestamp, while the trace starts when
+                # the watcher detects the event. A tiny capped offset keeps events
+                # discovered in the same poll visually distinct at the left edge.
+                visual_offset = min(0.12, event_index * 0.02)
+                self._token_flow_samples.append((sample_clock - visual_offset, tokens))
+            provider = _concrete_live_provider(event.get("provider"))
+            model = str(event.get("model") or "")
+            matched_marker = _match_live_cockpit_marker(event, cockpit_markers)
+            if matched_marker is not None:
+                cockpit_markers.remove(matched_marker)
+                provider = str(matched_marker.get("label") or "")
+                model = str(matched_marker.get("model") or "")
+                self._record_live_provider_overlay(
+                    overlay,
+                    provider,
+                    matched_marker,
+                    event["when"],
+                )
+            elif provider:
+                self._record_live_provider_overlay(overlay, provider, event, event["when"])
+            else:
+                provider, model = self._live_event_request_context(event)
+                if api_service_current:
+                    # Cockpit may write its routing marker a moment after the
+                    # Codex token event. Keep the total optimistic, but never
+                    # guess which pool account should receive it.
+                    provider = ""
+                elif provider:
+                    self._record_live_provider_overlay(overlay, provider, event, event["when"])
+            if provider:
+                event["provider"] = provider
+            if model:
+                event["model"] = model
+            if event is latest_event:
+                latest_provider = provider
+                latest_model = model
+        if animate:
+            self._record_token_delta_badge(accepted_tokens, now=sample_clock)
+        if not latest_model:
+            _provider, latest_model = self._live_event_request_context(latest_event)
+            if not latest_provider and not api_service_current:
+                latest_provider = _provider
         latest_when = latest_event["when"].astimezone(CN_TZ).isoformat(timespec="seconds")
         self.state.latest_request = {
             "kind": "success",
@@ -6809,9 +7895,10 @@ class FloatingMonitorApp:
         }
         if latest_provider:
             self.state.latest_account_name = latest_provider
-        if hasattr(self, "root"):
+        if animate and hasattr(self, "root"):
             self._ensure_pulse_animation()
         self._apply_live_usage_overlay(self.state)
+        self._persist_live_usage_checkpoint(force=allow_historical)
         return True
 
     def _apply_live_usage_overlay(self, state: MonitorState) -> None:
@@ -6826,6 +7913,67 @@ class FloatingMonitorApp:
             int(state.today_requests or 0),
             int(overlay["base_today_requests"]) + int(overlay["requests"]),
         )
+        state.today_account_cost = max(
+            float(state.today_account_cost or 0.0),
+            float(overlay.get("base_today_cost") or 0.0) + float(overlay.get("cost") or 0.0),
+        )
+        provider_targets = overlay.get("providers")
+        if isinstance(provider_targets, dict):
+            raw_providers = (
+                state.client_usage.get("providers")
+                if isinstance(state.client_usage, dict)
+                and isinstance(state.client_usage.get("providers"), list)
+                else []
+            )
+            top_accounts = state.top_accounts if isinstance(state.top_accounts, list) else []
+            for provider, target in provider_targets.items():
+                if not isinstance(target, dict):
+                    continue
+                provider_key = account_display_key(provider)
+                desired = {
+                    "tokens": int(target["base_tokens"]) + int(target["tokens"]),
+                    "requests": int(target["base_requests"]) + int(target["requests"]),
+                    "input_tokens": int(target["base_input_tokens"]) + int(target["input_tokens"]),
+                    "cached_input_tokens": int(target["base_cached_input_tokens"]) + int(target["cached_input_tokens"]),
+                    "output_tokens": int(target["base_output_tokens"]) + int(target["output_tokens"]),
+                }
+                desired_cost = float(target.get("base_cost") or 0.0) + float(target.get("cost") or 0.0)
+                latest_when = target.get("latest_when")
+                latest_at = (
+                    latest_when.astimezone(CN_TZ).isoformat(timespec="seconds")
+                    if isinstance(latest_when, datetime)
+                    else ""
+                )
+                raw_row = next(
+                    (
+                        row
+                        for row in raw_providers
+                        if isinstance(row, dict)
+                        and account_display_key(row.get("name")) == provider_key
+                    ),
+                    None,
+                )
+                if isinstance(raw_row, dict):
+                    for key, value in desired.items():
+                        raw_row[key] = max(int(raw_row.get(key) or 0), value)
+                    raw_row["cost"] = max(float(raw_row.get("cost") or 0.0), desired_cost)
+                    if latest_at:
+                        raw_row["latest_at"] = latest_at
+                top_row = next(
+                    (
+                        row
+                        for row in top_accounts
+                        if isinstance(row, dict)
+                        and account_display_key(row.get("name")) == provider_key
+                    ),
+                    None,
+                )
+                if isinstance(top_row, dict):
+                    top_row["tokens"] = max(int(top_row.get("tokens") or 0), desired["tokens"])
+                    top_row["requests"] = max(int(top_row.get("requests") or 0), desired["requests"])
+                    top_row["cost"] = max(float(top_row.get("cost") or 0.0), desired_cost)
+                    if latest_at:
+                        top_row["latest_at"] = latest_at
         state.cost_history = trend_with_current_totals(
             state.cost_history,
             state.today_tokens,
@@ -6867,10 +8015,57 @@ class FloatingMonitorApp:
         try:
             if self.closed:
                 return
-            if self._record_live_usage_events(events):
+            recorded = self._record_live_usage_events(events)
+            watcher = getattr(self, "_live_usage_watcher", None)
+            needs_reconcile = (changed and not recorded) or (
+                isinstance(watcher, CodexUsageFileWatcher)
+                and watcher.reconciliation_needed
+            )
+            if needs_reconcile:
+                self._schedule_live_usage_reconcile()
+            if recorded or bool(
+                getattr(self, "_live_usage_verification_pending", False)
+            ):
                 self._draw()
         finally:
             self._live_usage_lock.release()
+
+    def _schedule_live_usage_reconcile(self, delay_ms: int = LIVE_USAGE_RECONCILE_DELAY_MS) -> bool:
+        if (
+            self.closed
+            or not hasattr(self, "root")
+            or bool(getattr(self, "_live_reconcile_scheduled", False))
+        ):
+            return False
+        self._live_reconcile_scheduled = True
+        self.root.after(max(1_000, int(delay_ms)), self._run_live_usage_reconcile)
+        return True
+
+    def _run_live_usage_reconcile(self) -> None:
+        self._live_reconcile_scheduled = False
+        if self.closed:
+            return
+        watcher = getattr(self, "_live_usage_watcher", None)
+        elapsed = time.monotonic() - float(
+            getattr(self, "_last_live_reconcile_at", float("-inf"))
+        )
+        urgent_verification = bool(
+            getattr(self, "_live_usage_verification_pending", False)
+        )
+        if elapsed < LIVE_USAGE_RECONCILE_MIN_INTERVAL_SECONDS and not urgent_verification:
+            remaining_ms = int(
+                (LIVE_USAGE_RECONCILE_MIN_INTERVAL_SECONDS - elapsed) * 1000
+            )
+            self._schedule_live_usage_reconcile(max(1_000, remaining_ms))
+            return
+        if isinstance(watcher, CodexUsageFileWatcher):
+            quiet_seconds = LIVE_USAGE_RECONCILE_DELAY_MS / 1000.0
+            if not watcher.reconciliation_ready(quiet_seconds):
+                self._schedule_live_usage_reconcile()
+                return
+            watcher.mark_reconciled()
+        if not self._refresh_live_usage_catchup_async():
+            self._schedule_live_usage_reconcile()
 
     def _schedule_live_usage_refresh(self) -> None:
         if self.closed:
@@ -6923,11 +8118,27 @@ class FloatingMonitorApp:
                 result.cost_history = update_usage_history(result)
             except Exception:
                 result.cost_history = summarize_usage_history(load_usage_history())
+            if bool((result.usage_sync or {}).get("fresh")):
+                client_usage = result.client_usage if isinstance(result.client_usage, dict) else {}
+                scan_status = (
+                    client_usage.get("scan_status")
+                    if isinstance(client_usage.get("scan_status"), dict)
+                    else {}
+                )
+                self._complete_live_usage_verification(
+                    _parse_time(str(scan_status.get("through") or ""))
+                )
             if self._authoritative_state_covers_live_overlay(result):
                 self._live_usage_overlay = None
+                self._clear_live_usage_checkpoint()
             else:
                 self._apply_live_usage_overlay(result)
             self.state = result
+            if result.usage_source == "local":
+                self._last_quota_refresh_at = time.monotonic()
+                self._last_forced_full_refresh_at = time.monotonic()
+                if bool((result.usage_sync or {}).get("fresh")):
+                    self._full_refresh_requested = False
         self._draw()
         if refresh_pending and not self.closed:
             self.refresh_async(force=True)
@@ -6939,12 +8150,186 @@ class FloatingMonitorApp:
         self._current_day_key = current_day
         self.client.clear_runtime_caches()
         self._live_usage_overlay = None
+        self._clear_live_usage_checkpoint()
+        self._live_usage_verification_pending = False
+        self._live_usage_verification_latest_when = None
+        self._live_usage_verification_pending_tokens = 0
+        samples = getattr(self, "_live_usage_rate_samples", None)
+        if isinstance(samples, list):
+            samples.clear()
         self._account_range_auto_selected = False
         if not self._account_range_user_selected:
             self._account_range = "today"
         return True
 
+    def _apply_quota_snapshot(self, payload: dict[str, Any] | None) -> None:
+        try:
+            if self.closed or self.state is None or not isinstance(payload, dict):
+                return
+            accounts = payload.get("accounts")
+            if not isinstance(accounts, dict):
+                return
+            client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+            raw_providers = client_usage.get("providers")
+            raw_rows = raw_providers if isinstance(raw_providers, list) else []
+            top_rows = self.state.top_accounts if isinstance(self.state.top_accounts, list) else []
+            quota_fields = (
+                "quota_available",
+                "quota_stale",
+                "quota_unlimited",
+                "quota_source",
+                "quota_snapshot_at",
+                "quota_reset_unavailable",
+                "quota_snapshot_expired",
+                "quota_idle",
+                "countdown_active",
+                "remaining_percent",
+                "utilization",
+                "resets_at",
+                "window_minutes",
+                "window_days",
+            )
+            quota_signature_fields = (
+                "quota_available",
+                "quota_stale",
+                "quota_unlimited",
+                "remaining_percent",
+                "utilization",
+                "resets_at",
+                "window_minutes",
+            )
+            quota_changed = False
+
+            def quota_signature(window: dict[str, Any]) -> tuple[Any, ...]:
+                return tuple(window.get(field) for field in quota_signature_fields)
+
+            def merge_account_windows(row: dict[str, Any], quota: dict[str, Any]) -> None:
+                nonlocal quota_changed
+                for window_key in ("window_5h", "window_7d", "window_cycle"):
+                    quota_window = quota.get(window_key)
+                    if not isinstance(quota_window, dict):
+                        continue
+                    current = dict(row.get(window_key) or {})
+                    previous_signature = quota_signature(current)
+                    for field in quota_fields:
+                        current.pop(field, None)
+                    current.update(quota_window)
+                    if quota_signature(current) != previous_signature:
+                        quota_changed = True
+                    row[window_key] = current
+
+            for provider, quota in accounts.items():
+                if not isinstance(quota, dict):
+                    continue
+                provider_key = account_display_key(provider)
+                for row in raw_rows:
+                    if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key:
+                        merge_account_windows(row, quota)
+                        break
+                for row in top_rows:
+                    if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key:
+                        merge_account_windows(row, quota)
+                        break
+            if quota_changed:
+                # The live watcher updates today's totals, but a changed quota
+                # boundary also requires rebuilding the 5h/7d Token and cost.
+                self._full_refresh_requested = True
+            self.state.updated_at = time.time()
+            self._draw()
+        finally:
+            try:
+                self._quota_refresh_lock.release()
+            except RuntimeError:
+                pass
+
+    def _refresh_quota_async(self, force: bool = False) -> bool:
+        if (
+            self.closed
+            or self.state is None
+            or self.state.usage_source != "local"
+            or not CLIENT_USAGE_EXPORT.exists()
+        ):
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_quota_refresh_at < QUOTA_REFRESH_SECONDS:
+            return False
+        if not self._quota_refresh_lock.acquire(blocking=False):
+            return False
+        self._last_quota_refresh_at = now
+
+        def _worker() -> None:
+            payload: dict[str, Any] | None = None
+            try:
+                completed = subprocess.run(
+                    [
+                        CLIENT_USAGE_PYTHON,
+                        str(CLIENT_USAGE_EXPORT),
+                        "--quota-only",
+                    ],
+                    cwd=str(APP_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=QUOTA_REFRESH_TIMEOUT_SECONDS,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if completed.returncode == 0:
+                    lines = [line for line in str(completed.stdout or "").splitlines() if line.strip()]
+                    if lines:
+                        parsed = json.loads(lines[-1])
+                        if isinstance(parsed, dict):
+                            payload = parsed
+            except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+                payload = None
+            try:
+                self.root.after(0, lambda: self._apply_quota_snapshot(payload))
+            except tk.TclError:
+                try:
+                    self._quota_refresh_lock.release()
+                except RuntimeError:
+                    pass
+
+        try:
+            self._quota_refresh_executor.submit(_worker)
+        except RuntimeError:
+            self._quota_refresh_lock.release()
+            return False
+        return True
+
+    def _local_usage_snapshot_age_seconds(self) -> float:
+        if self.state is None or self.state.usage_source != "local":
+            return 0.0
+        client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+        updated_at = _parse_time(str(client_usage.get("updated_at") or ""))
+        if updated_at is None:
+            try:
+                updated_at = datetime.fromtimestamp(CLIENT_USAGE_JSON.stat().st_mtime, tz=CN_TZ)
+            except OSError:
+                return float("inf")
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=CN_TZ)
+        return max(0.0, (datetime.now(updated_at.tzinfo) - updated_at).total_seconds())
+
+    def _full_usage_refresh_due(self) -> bool:
+        if self.state is None or self.state.usage_source != "local":
+            return False
+        requested = bool(getattr(self, "_full_refresh_requested", False))
+        stale = self._local_usage_snapshot_age_seconds() >= FULL_USAGE_REFRESH_MAX_STALE_SECONDS
+        if not requested and not stale:
+            return False
+        last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
+        return time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
+
     def _codex_logs_busy(self) -> bool:
+        watcher = getattr(self, "_live_usage_watcher", None)
+        if (
+            isinstance(watcher, CodexUsageFileWatcher)
+            and watcher.has_recent_activity(LIVE_USAGE_EXPORT_IDLE_SECONDS)
+        ):
+            return True
         if self.state is None or not isinstance(self.state.client_usage, dict):
             return False
         sessions = self.state.client_usage.get("active_sessions")
@@ -6962,8 +8347,23 @@ class FloatingMonitorApp:
         if self.closed:
             return
         self._handle_day_rollover()
-        if not self._codex_logs_busy():
-            self.refresh_async()
+        catchup_lock = getattr(self, "_live_catchup_lock", None)
+        refresh_in_progress = (
+            self._refresh_lock.locked()
+            or self._quota_refresh_lock.locked()
+            or bool(catchup_lock is not None and catchup_lock.locked())
+        )
+        quota_started = False if refresh_in_progress else self._refresh_quota_async()
+        if not refresh_in_progress and not quota_started:
+            full_refresh_due = self._full_usage_refresh_due()
+            logs_busy = self._codex_logs_busy()
+            last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
+            reconcile_live_overlay = bool(getattr(self, "_live_usage_overlay", None)) and not logs_busy and (
+                time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
+            )
+            if full_refresh_due or reconcile_live_overlay:
+                if self.refresh_async():
+                    self._last_forced_full_refresh_at = time.monotonic()
         self.root.after(REFRESH_SECONDS * 1000, self._schedule_auto_refresh)
 
     def _schedule_midnight_refresh(self) -> None:
@@ -6988,7 +8388,13 @@ class FloatingMonitorApp:
 
     def close_app(self) -> None:
         self.closed = True
-        for name in ("_live_active_executor", "_live_usage_executor"):
+        self._persist_live_usage_checkpoint(force=True)
+        for name in (
+            "_live_active_executor",
+            "_live_usage_executor",
+            "_live_catchup_executor",
+            "_quota_refresh_executor",
+        ):
             executor = getattr(self, name, None)
             if executor is not None:
                 executor.shutdown(wait=False)

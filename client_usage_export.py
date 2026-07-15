@@ -240,6 +240,22 @@ class UsageEvent:
         return max(0, self.input_tokens) + max(0, self.cached_tokens) + max(0, self.output_tokens)
 
 
+def live_usage_event_id(event: UsageEvent) -> str:
+    when = event.when
+    aware = when if when.tzinfo is not None else when.replace(tzinfo=LOCAL_TZ)
+    timestamp_us = int(round(aware.timestamp() * 1_000_000))
+    raw_input = max(0, event.input_tokens) + max(0, event.cached_tokens)
+    return "|".join(
+        (
+            str(event.session_id or ""),
+            str(timestamp_us),
+            str(raw_input),
+            str(max(0, event.cached_tokens)),
+            str(max(0, event.output_tokens)),
+        )
+    )
+
+
 @dataclass
 class SessionLifecycle:
     session_id: str
@@ -4519,7 +4535,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     if str(existing.get("date") or "") != day.isoformat():
         return
     collapse_api_service_mirror_providers(existing)
-    current_api_aggregate = output.get("api_service_aggregate") or output.get("api_service_routed")
+    current_api_aggregate = bool(output.get("api_service_aggregate"))
+    current_api_account_routing = current_api_aggregate or bool(output.get("api_service_routed"))
 
     def tokens_of(row: Any) -> int:
         if not isinstance(row, dict):
@@ -4640,7 +4657,7 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         if not name:
             continue
         current = current_by_name.get(name)
-        if current_api_aggregate:
+        if current_api_account_routing:
             if current is not None and "window_30d" not in current and isinstance(previous.get("window_30d"), dict):
                 current["window_30d"] = dict(previous["window_30d"])
             continue
@@ -5195,16 +5212,169 @@ def build_codex_window_stats(
     return result
 
 
+def window_only_provider_labels(
+    window_stats: dict[str, dict[str, dict[str, Any]]],
+    provider_map: dict[str, UsageBucket],
+) -> set[str]:
+    return {
+        label
+        for label in window_stats
+        if "@" in label and label not in provider_map
+    }
+
+
+def build_live_catchup_payload(
+    home: Path,
+    sessions_root: Path,
+    output_path: Path,
+    since: datetime,
+    through: datetime,
+) -> dict[str, Any]:
+    """Build a read-only, fixed-cutoff event delta for the floating monitor."""
+    if through <= since:
+        return {
+            "schema": 1,
+            "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
+            "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
+            "events": [],
+        }
+
+    day_start = datetime.combine(since.date(), datetime.min.time())
+    session_lifecycle: dict[str, SessionLifecycle] = {}
+    codex_events = scan_all_codex_events(
+        home,
+        sessions_root,
+        day_start,
+        through,
+        session_lifecycle=session_lifecycle,
+    )
+    speed_markers = codex_speed_history(home, day_start, through)
+    apply_codex_speed_fallback(codex_events, speed_markers)
+
+    current_label = current_codex_account_label(home)
+    attribution_ledger = load_attribution_ledger()
+    markers = scan_cockpit_codex_switch_markers(home, day_start, through)
+    markers.extend(load_account_timeline())
+    account_markers = scan_cockpit_codex_account_markers(home, day_start, through)
+    markers.extend(account_markers)
+    raw_attributed = attribute_codex_events_by_account(
+        codex_events,
+        markers,
+        attribution_ledger,
+        current_label,
+        through,
+    )
+    raw_attributed, fallback_events = merge_missing_cockpit_account_events(
+        raw_attributed,
+        account_markers,
+    )
+    attributed, _session_accounts, unresolved_events = resolve_api_service_event_accounts(
+        raw_attributed,
+        account_markers,
+        previous_active_session_account_labels(output_path, since.date()),
+    )
+    speed_by_account = cockpit_codex_speed_by_label(home)
+    cost_multiplier_by_label = {
+        label: float(meta.get("cost_multiplier") or 1.0)
+        for label, meta in speed_by_account.items()
+    }
+
+    provider_buckets = buckets_from_attributed_events(
+        attributed,
+        cost_multiplier_by_label,
+    )
+    total = UsageBucket()
+    provider_totals: list[dict[str, Any]] = []
+    for provider, bucket in sorted(
+        provider_buckets.items(),
+        key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
+    ):
+        add_bucket(total, bucket)
+        provider_totals.append(bucket_to_dict(provider, bucket))
+    claude = scan_claude(home / ".claude" / "projects", day_start, through)
+    if claude.requests or claude.total_tokens or claude.cost:
+        add_bucket(total, claude)
+        provider_totals.append(bucket_to_dict("Claude local", claude))
+
+    rows: list[dict[str, Any]] = []
+    for provider, events in attributed.items():
+        multiplier = float(cost_multiplier_by_label.get(provider) or 1.0)
+        for event in events:
+            if not since < event.when < through:
+                continue
+            event_bucket = UsageBucket()
+            add_codex_event_to_bucket(event_bucket, event, multiplier)
+            aware_when = (
+                event.when
+                if event.when.tzinfo is not None
+                else event.when.replace(tzinfo=LOCAL_TZ)
+            )
+            rows.append(
+                {
+                    "event_id": live_usage_event_id(event),
+                    "when": aware_when.isoformat(timespec="microseconds"),
+                    "provider": provider,
+                    "model": event.model,
+                    "session_id": event.session_id,
+                    "total_tokens": event.total_tokens,
+                    "input_tokens": event.input_tokens + event.cached_tokens,
+                    "cached_tokens": event.cached_tokens,
+                    "output_tokens": event.output_tokens,
+                    "cost": round(event_bucket.cost, 12),
+                }
+            )
+    rows.sort(key=lambda row: (str(row.get("when") or ""), str(row.get("event_id") or "")))
+    return {
+        "schema": 1,
+        "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
+        "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
+        "events": rows,
+        "summary": bucket_to_dict("Client live catch-up", total),
+        "providers": provider_totals,
+        "fallback_events": int(fallback_events),
+        "unresolved_events": int(unresolved_events),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Export local Claude/Codex client token usage for Sub2API monitor.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--date", default="")
     parser.add_argument("--include-30d", action="store_true")
     parser.add_argument("--backfill-history-details", action="store_true")
+    parser.add_argument("--quota-only", action="store_true")
+    parser.add_argument("--live-since", default="")
+    parser.add_argument("--live-through", default="")
     args = parser.parse_args()
 
     now = datetime.now()
     out = Path(args.output)
+    home = Path(os.path.expanduser("~"))
+    if args.live_since:
+        since = parse_dt(args.live_since)
+        through = parse_dt(args.live_through) if args.live_through else now
+        if since is None or through is None:
+            parser.error("--live-since/--live-through must be valid ISO timestamps")
+        payload = build_live_catchup_payload(
+            home,
+            home / ".codex" / "sessions",
+            out,
+            since,
+            through,
+        )
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if args.quota_only:
+        print(
+            json.dumps(
+                {
+                    "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                    "accounts": cockpit_codex_quota_by_label(home),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     cached_30d_valid = False
     cached_30d_updated_at = ""
     cached_30d_windows: dict[str, dict[str, Any]] = {}
@@ -5221,8 +5391,8 @@ def main() -> int:
         day = now.date()
     start = datetime.combine(day, datetime.min.time())
     end = start + timedelta(days=1)
+    scan_end = min(now, end) if day == now.date() else end
 
-    home = Path(os.path.expanduser("~"))
     codex_sessions_root = home / ".codex" / "sessions"
     record_current_account_snapshot(home, now)
     attribution_ledger = load_attribution_ledger()
@@ -5238,7 +5408,7 @@ def main() -> int:
         home,
         codex_sessions_root,
         start,
-        end,
+        scan_end,
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
@@ -5250,13 +5420,13 @@ def main() -> int:
     desktop_log_roots = default_codex_desktop_log_roots()
     if desktop_log_roots:
         codex_failures.extend(
-            scan_codex_desktop_failure_events(desktop_log_roots, start, end)
+            scan_codex_desktop_failure_events(desktop_log_roots, start, scan_end)
         )
-    speed_markers = codex_speed_history(home, start, end)
+    speed_markers = codex_speed_history(home, start, scan_end)
     apply_codex_speed_fallback(codex_events, speed_markers)
-    markers = scan_cockpit_codex_switch_markers(home, start, end)
+    markers = scan_cockpit_codex_switch_markers(home, start, scan_end)
     markers.extend(load_account_timeline())
-    account_markers = scan_cockpit_codex_account_markers(home, start, end)
+    account_markers = scan_cockpit_codex_account_markers(home, start, scan_end)
     markers.extend(account_markers)
     raw_attributed_events = attribute_codex_events_by_account(
         codex_events,
@@ -5298,12 +5468,12 @@ def main() -> int:
     )
 
     claude_root = home / ".claude" / "projects"
-    claude = scan_claude(claude_root, start, end)
+    claude = scan_claude(claude_root, start, scan_end)
     hourly_today = merge_hourly_buckets(
         codex_hourly_from_events(
             [event for events in attributed_events.values() for event in events]
         ),
-        scan_claude_hourly(claude_root, start, end),
+        scan_claude_hourly(claude_root, start, scan_end),
     )
     mark_codex_failure_hours(hourly_today, codex_failures, day, now)
     if args.include_30d and cached_30d_valid:
@@ -5325,6 +5495,16 @@ def main() -> int:
             current_label,
             include_30d=refresh_30d,
         )
+    window_only_labels = window_only_provider_labels(
+        window_stats_by_account,
+        codex_provider_map,
+    )
+    for label in window_only_labels:
+        codex_provider_map[label] = UsageBucket()
+    codex_provider_buckets = sorted(
+        codex_provider_map.items(),
+        key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
+    )
     save_attribution_ledger(attribution_ledger, now)
 
     session_account_labels = dict(provider_session_accounts)
@@ -5344,6 +5524,7 @@ def main() -> int:
     codex_providers = []
     for name, bucket in codex_provider_buckets:
         provider = bucket_to_dict(name, bucket, show_zero=True)
+        provider["window_only"] = name in window_only_labels
         provider["recent_active"] = int(recent_active_by_label.get(name) or 0)
         provider["recent_sessions"] = int(recent_sessions_by_label.get(name) or 0)
         for key, value in speed_by_account.get(name, {}).items():
@@ -5393,12 +5574,12 @@ def main() -> int:
     recent_latest_request: dict[str, Any] = {}
     if not latest_at and day == now.date() and LATEST_REQUEST_LOOKBACK_DAYS > 0:
         lookback_start = now - timedelta(days=LATEST_REQUEST_LOOKBACK_DAYS)
-        lookback_events = scan_all_codex_events(home, codex_sessions_root, lookback_start, end)
+        lookback_events = scan_all_codex_events(home, codex_sessions_root, lookback_start, scan_end)
         if lookback_events:
-            lookback_speed_markers = codex_speed_history(home, lookback_start, end)
+            lookback_speed_markers = codex_speed_history(home, lookback_start, scan_end)
             apply_codex_speed_fallback(lookback_events, lookback_speed_markers)
-            lookback_markers = scan_cockpit_codex_switch_markers(home, lookback_start, end)
-            lookback_markers.extend(scan_cockpit_codex_account_markers(home, lookback_start, end))
+            lookback_markers = scan_cockpit_codex_switch_markers(home, lookback_start, scan_end)
+            lookback_markers.extend(scan_cockpit_codex_account_markers(home, lookback_start, scan_end))
             lookback_markers.extend(load_account_timeline())
             recent_attributed = attribute_codex_events_by_account(
                     lookback_events,
@@ -5409,7 +5590,7 @@ def main() -> int:
                 )
             recent_latest_request = latest_request_from_attributed_events(
                 recent_attributed,
-                scan_cockpit_codex_account_markers(home, lookback_start, end),
+                scan_cockpit_codex_account_markers(home, lookback_start, scan_end),
             )
             latest_provider = str(recent_latest_request.get("provider") or "")
             latest_model = str(recent_latest_request.get("model") or "")
@@ -5418,12 +5599,12 @@ def main() -> int:
     output = {
         "schema": 1,
         "source": "client-jsonl",
-        "updated_at": now.isoformat(timespec="seconds"),
+        "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "date": day.isoformat(),
         "scan_status": {
             "state": "complete",
             "from": start.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-            "through": min(now, end).replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+            "through": scan_end.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
             "source": "local-logs",
         },
         "today": bucket_to_dict("Client local", total),

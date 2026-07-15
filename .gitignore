@@ -5,6 +5,8 @@ client_usage_config.json
 client_usage_speed_history.json
 client_usage_today.json
 client_usage_account_timeline.json
+client_usage_account_types.json
+client_usage_live_checkpoint.json
 client_usage_auth_switch_events.jsonl
 client_usage_attribution_ledger.json
 client_usage_route_labels.json

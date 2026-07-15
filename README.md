@@ -14,7 +14,7 @@
 
 ### 用量统计
 
-提供 `24h / 7d / 30d / 全部` 视图，包含 Token 构成、缓存命中率、活跃分布、常用模型和账号累计成本。
+提供 `今日 / 7d / 30d / 全部` 视图，包含 Token 构成、缓存命中率、活跃分布、常用模型和账号累计成本。
 
 ![用量统计页](assets/screenshots/usage-stats.png)
 
@@ -28,7 +28,7 @@
 - 账号排行：按今日、5h、7d、30d 查看账号用量与额度状态。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
 - 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、常用模型和账号累计成本。
-- 活跃分布：支持 24h、7d、30d、全部，不同强度颜色表示用量高低；24h 视图中发生 Codex 任务或持续网络错误的小时显示为红色，即使该小时同时存在成功 Token 用量。鼠标悬停可查看具体值和错误摘要；窄窗口的全部视图聚焦最近 30 天。
+- 活跃分布：支持今日、7d、30d、全部，不同强度颜色表示用量高低；今日视图按 00:00 至当前的小时分布展示，发生 Codex 任务或持续网络错误的小时显示为红色，即使该小时同时存在成功 Token 用量。鼠标悬停可查看具体值和错误摘要；窄窗口的全部视图聚焦最近 30 天。
 - 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
 - 去重逻辑：保留 Codex fork replay 去重和 Sub2API mirror 扣除；Cockpit API 服务模式以去重后的
   原始请求为权威总量，`api-service-local` / `codex_local_access_runtime` 仅合并为一个展示项，不再重复扣除。
@@ -65,6 +65,10 @@ python .\monitor.py
 
 Cockpit 不是必需依赖。直连官方账号时，Token Pulse 会解析 Codex 官方 `~/.codex/auth.json`（包括 JWT 邮箱和 `tokens.account_id`），并按认证文件修改时间记录手动切换边界。切换前已经开始、切换后才完成的任务仍归原账号；切换后开始的新任务归新账号。只有活动 provider 明确为 Cockpit API 服务时，才读取 `.cockpit_codex_auth.json` 和 Cockpit 请求日志，卸载后的遗留文件不会覆盖官方账号身份。
 
+账号套餐类型在首次识别后会保存到 Token Pulse 自己的 `client_usage_account_types.json`。程序也会一次性迁移 Cockpit 仍保留的账号清单备份和 sidecar 认证备份；以后即使账号从 Cockpit 删除、切换到其他账号或没有安装 Cockpit，历史账号仍保留最后一次确认的 K12、PLUS、PRO 等类型。该文件只保存在本地并默认忽略 Git 提交。
+
+实时 Token 增量会保存到本地 `client_usage_live_checkpoint.json`，并在启动时按权威快照的固定时间截点补齐缺口。进程重启不会再退回旧总量；补扫事件与实时事件使用同一事件标识去重。持续活跃时仍采用轻量文件尾监听，不会因每个 Token 事件启动完整导出。
+
 悬浮窗默认每秒轻量检查一次认证身份。检测到手动切号时只追加一条切换时间记录并刷新活跃账号，不扫描会话日志，也不立即触发完整 Token 导出。
 
 如果希望完全不碰 Sub2API，可以强制本地独立模式。这个模式只读取本机 Codex/Claude 与 Antigravity Cockpit 本地日志，不请求 Sub2API 管理接口，也不使用 Sub2API 的最近请求、账号统计或并发数据。
@@ -79,9 +83,13 @@ Token Pulse 会先读取 Cockpit 明文账号快照和 sidecar reserve 中的本
 
 每个账号默认缓存 10 分钟；请求失败也会等待 10 分钟再重试，并继续显示本地 reserve 中已有的百分比。可通过环境变量调整或关闭：
 
+Token 任务持续运行时会每分钟执行一次轻量额度同步：先读取 Cockpit 本地快照，再复用上述 10 分钟官方缓存。百分比或重置周期发生变化时会补做一次完整窗口统计；即使会话持续繁忙，完整账号窗口快照最多保留 10 分钟，避免百分比已更新而 Token/成本仍停在旧周期。
+
 ```env
 CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS=600
 CLIENT_USAGE_OFFICIAL_QUOTA_REFRESH=1
+TOKEN_PULSE_QUOTA_REFRESH_SECONDS=60
+TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS=600
 ```
 
 如果 `.env` 里写着 `SUB2API_MONITOR_MODE=auto`，程序会按“当前 endpoint 门禁”处理：当前 Codex 指向 Sub2API 才读 Sub2API，否则走本地日志。
@@ -123,6 +131,8 @@ SUB2API_CLIENT_USAGE_EXPORT_TIMEOUT_SECONDS=90
 TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS=100
 TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS=250
 TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS=500
+TOKEN_PULSE_LIVE_VERIFY_THRESHOLD_TOKENS=50000000
+TOKEN_PULSE_LIVE_VERIFY_WINDOW_SECONDS=5
 TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS=30
 TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS=1000
 SUB2API_INCLUDE_LOCAL_USAGE=false
@@ -131,9 +141,11 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 
 `CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS` 用来过滤异常大的单次 token 事件。
 
-实时监听采用自适应冷热双层轮询：有日志活动时按 `TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS`（默认 `100` 毫秒）检查最多 16 个热文件；空闲 10 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS`（默认 `250` 毫秒），空闲 60 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS`（默认 `500` 毫秒）。程序每 20 秒只遍历一次完整目录以补充新文件，不重复读取历史日志内容。即时层只在内存中更新顶部 Token/请求总量和 24h Token 构成，不写入 provider、模型、成本、Activity、历史或统计缓存；随后仍由原有后台完整解析、fork replay 去重、账号归属和计费流程生成权威结果。
+运行过程中，实时增量在 5 秒内累计达到 `TOKEN_PULSE_LIVE_VERIFY_THRESHOLD_TOKENS`（默认 `50,000,000`）时不会立即加入今日总量，而是先触发只读完整扫描；扫描截止时间覆盖这批事件后，才按去重后的权威结果更新。可通过 `TOKEN_PULSE_LIVE_VERIFY_WINDOW_SECONDS` 调整累计窗口。软件刚启动时从历史日志恢复当日用量不经过这项运行期防护，因此不会把正常的启动加载误判为突增。
 
-`TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS` 默认为 `30` 秒。活跃会话仍在写日志时，自动完整扫描会暂缓；日志安静达到该时间后再更新账号归属、模型和成本。悬浮窗上的手动刷新按钮不受此限制。
+实时监听采用自适应冷热双层轮询：有日志活动时按 `TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS`（默认 `100` 毫秒）检查最多 16 个热文件；空闲 10 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_IDLE_INTERVAL_MS`（默认 `250` 毫秒），空闲 60 秒后使用 `TOKEN_PULSE_LIVE_USAGE_WATCH_COLD_INTERVAL_MS`（默认 `500` 毫秒）。程序每 20 秒只遍历一次完整目录以补充新文件，不重复读取历史日志内容。即时层只在内存中更新顶部 Token/请求总量和今日 Token 构成，不写入 provider、模型、成本、Activity、历史或统计缓存；随后仍由原有后台完整解析、fork replay 去重、账号归属和计费流程生成权威结果。
+
+`TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS` 默认为 `30` 秒。活跃会话仍在写日志时，常规完整扫描会暂缓；日志安静达到该时间后再更新账号归属、模型和成本。额度周期变化或完整快照超过 `TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS`（默认 10 分钟）时仍会强制校正一次，悬浮窗上的手动刷新按钮也不受此限制。
 
 `TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS` 控制官方账号身份检查间隔，默认 `1000` 毫秒，最小 `500` 毫秒。监听只读取 `config.toml` 与当前路由对应的小型认证文件，切号记录保存在本地 `client_usage_auth_switch_events.jsonl`。
 
