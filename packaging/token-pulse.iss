@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.1"
 #endif
 
 #define AppName "Token Pulse"
@@ -50,3 +50,32 @@ Name: "{userstartup}\Token Pulse"; Filename: "{app}\TokenPulse.exe"; Tasks: star
 
 [Run]
 Filename: "{app}\TokenPulse.exe"; Description: "启动 Token Pulse"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: files; Name: "{app}\TokenPulse.exe"
+Type: files; Name: "{app}\TokenPulseExporter.exe"
+Type: dirifempty; Name: "{app}"
+
+[Code]
+procedure StopTokenPulseProcess(const ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/F /T /IM ' + ImageName,
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    StopTokenPulseProcess('TokenPulse.exe');
+    StopTokenPulseProcess('TokenPulseExporter.exe');
+  end;
+end;
