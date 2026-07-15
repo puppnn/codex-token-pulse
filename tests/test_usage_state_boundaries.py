@@ -5745,6 +5745,34 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
 
 
 class ClientUsageSyncStatusTests(unittest.TestCase):
+    def test_export_command_uses_python_for_source_script(self) -> None:
+        with (
+            patch.object(monitor, "CLIENT_USAGE_EXPORT", Path("C:/tools/export.py")),
+            patch.object(monitor, "CLIENT_USAGE_PYTHON", "python.exe"),
+        ):
+            command = monitor.client_usage_export_command("--quota-only")
+
+        self.assertEqual(
+            command,
+            ["python.exe", "C:\\tools\\export.py", "--quota-only"],
+        )
+
+    def test_export_command_runs_packaged_exporter_directly(self) -> None:
+        with patch.object(
+            monitor,
+            "CLIENT_USAGE_EXPORT",
+            Path("C:/Program Files/Token Pulse/TokenPulseExporter.exe"),
+        ):
+            command = monitor.client_usage_export_command("--quota-only")
+
+        self.assertEqual(
+            command,
+            [
+                "C:\\Program Files\\Token Pulse\\TokenPulseExporter.exe",
+                "--quota-only",
+            ],
+        )
+
     def payload(self, tokens: int) -> dict:
         return {
             "date": monitor.today_key(),

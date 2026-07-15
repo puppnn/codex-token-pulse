@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -60,7 +61,20 @@ def load_cached_account_30d_windows(
     return True, updated_text, windows
 
 
-APP_DIR = Path(__file__).resolve().parent
+SOURCE_DIR = Path(__file__).resolve().parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+if IS_FROZEN:
+    local_app_data = Path(
+        os.environ.get("LOCALAPPDATA")
+        or Path.home() / "AppData" / "Local"
+    )
+    APP_DIR = Path(
+        os.environ.get("TOKEN_PULSE_DATA_DIR")
+        or local_app_data / "Token Pulse"
+    )
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    APP_DIR = SOURCE_DIR
 DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_usage_config.json")
 SPEED_HISTORY_PATH = Path(os.environ.get("CLIENT_USAGE_SPEED_HISTORY") or APP_DIR / "client_usage_speed_history.json")

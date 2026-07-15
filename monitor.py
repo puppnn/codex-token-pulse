@@ -20,12 +20,31 @@ from typing import Any
 from urllib import error, parse, request
 
 
-APP_DIR = Path(__file__).resolve().parent
-ENV_FILES = [
-    APP_DIR / ".env",
-    APP_DIR / "deploy" / ".env",
-    APP_DIR.parent.parent / "deploy" / ".env",
-]
+SOURCE_DIR = Path(__file__).resolve().parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+INSTALL_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else SOURCE_DIR
+if IS_FROZEN:
+    local_app_data = Path(
+        os.environ.get("LOCALAPPDATA")
+        or Path.home() / "AppData" / "Local"
+    )
+    APP_DIR = Path(
+        os.environ.get("TOKEN_PULSE_DATA_DIR")
+        or local_app_data / "Token Pulse"
+    )
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    APP_DIR = SOURCE_DIR
+ENV_FILES = list(
+    dict.fromkeys(
+        [
+            APP_DIR / ".env",
+            INSTALL_DIR / ".env",
+            INSTALL_DIR / "deploy" / ".env",
+            SOURCE_DIR.parent.parent / "deploy" / ".env",
+        ]
+    )
+)
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 REFRESH_SECONDS = 3
 CLIENT_USAGE_CACHE_SECONDS = int(os.environ.get("SUB2API_CLIENT_USAGE_CACHE_SECONDS", "10"))
@@ -111,7 +130,14 @@ COCKPIT_REQUEST_LOG_DB = Path(
     os.environ.get("TOKEN_PULSE_COCKPIT_REQUEST_LOG_DB")
     or Path.home() / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
 )
-CLIENT_USAGE_EXPORT = Path(os.environ.get("CLIENT_USAGE_EXPORT") or APP_DIR / "client_usage_export.py")
+CLIENT_USAGE_EXPORT = Path(
+    os.environ.get("CLIENT_USAGE_EXPORT")
+    or (
+        INSTALL_DIR / "TokenPulseExporter.exe"
+        if IS_FROZEN
+        else APP_DIR / "client_usage_export.py"
+    )
+)
 if not CLIENT_USAGE_EXPORT.exists():
     fallback_export = APP_DIR.parent / "client-token-importer" / "client_usage_export.py"
     if fallback_export.exists():
@@ -171,7 +197,10 @@ AUTH_SWITCH_EVENTS_PATH = Path(
 CN_TZ = timezone(timedelta(hours=8), "CST")
 DISPLAY_TIMEZONE = "Asia/Shanghai"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
-SINGLE_INSTANCE_MUTEX_NAME = "Local\\TokenPulseFloatingMonitor"
+SINGLE_INSTANCE_MUTEX_NAME = os.environ.get(
+    "TOKEN_PULSE_MUTEX_NAME",
+    "Local\\TokenPulseFloatingMonitor",
+)
 ERROR_ALREADY_EXISTS = 183
 
 
@@ -2237,6 +2266,14 @@ def normalize_usage_window(progress: Any) -> dict[str, Any]:
     return result
 
 
+def client_usage_export_command(*arguments: str) -> list[str]:
+    exporter = str(CLIENT_USAGE_EXPORT)
+    suffix = CLIENT_USAGE_EXPORT.suffix.casefold()
+    if suffix in {".exe", ".com", ".bat", ".cmd"}:
+        return [exporter, *arguments]
+    return [CLIENT_USAGE_PYTHON, exporter, *arguments]
+
+
 def load_client_usage(
     include_30d: bool = False,
     backfill_history_details: bool = False,
@@ -2256,7 +2293,10 @@ def load_client_usage(
     if run_export and CLIENT_USAGE_EXPORT.exists():
         export_attempted = True
         try:
-            command = [CLIENT_USAGE_PYTHON, str(CLIENT_USAGE_EXPORT), "--output", str(CLIENT_USAGE_JSON)]
+            command = client_usage_export_command(
+                "--output",
+                str(CLIENT_USAGE_JSON),
+            )
             if include_30d:
                 command.append("--include-30d")
             if backfill_history_details:
@@ -7771,16 +7811,14 @@ class FloatingMonitorApp:
             payload: dict[str, Any] | None = None
             try:
                 completed = subprocess.run(
-                    [
-                        CLIENT_USAGE_PYTHON,
-                        str(CLIENT_USAGE_EXPORT),
+                    client_usage_export_command(
                         "--output",
                         str(CLIENT_USAGE_JSON),
                         "--live-since",
                         since.isoformat(timespec="microseconds"),
                         "--live-through",
                         through.isoformat(timespec="microseconds"),
-                    ],
+                    ),
                     cwd=str(APP_DIR),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -8533,11 +8571,7 @@ class FloatingMonitorApp:
             payload: dict[str, Any] | None = None
             try:
                 completed = subprocess.run(
-                    [
-                        CLIENT_USAGE_PYTHON,
-                        str(CLIENT_USAGE_EXPORT),
-                        "--quota-only",
-                    ],
+                    client_usage_export_command("--quota-only"),
                     cwd=str(APP_DIR),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,

@@ -41,6 +41,12 @@
 
 项目不需要安装额外 Python 包。
 
+## Windows 安装版
+
+不想配置 Python 时，可以从 [GitHub Releases](https://github.com/puppnn/codex-token-pulse/releases) 下载 `CodexTokenPulse-Setup-v*.exe`。安装器包含界面程序和本地统计器，可选创建桌面快捷方式或登录后自动启动。
+
+安装版会把 Token 历史、账号类型、价格缓存和配置保存在 `%LOCALAPPDATA%\Token Pulse`，升级程序不会覆盖这些数据。需要自定义 Sub2API 或刷新参数时，可在该目录创建 `.env`。
+
 ## 快速开始
 
 自动模式会先检测当前 Codex endpoint。只有当前账号指向 Sub2API 地址时，才读取 Sub2API 管理端数据；切回官方账号或其他 API 时，只读取本地客户端日志：
