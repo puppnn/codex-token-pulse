@@ -459,11 +459,11 @@ class CodexAuthIdentityTests(unittest.TestCase):
 
 
 class CompactNumberTests(unittest.TestCase):
-    def test_trend_chart_labels_make_recent_bars_explicit(self) -> None:
-        self.assertEqual(monitor.trend_chart_day_label("2026-07-09", 0), "7/9")
-        self.assertEqual(monitor.trend_chart_day_label("2026-07-14", 5), "昨日")
-        self.assertEqual(monitor.trend_chart_day_label("2026-07-15", 6), "今日")
-        self.assertEqual(monitor.trend_chart_day_label("invalid", 2), "-")
+    def test_trend_metric_bars_are_proportional_and_nonzero_is_visible(self) -> None:
+        self.assertEqual(monitor.trend_bar_fill_height(0, 100, 52), 0)
+        self.assertEqual(monitor.trend_bar_fill_height(100, 100, 52), 52)
+        self.assertEqual(monitor.trend_bar_fill_height(50, 100, 52), 26)
+        self.assertEqual(monitor.trend_bar_fill_height(1, 100, 52), 7)
 
     def test_billions_use_b_suffix(self) -> None:
         self.assertEqual(monitor.compact_number(1_000_000_000), "1.0B")

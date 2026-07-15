@@ -14,7 +14,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -889,17 +889,16 @@ def date_key(days_ago: int) -> str:
     return (datetime.now(CN_TZ).date() - timedelta(days=days_ago)).isoformat()
 
 
-def trend_chart_day_label(date_value: str, index: int, total: int = 7) -> str:
-    """Return a compact, unambiguous label for a daily trend bar."""
-    if index == total - 1:
-        return "今日"
-    if index == total - 2:
-        return "昨日"
-    try:
-        parsed = date.fromisoformat(str(date_value))
-        return f"{parsed.month}/{parsed.day}"
-    except (TypeError, ValueError):
-        return "-"
+def trend_bar_fill_height(
+    value: float | int,
+    maximum: float | int,
+    chart_height: int,
+    minimum_visible: int = 7,
+) -> int:
+    """Scale a trend value while keeping every non-zero bar clearly visible."""
+    if value <= 0 or maximum <= 0 or chart_height <= 0:
+        return 0
+    return min(chart_height, max(minimum_visible, round(chart_height * value / maximum)))
 
 
 def load_usage_history() -> dict[str, Any]:
@@ -6415,40 +6414,44 @@ class FloatingMonitorApp:
             c.create_text(cx, y + 21, anchor="n", text=lbl,
                            font=self._fonts["font_micro"], fill=Theme.text_secondary)
             self._add_tooltip(metric_x1, y - 3, metric_x2, y + 38, tooltip)
-        series = history.get("series") if isinstance(history, dict) else []
-        if isinstance(series, list) and series:
-            bar_y = y + 40
-            bar_h = 34
-            gap = 5
-            bar_w = max(8, int((COL_R - COL_L - gap * 6) / 7))
-            max_cost = max([float(item.get("tokens") or 0) for item in series if isinstance(item, dict)], default=0) or 1
-            for index, item in enumerate(series[:7]):
-                cost = float(item.get("tokens") or 0) if isinstance(item, dict) else 0
-                intensity = min(1.0, cost / max_cost) if cost > 0 else 0.0
-                x1 = COL_L + index * (bar_w + gap)
-                x2 = min(COL_R, x1 + bar_w)
-                fill_h = max(2, int(bar_h * min(1.0, cost / max_cost))) if cost > 0 else 2
-                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill=Theme.ag_bg, outline="")
-                color = self._trend_token_color(intensity, index == 6)
-                self._draw_rounded_rect(x1, bar_y + bar_h - fill_h, x2, bar_y + bar_h, r=3, fill=color, outline="")
-                c.create_text(
-                    (x1 + x2) / 2,
-                    bar_y + bar_h + 4,
-                    anchor="n",
-                    text=trend_chart_day_label(str(item.get("date") or ""), index, min(7, len(series))),
-                    font=self._fonts["font_micro"],
-                    fill=color if index >= 5 else Theme.text_muted,
-                )
-                self._add_tooltip(
+        bar_y = y + 40
+        bar_h = 52
+        bar_w = 44
+        bar_values = [trend_today, trend_yesterday, trend_average]
+        max_tokens = max(bar_values, default=0) or 1
+        c.create_line(COL_L, bar_y + bar_h, COL_R, bar_y + bar_h, fill=Theme.ag_divider, width=1)
+        for index, ((label, _value, color, tooltip), tokens) in enumerate(zip(cost_stats, bar_values)):
+            cx = COL_L + col_w * index + col_w // 2
+            x1 = cx - bar_w // 2
+            x2 = cx + bar_w // 2
+            fill_h = trend_bar_fill_height(tokens, max_tokens, bar_h)
+            self._draw_rounded_rect(
+                x1,
+                bar_y,
+                x2,
+                bar_y + bar_h,
+                r=5,
+                fill=Theme.ag_bg,
+                outline=Theme.border,
+            )
+            if fill_h:
+                self._draw_rounded_rect(
                     x1,
-                    bar_y,
+                    bar_y + bar_h - fill_h,
                     x2,
-                    bar_y + bar_h + 18,
-                    f"{item.get('date', '-')}\n{exact_token_count(cost)} Token\n{int(item.get('requests') or 0):,} calls · {money(item.get('cost', 0))}",
+                    bar_y + bar_h,
+                    r=5,
+                    fill=color,
+                    outline="",
                 )
-            y += 94
-        else:
-            y += 46
+            self._add_tooltip(
+                COL_L + col_w * index,
+                y - 3,
+                COL_R if index == 2 else COL_L + col_w * (index + 1),
+                bar_y + bar_h,
+                tooltip,
+            )
+        y += 104
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
