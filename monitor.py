@@ -8721,5 +8721,25 @@ def run_monitor_app() -> bool:
     return True
 
 
+def run_monitor_smoke_test() -> int:
+    root: tk.Tk | None = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.update()
+        return 0
+    except Exception:
+        return 1
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
+    if "--smoke-test" in sys.argv:
+        raise SystemExit(run_monitor_smoke_test())
     run_monitor_app()

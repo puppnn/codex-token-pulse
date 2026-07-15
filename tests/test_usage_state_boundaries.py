@@ -5874,6 +5874,29 @@ class ClientUsageSyncStatusTests(unittest.TestCase):
         self.assertFalse(usage["stale"])
 
 
+class PackagedSmokeTestTests(unittest.TestCase):
+    def test_smoke_test_initializes_and_closes_tk(self) -> None:
+        root = MagicMock()
+        with patch.object(monitor.tk, "Tk", return_value=root):
+            result = monitor.run_monitor_smoke_test()
+
+        self.assertEqual(result, 0)
+        root.withdraw.assert_called_once_with()
+        root.update_idletasks.assert_called_once_with()
+        root.update.assert_called_once_with()
+        root.destroy.assert_called_once_with()
+
+    def test_smoke_test_returns_failure_when_tk_cannot_initialize(self) -> None:
+        with patch.object(
+            monitor.tk,
+            "Tk",
+            side_effect=monitor.tk.TclError("broken Tcl"),
+        ):
+            result = monitor.run_monitor_smoke_test()
+
+        self.assertEqual(result, 1)
+
+
 class AttributionLedgerTests(unittest.TestCase):
     def test_stable_event_id_wins_when_route_time_changes(self) -> None:
         event = client_usage_export.UsageEvent(
