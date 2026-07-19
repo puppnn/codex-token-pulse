@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib import request
 
+from remote_usage import merge_configured_remote_usage
+
 
 def env_float(name: str, default: float) -> float:
     try:
@@ -6190,6 +6192,7 @@ def main() -> int:
         )
 
     collapse_api_service_mirror_providers(output)
+    merge_configured_remote_usage(output, include_30d=args.include_30d)
     same_day_output_high_water(output, out, day)
     restore_today_from_usage_history(output, day)
     add_unattributed_provider_gap(output)

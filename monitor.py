@@ -1694,6 +1694,7 @@ class CodexUsageFileWatcher:
         self._last_full_scan_at = float("-inf")
         self._last_activity_at = time.monotonic()
         self._primed = False
+        self._empty_tree_mtime_ns: int | None = None
         self.token_count_changed = False
         self.reconciliation_needed = False
         self._reconciliation_paths: dict[Path, float] = {}
@@ -1931,6 +1932,19 @@ class CodexUsageFileWatcher:
                 self._files.pop(missing, None)
                 self._hot_files.pop(missing, None)
                 self._fork_replay_cutoffs.pop(missing, None)
+
+        # A newly-created rollout may be dated outside today's directory (for
+        # example after clock skew or migration). If the watcher was primed
+        # while the tree was empty, use the root mtime as a cheap trigger for
+        # one cold discovery instead of waiting for the normal full-scan timer.
+        if not paths and not self._files:
+            try:
+                empty_tree_mtime_ns = int(self.sessions_root.stat().st_mtime_ns)
+            except OSError:
+                empty_tree_mtime_ns = -1
+            if empty_tree_mtime_ns != self._empty_tree_mtime_ns:
+                paths.update(self._full_scan_paths())
+                self._empty_tree_mtime_ns = empty_tree_mtime_ns
 
         for path in paths:
             try:
@@ -2623,6 +2637,21 @@ def load_client_usage(
     offline_catchup = data.get("offline_catchup")
     if isinstance(offline_catchup, dict):
         sync_status["offline_catchup"] = offline_catchup
+    remote_nodes = data.get("remote_nodes") if isinstance(data.get("remote_nodes"), list) else []
+    failed_remote_nodes = [
+        node
+        for node in remote_nodes
+        if isinstance(node, dict) and str(node.get("state") or "").casefold() == "error"
+    ]
+    if failed_remote_nodes:
+        summaries = []
+        for node in failed_remote_nodes[:3]:
+            name = str(node.get("name") or node.get("node_id") or "remote")
+            message = str(node.get("message") or "unavailable")
+            summaries.append(f"{name}: {message}")
+        sync_status["state"] = "partial"
+        sync_status["message"] = ("Remote usage unavailable: " + "; ".join(summaries))[:240]
+        sync_status["remote_nodes"] = remote_nodes
     if export_state == "ok" and isinstance(offline_catchup, dict):
         catchup_state = str(offline_catchup.get("state") or "")
         if catchup_state == "error":
@@ -2681,6 +2710,7 @@ def load_client_usage(
         "latest_request": data.get("latest_request") or {},
         "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
         "scan_status": data.get("scan_status") if isinstance(data.get("scan_status"), dict) else {},
+        "remote_nodes": remote_nodes,
         "api_service_routed": bool(data.get("api_service_routed")),
         "updated_at": data.get("updated_at") or "",
         "date": data_date,

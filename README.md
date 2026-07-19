@@ -31,6 +31,7 @@
 - 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、常用模型和账号累计成本。
 - 活跃分布：支持今日、7d、30d、全部，不同强度颜色表示用量高低；今日视图按 00:00 至当前的小时分布展示，发生 Codex 任务或持续网络错误的小时显示为红色，即使该小时同时存在成功 Token 用量。鼠标悬停可查看具体值和错误摘要；窄窗口的全部视图聚焦最近 30 天。
 - 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
+- 多机器汇总：通过 Tailscale 从远端只读端点拉取聚合结果，合并本机与多台服务器的 Token、请求、成本和小时分布，并按节点标注来源。
 - 去重逻辑：保留 Codex fork replay 去重和 Sub2API mirror 扣除；Cockpit API 服务模式以去重后的
   原始请求为权威总量，`api-service-local` / `codex_local_access_runtime` 仅合并为一个展示项，不再重复扣除。
 
@@ -100,6 +101,57 @@ TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS=600
 ```
 
 如果 `.env` 里写着 `SUB2API_MONITOR_MODE=auto`，程序会按“当前 endpoint 门禁”处理：当前 Codex 指向 Sub2API 才读 Sub2API，否则走本地日志。
+
+## 通过 Tailscale 汇总多台机器
+
+Token Pulse 默认只扫描当前机器。Tailscale 负责网络连通，但不会自动共享远端的
+`~/.codex` 或 `~/.claude` 日志。要把远端服务器的用量计入本机总量，需要在每台远端
+机器启动只读用量端点，再由本机导出器拉取聚合结果。
+
+远端机器：
+
+1. 将本仓库放到远端机器，并复制 `.env.example` 为 `.env`。
+2. 建议在 `.env` 中设置一个长随机密钥和稳定、唯一的节点名：
+
+   ```env
+   TOKEN_PULSE_LOCAL_NODE_ID=scuaa312
+   TOKEN_PULSE_REMOTE_TOKEN=replace-with-a-long-random-secret
+   TOKEN_PULSE_REMOTE_PORT=8765
+   ```
+
+3. 在远端启动：
+
+   ```powershell
+   .\start-remote-usage-tailscale.ps1
+   ```
+
+   服务只绑定当前 Tailscale IPv4，默认地址形如
+   `http://100.x.y.z:8765/v1/usage`。它返回已经聚合的统计，不提供原始日志、
+   `auth.json`、账号 access token 或任意文件读取接口。
+
+运行悬浮窗的汇总机器：
+
+```env
+TOKEN_PULSE_LOCAL_NODE_ID=laptop
+TOKEN_PULSE_REMOTE_NODES=scuaa312=http://100.87.128.74:8765
+TOKEN_PULSE_REMOTE_TOKEN=replace-with-the-same-long-random-secret
+TOKEN_PULSE_REMOTE_TIMEOUT_SECONDS=5
+```
+
+多台远端使用分号分隔，例如：
+
+```env
+TOKEN_PULSE_REMOTE_NODES=build=http://100.87.128.74:8765;gpu=http://gpu-box:8765
+```
+
+重新启动 `monitor.py` 后，顶部总量、请求、成本和小时分布会同时包含本机与远端；
+账号行会追加 `@ 节点名`，便于核对来源。同一节点通过多个别名配置时只合并一次，
+把本机误填为远端也不会重复计数。远端离线或鉴权失败时，本机数据继续刷新，
+本次扫描标记为 `partial` 并保留错误状态。
+
+HTTP 流量位于 Tailscale 的加密隧道内。仍建议同时设置 `TOKEN_PULSE_REMOTE_TOKEN`，
+并用 Tailscale ACL 仅允许汇总机器访问远端 TCP `8765`。如果不设置密钥，则只依赖
+tailnet 身份与 ACL。
 
 ## Sub2API 兼容模式
 
@@ -198,6 +250,8 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 
 - `monitor.py`：悬浮窗 UI、Sub2API 读取、本地统计整合和页面绘制。
 - `client_usage_export.py`：本地客户端 JSONL 用量扫描器。
+- `remote_usage.py`：Tailscale 远端只读端点与多节点用量合并器。
+- `start-remote-usage-tailscale.ps1`：在远端节点绑定 Tailscale 地址并启动用量端点。
 - `start-monitor.ps1`：自动模式启动脚本。
 - `start-local-codex.ps1`：本地日志模式启动脚本。
 - `run-monitor.cmd`：CMD 启动脚本。
