@@ -5138,6 +5138,31 @@ class CodexSessionModelTests(unittest.TestCase):
         self.assertTrue(hourly[3]["failure"])
         self.assertFalse(hourly[4].get("failure"))
 
+    def test_idle_hour_network_failure_does_not_mark_token_activity(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 4, 0, 14),
+                session_id="codex-desktop",
+                kind="desktop_network",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 0),
+        )
+
+        self.assertFalse(hourly[4].get("failure"))
+        self.assertNotIn("failure_count", hourly[4])
+        self.assertNotIn("failure_at", hourly[4])
+        self.assertNotIn("failure_kind", hourly[4])
+
     def test_repeated_desktop_network_failures_mark_the_failure_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_root = Path(directory)

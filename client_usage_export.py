@@ -3650,6 +3650,14 @@ def mark_codex_failure_hours(
         candidate = by_hour.get(candidate_hour)
         if candidate is None or candidate_hour > last_observed_hour:
             continue
+        if (
+            failure.kind == "desktop_network"
+            and int(candidate.get("requests") or 0) <= 0
+            and int(candidate.get("tokens") or 0) <= 0
+        ):
+            # Background network polling can fail while Codex is idle. Keep
+            # that separate from token activity so an empty hour stays empty.
+            continue
         candidate["failure"] = True
         candidate["failure_count"] = int(candidate.get("failure_count") or 0) + 1
         failure_at = failure.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
