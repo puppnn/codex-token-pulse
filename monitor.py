@@ -836,8 +836,10 @@ def account_type_label(account: dict[str, Any] | None = None, name: Any = "") ->
     display_name = ranking_account_display_name(
         str(next((candidate for candidate in candidates if candidate), ""))
     ).casefold()
-    if row.get("is_pool_aggregate") or display_name == "api \u670d\u52a1":
+    if row.get("is_pool_aggregate"):
         return "\u8d26\u53f7\u6c60"
+    if row.get("is_api_service_aggregate") or display_name == "api \u670d\u52a1":
+        return "\u5f85\u5f52\u56e0"
     if "api-key" in display_name or "api key" in display_name:
         return "API KEY"
     if display_name == "claude":
@@ -3201,6 +3203,9 @@ def build_local_monitor_state(
                     "active_now": False,
                     "window_only": bool(provider.get("window_only")),
                     "is_unattributed_gap": bool(provider.get("is_unattributed_gap")),
+                    "is_api_service_aggregate": bool(
+                        provider.get("is_api_service_aggregate")
+                    ),
                     "is_latest": str(provider.get("name") or "") == latest_provider_name,
                 }
             )
@@ -5982,7 +5987,8 @@ class FloatingMonitorApp:
                     else:
                         reset = quota_reset_text(window.get("resets_at")) or "\u91cd\u7f6e -"
                     if window.get("quota_stale"):
-                        detail = "\u5f85\u5237\u65b0"
+                        detail = f"\u4e0a\u6b21 {detail}"
+                        reset = "\u989d\u5ea6\u5f85\u5237\u65b0"
                         color = Theme.ag_warn
                 else:
                     utilization = 0.0
@@ -7155,7 +7161,14 @@ class FloatingMonitorApp:
                     right_detail = f"最近 5h · {reqs} 次"
                     right_color = Theme.accent_green
                 elif quota_stale:
-                    right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
+                    if quota_available:
+                        try:
+                            remaining_text = f"{float(remaining_percent):.0f}%"
+                        except (TypeError, ValueError):
+                            remaining_text = "--%"
+                        right_detail = f"\u4e0a\u6b21\u5269\u4f59 {remaining_text} \u00b7 \u5f85\u5237\u65b0"
+                    else:
+                        right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
                     right_color = Theme.amber_bright
                 elif quota_idle:
                     right_detail = "\u6ee1\u989d\u5f85\u4f7f\u7528"
@@ -7182,7 +7195,9 @@ class FloatingMonitorApp:
                 if quota_unlimited:
                     reset_text = "无5h限制 · 最近5小时分析"
                 elif quota_available:
-                    if quota_idle:
+                    if quota_stale:
+                        reset_text = "\u4e0a\u6b21\u989d\u5ea6\u8bb0\u5f55 \u00b7 \u5f85\u5237\u65b0"
+                    elif quota_idle:
                         reset_text = "\u9996\u6b21\u4f7f\u7528\u540e\u5f00\u59cb 5h \u5012\u8ba1\u65f6"
                     elif quota_reset_unavailable:
                         reset_text = "\u91cd\u7f6e\u65f6\u95f4\u5f85\u540c\u6b65"
@@ -8940,7 +8955,16 @@ def run_monitor_smoke_test() -> int:
         root.update_idletasks()
         root.update()
         return 0
-    except Exception:
+    except Exception as exc:
+        report_path = os.environ.get("TOKEN_PULSE_SMOKE_REPORT")
+        if report_path:
+            try:
+                Path(report_path).write_text(
+                    f"{type(exc).__name__}: {exc}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
         return 1
     finally:
         if root is not None:

@@ -138,6 +138,14 @@ CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
+COCKPIT_AFFINITY_TURN_MATCH_SECONDS = max(
+    0.1,
+    env_float("CLIENT_USAGE_COCKPIT_AFFINITY_TURN_MATCH_SECONDS", 2.0),
+)
+COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS = max(
+    0.0,
+    env_float("CLIENT_USAGE_COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS", 0.2),
+)
 CODEX_CURRENT_ACCOUNT_RECENT_SECONDS = int(os.environ.get("CLIENT_USAGE_CURRENT_ACCOUNT_RECENT_SECONDS", "1800"))
 CLIENT_USAGE_ACTIVE_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_ACTIVE_WINDOW_SECONDS", "60"))
 CLIENT_USAGE_ACTIVE_TASK_STALE_SECONDS = int(
@@ -196,6 +204,30 @@ API_SERVICE_MIRROR_LABELS = {
 if "CLIENT_USAGE_HIGH_WATER_UNATTRIBUTED_LABEL" not in os.environ:
     HIGH_WATER_UNATTRIBUTED_LABEL = "Codex local - \u5386\u53f2\u7f3a\u53e3\u672a\u5f52\u5c5e"
 API_SERVICE_AGGREGATE_LABEL = "Codex local - api-service-local"
+COCKPIT_CONFIRMED_AFFINITY_ACTIONS = {
+    "binding confirmed",
+    "spillover binding confirmed",
+    "confirmed binding hit",
+}
+COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS = {
+    "cache hit before new k12 routing",
+    "cache hit",
+    "cache miss, new binding",
+    "temporary spillover binding hit during k12 cooldown",
+    "recovery spillover retained after k12 hard release",
+}
+COCKPIT_FAILED_AFFINITY_ACTION_FRAGMENTS = (
+    "released after failure",
+    "suspended for failover",
+    "auth unavailable",
+    "failure recovery",
+    "quarantined auth",
+)
+COCKPIT_AFFINITY_LINE_RE = re.compile(
+    r'^(?P<timestamp>\S+).*?msg="(?:k12-)?session-affinity:\s*'
+    r'(?P<action>[^|\"]+?)\s*\|\s*(?P<fields>[^\"]*)"\s+'
+    r'request_id=(?P<request_id>[^\s]+)'
+)
 
 _ONLINE_PRICE_TABLE: dict[str, tuple[float, float, float]] | None = None
 _ONLINE_PRICE_DETAILS: dict[str, dict[str, float]] | None = None
@@ -314,6 +346,20 @@ class AccountMarker:
     cached_tokens: int = 0
     output_tokens: int = 0
     event_key: str = ""
+    request_id: str = ""
+    account_id: str = ""
+
+
+@dataclass
+class CockpitAffinityEvent:
+    when: datetime
+    request_id: str
+    source: str = ""
+    session_key: str = ""
+    account_id: str = ""
+    label: str = ""
+    action: str = ""
+    confirmed: bool = False
 
 
 @dataclass
@@ -2260,6 +2306,25 @@ def cockpit_account_label(account_id: str, email: str, api_key_label: str) -> st
     return "Codex local - Unknown"
 
 
+def usable_cockpit_identity(value: Any) -> str:
+    """Accept compact auth metadata, but reject diagnostic routing text."""
+    identity = str(value or "").strip()
+    if not identity:
+        return ""
+    if identity.lower() in API_SERVICE_MIRROR_LABELS:
+        return identity
+    if any(char.isspace() or char in ":;{}[]" for char in identity):
+        return ""
+    return identity
+
+
+def usable_cockpit_account_label(value: Any) -> str:
+    label = str(value or "").strip()
+    prefix = "Codex local - "
+    identity = label[len(prefix):].strip() if label.lower().startswith(prefix.lower()) else label
+    return label if usable_cockpit_identity(identity) else ""
+
+
 def decode_jwt_payload(value: Any) -> dict[str, Any]:
     token = str(value or "").strip()
     if token.count(".") < 2:
@@ -2304,11 +2369,15 @@ def codex_auth_identity(data: dict[str, Any] | None) -> str:
     if account_id:
         return account_id
 
-    return str(
+    provider_identity = str(
         data.get("api_provider_name")
         or data.get("api_provider_id")
         or ""
     ).strip()
+    # A routing diagnostic is not an account identity.  Only compact metadata
+    # values may seed the local account timeline; free-form log text must stay
+    # unresolved instead of becoming a guessed account or plan type.
+    return usable_cockpit_identity(provider_identity)
 
 
 def active_codex_model_provider(home: Path) -> str:
@@ -2377,7 +2446,7 @@ def load_account_timeline() -> list[AccountMarker]:
             continue
         when = parse_dt(item.get("at"))
         label = str(item.get("label") or "").strip()
-        if when is None or not label:
+        if when is None or not usable_cockpit_account_label(label):
             continue
         markers.append(AccountMarker(when=when, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
     try:
@@ -2396,7 +2465,7 @@ def load_account_timeline() -> list[AccountMarker]:
             continue
         when = parse_dt(item.get("at"))
         label = str(item.get("label") or "").strip()
-        if when is None or not label:
+        if when is None or not usable_cockpit_account_label(label):
             continue
         markers.append(AccountMarker(when=when, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
     deduped: dict[tuple[datetime, str], AccountMarker] = {
@@ -2550,6 +2619,60 @@ def cockpit_codex_account_label_by_id(home: Path) -> dict[str, str]:
                 str(account.get("email") or ""),
                 str(account.get("api_provider_name") or account.get("name") or ""),
             )
+    return labels
+
+
+def normalize_cockpit_auth_id(value: Any) -> str:
+    account_id = str(value or "").strip().strip('"').strip("'")
+    if account_id.lower().endswith(".json"):
+        account_id = account_id[:-5]
+    return account_id
+
+
+def cockpit_affinity_account_label_by_id(
+    home: Path,
+    request_markers: list[AccountMarker] | None = None,
+) -> dict[str, str]:
+    labels = {
+        normalize_cockpit_auth_id(account_id): label
+        for account_id, label in cockpit_codex_account_label_by_id(home).items()
+        if normalize_cockpit_auth_id(account_id) and usable_cockpit_account_label(label)
+    }
+    for marker in request_markers or []:
+        account_id = normalize_cockpit_auth_id(marker.account_id)
+        if account_id and usable_cockpit_account_label(marker.label):
+            labels[account_id] = marker.label
+
+    db_path = home / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
+    if not db_path.exists():
+        return labels
+    try:
+        connection = sqlite3.connect(db_path)
+        rows = connection.execute(
+            """
+            SELECT logs.account_id, logs.email, logs.api_key_label
+            FROM request_logs AS logs
+            INNER JOIN (
+                SELECT account_id, MAX(id) AS latest_id
+                FROM request_logs
+                WHERE account_id <> ''
+                GROUP BY account_id
+            ) AS latest
+                ON latest.latest_id = logs.id
+            """
+        ).fetchall()
+        connection.close()
+    except sqlite3.Error:
+        return labels
+    for account_id, email, api_key_label in rows:
+        normalized = normalize_cockpit_auth_id(account_id)
+        label = cockpit_account_label(
+            str(account_id or ""),
+            str(email or ""),
+            str(api_key_label or ""),
+        )
+        if normalized and usable_cockpit_account_label(label):
+            labels[normalized] = label
     return labels
 
 
@@ -3026,6 +3149,78 @@ def load_official_quota_cache() -> dict[str, Any]:
     return accounts if isinstance(accounts, dict) else {}
 
 
+def cached_official_quota_by_label(
+    cache: dict[str, Any],
+    active_account_ids: set[str] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Return stale last-known quota for accounts no longer in Cockpit's pool."""
+    active_ids = active_account_ids or set()
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for account_id, entry in cache.items():
+        if account_id in active_ids or not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or entry.get("email") or "").strip()
+        if not label:
+            continue
+        stale_quota = stale_official_quota_snapshot(entry.get("quota"))
+        if stale_quota is not None:
+            result[label] = stale_quota
+    return result
+
+
+def persist_quota_snapshots_by_account(
+    accounts: dict[str, dict[str, Any]],
+    labels_by_id: dict[str, str],
+    quota_by_label: dict[str, dict[str, dict[str, Any]]],
+    now: datetime | None = None,
+) -> None:
+    """Persist every real quota snapshot, including sidecar-derived values."""
+    cache = load_official_quota_cache()
+    snapshot_epoch = (now or datetime.now(LOCAL_TZ)).timestamp()
+    changed = False
+    for account_id, account in accounts.items():
+        label = labels_by_id.get(account_id, "")
+        quota = quota_by_label.get(label)
+        if not label or stale_official_quota_snapshot(quota) is None:
+            continue
+        previous = cache.get(account_id)
+        entry = dict(previous) if isinstance(previous, dict) else {}
+        quota_changed = entry.get("quota") != quota
+        entry.update(
+            {
+                "label": label,
+                "email": str(account.get("email") or ""),
+                "plan_type": str(account.get("plan_type") or ""),
+                "quota": quota,
+            }
+        )
+        if not quota_row_needs_official_refresh(quota) and (
+            quota_changed or not entry.get("last_success_at")
+        ):
+            entry["checked_at"] = snapshot_epoch
+            entry["last_success_at"] = snapshot_epoch
+            entry.pop("refresh_failed", None)
+        if entry != previous:
+            cache[account_id] = entry
+            changed = True
+    if not changed:
+        return
+    try:
+        write_json_atomic(
+            COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
+            {
+                "schema": 2,
+                "accounts": {
+                    account_id: entry
+                    for account_id, entry in cache.items()
+                    if isinstance(entry, dict)
+                },
+            },
+        )
+    except OSError:
+        pass
+
+
 def read_cockpit_sidecar_auth(home: Path, account_id: str) -> dict[str, Any] | None:
     path = (
         home
@@ -3077,7 +3272,21 @@ def fetch_cockpit_official_quota(
         },
     )
     try:
-        with request.urlopen(req, timeout=COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS) as response:
+        proxy_url = str(auth.get("proxy_url") or "").strip()
+        if proxy_url:
+            opener = request.build_opener(
+                request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+            response_context = opener.open(
+                req,
+                timeout=COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS,
+            )
+        else:
+            response_context = request.urlopen(
+                req,
+                timeout=COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS,
+            )
+        with response_context as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
@@ -3099,6 +3308,22 @@ def cockpit_official_quota_by_account(
     cache_changed = False
     for account_id, account in accounts.items():
         cached = cache.get(account_id)
+        label = cockpit_account_label(
+            account_id,
+            str(account.get("email") or ""),
+            str(account.get("api_provider_name") or account.get("name") or ""),
+        )
+        plan_type = str(account.get("plan_type") or "")
+        if isinstance(cached, dict):
+            metadata = {
+                "label": label,
+                "email": str(account.get("email") or ""),
+                "plan_type": plan_type,
+            }
+            for key, value in metadata.items():
+                if value and cached.get(key) != value:
+                    cached[key] = value
+                    cache_changed = True
         try:
             checked_epoch = float(cached.get("checked_at") or 0) if isinstance(cached, dict) else 0.0
         except (TypeError, ValueError):
@@ -3111,7 +3336,7 @@ def cockpit_official_quota_by_account(
             continue
         auth = read_cockpit_sidecar_auth(home, account_id)
         if auth is not None:
-            pending[account_id] = (auth, str(account.get("plan_type") or ""))
+            pending[account_id] = (auth, plan_type)
         else:
             previous_quota = cached.get("quota") if isinstance(cached, dict) else None
             stale_quota = stale_official_quota_snapshot(previous_quota)
@@ -3137,8 +3362,20 @@ def cockpit_official_quota_by_account(
                     if isinstance(previous_entry, dict)
                     else None
                 )
+                account = accounts.get(account_id) or {}
+                label = cockpit_account_label(
+                    account_id,
+                    str(account.get("email") or ""),
+                    str(account.get("api_provider_name") or account.get("name") or ""),
+                )
+                metadata = {
+                    "label": label,
+                    "email": str(account.get("email") or ""),
+                    "plan_type": str(account.get("plan_type") or ""),
+                }
                 if isinstance(quota, dict):
                     cache[account_id] = {
+                        **metadata,
                         "checked_at": now_epoch,
                         "last_success_at": now_epoch,
                         "quota": quota,
@@ -3147,6 +3384,7 @@ def cockpit_official_quota_by_account(
                 else:
                     stale_quota = stale_official_quota_snapshot(previous_quota)
                     cache_entry: dict[str, Any] = {
+                        **metadata,
                         "checked_at": now_epoch,
                         "quota": stale_quota,
                         "refresh_failed": True,
@@ -3164,16 +3402,15 @@ def cockpit_official_quota_by_account(
                 cache_changed = True
 
     if cache_changed:
-        active_ids = set(accounts)
         compact_cache = {
             account_id: entry
             for account_id, entry in cache.items()
-            if account_id in active_ids and isinstance(entry, dict)
+            if isinstance(entry, dict)
         }
         try:
             write_json_atomic(
                 COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
-                {"schema": 1, "accounts": compact_cache},
+                {"schema": 2, "accounts": compact_cache},
             )
         except OSError:
             pass
@@ -3182,23 +3419,24 @@ def cockpit_official_quota_by_account(
 
 def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, Any]]]:
     accounts_dir = home / ".antigravity_cockpit" / "codex_accounts"
-    if not accounts_dir.exists():
-        return {}
-
     result: dict[str, dict[str, dict[str, Any]]] = {}
-    for path in accounts_dir.glob("*.json"):
+    source_accounts_by_id: dict[str, dict[str, Any]] = {}
+    account_paths = accounts_dir.glob("*.json") if accounts_dir.exists() else ()
+    for path in account_paths:
         try:
             account = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
         except Exception:
             continue
         if not isinstance(account, dict):
             continue
+        account_id = str(account.get("id") or path.stem)
+        source_accounts_by_id[account_id] = account
         quota = account.get("quota")
         if not isinstance(quota, dict):
             continue
 
         label = cockpit_account_label(
-            str(account.get("id") or path.stem),
+            account_id,
             str(account.get("email") or ""),
             str(account.get("api_provider_name") or account.get("name") or ""),
         )
@@ -3281,14 +3519,22 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
         for row in (manifest_rows if isinstance(manifest_rows, list) else [])
         if isinstance(row, dict) and str(row.get("id") or "").strip()
     }
+    all_accounts_by_id = dict(source_accounts_by_id)
+    all_accounts_by_id.update(manifest_by_id)
     labels_by_id = {
         account_id: cockpit_account_label(
             account_id,
             str(account.get("email") or ""),
             str(account.get("api_provider_name") or account.get("name") or ""),
         )
-        for account_id, account in manifest_by_id.items()
+        for account_id, account in all_accounts_by_id.items()
     }
+    retained_quota = cached_official_quota_by_label(
+        load_official_quota_cache(),
+        set(all_accounts_by_id),
+    )
+    for label, quota in retained_quota.items():
+        result.setdefault(label, quota)
 
     def reserve_window(
         snapshot: dict[str, Any],
@@ -3433,6 +3679,11 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
         label = labels_by_id.get(account_id)
         if label:
             result[label] = quota
+    persist_quota_snapshots_by_account(
+        all_accounts_by_id,
+        labels_by_id,
+        result,
+    )
     return result
 
 
@@ -3441,7 +3692,7 @@ def quota_window_start(
     now: datetime,
     duration: timedelta,
 ) -> datetime | None:
-    if not window.get("quota_available") or window.get("quota_stale"):
+    if not window.get("quota_available"):
         return None
     reset_at = parse_dt(window.get("resets_at"))
     if reset_at is None or reset_at > now + duration:
@@ -3505,6 +3756,14 @@ def add_cockpit_usage_to_bucket(
     return True
 
 
+COCKPIT_RECORDED_USAGE_SQL = """(
+    COALESCE(total_tokens, 0) > 0
+    OR COALESCE(input_tokens, 0) > 0
+    OR COALESCE(output_tokens, 0) > 0
+    OR COALESCE(cached_tokens, 0) > 0
+)"""
+
+
 def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> dict[str, UsageBucket]:
     db_path = root / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
     if not db_path.exists():
@@ -3517,7 +3776,7 @@ def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> d
     try:
         con = sqlite3.connect(db_path)
         rows = con.execute(
-            """
+            f"""
             SELECT
                 timestamp,
                 account_id,
@@ -3531,6 +3790,7 @@ def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> d
                 estimated_cost_usd
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
+              AND {COCKPIT_RECORDED_USAGE_SQL}
             """,
             (start_ms, end_ms),
         ).fetchall()
@@ -3639,7 +3899,7 @@ def scan_cockpit_codex_quota_windows(
     try:
         con = sqlite3.connect(db_path)
         rows = con.execute(
-            """
+            f"""
             SELECT
                 timestamp,
                 account_id,
@@ -3653,6 +3913,7 @@ def scan_cockpit_codex_quota_windows(
                 estimated_cost_usd
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
+              AND {COCKPIT_RECORDED_USAGE_SQL}
             """,
             (local_epoch_ms(query_start), local_epoch_ms(end)),
         ).fetchall()
@@ -3734,8 +3995,13 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
     end_ms = local_epoch_ms(end)
     try:
         con = sqlite3.connect(db_path)
+        columns = {
+            str(row[1])
+            for row in con.execute("PRAGMA table_info(request_logs)").fetchall()
+        }
+        request_id_sql = "request_id" if "request_id" in columns else "''"
         rows = con.execute(
-            """
+            f"""
             SELECT
                 timestamp,
                 account_id,
@@ -3746,9 +4012,11 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 input_tokens,
                 cached_tokens,
                 output_tokens,
-                event_key
+                event_key,
+                {request_id_sql} AS request_id
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
+              AND {COCKPIT_RECORDED_USAGE_SQL}
             ORDER BY timestamp ASC
             """,
             (start_ms, end_ms),
@@ -3769,9 +4037,20 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
         cached_tokens,
         output_tokens,
         event_key,
+        request_id,
     ) in rows:
         when = ms_to_local_datetime(timestamp)
         if when is None:
+            continue
+        input_token_count = max(0, int(input_tokens or 0))
+        cached_token_count = max(0, int(cached_tokens or 0))
+        output_token_count = max(0, int(output_tokens or 0))
+        reported_total = max(
+            max(0, int(total_tokens or 0)),
+            input_token_count + output_token_count,
+            cached_token_count + output_token_count,
+        )
+        if reported_total <= 0:
             continue
         label = cockpit_account_label(str(account_id or ""), str(email or ""), str(api_key_label or ""))
         if label == "Codex local - Unknown":
@@ -3782,11 +4061,13 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 label=label,
                 model=codex_model_name(str(model or "codex")),
                 kind="request",
-                total_tokens=max(0, int(total_tokens or 0)),
-                input_tokens=max(0, int(input_tokens or 0)),
-                cached_tokens=max(0, int(cached_tokens or 0)),
-                output_tokens=max(0, int(output_tokens or 0)),
+                total_tokens=reported_total,
+                input_tokens=input_token_count,
+                cached_tokens=cached_token_count,
+                output_tokens=output_token_count,
                 event_key=str(event_key or "").strip(),
+                request_id=str(request_id or "").strip(),
+                account_id=normalize_cockpit_auth_id(account_id),
             )
         )
     return markers
@@ -3805,6 +4086,78 @@ def parse_local_log_dt(value: str) -> datetime | None:
         return dt
     except Exception:
         return None
+
+
+def scan_cockpit_codex_affinity_events(
+    root: Path,
+    start: datetime,
+    end: datetime,
+    request_markers: list[AccountMarker] | None = None,
+) -> list[CockpitAffinityEvent]:
+    logs_dir = root / ".antigravity_cockpit" / "logs"
+    if not logs_dir.exists():
+        return []
+    labels = cockpit_affinity_account_label_by_id(root, request_markers)
+    scan_start = start - timedelta(seconds=COCKPIT_AFFINITY_TURN_MATCH_SECONDS)
+    events: list[CockpitAffinityEvent] = []
+    seen: set[tuple[datetime, str, str, str, str]] = set()
+    for path in sorted(logs_dir.glob("codex-api.log*")):
+        dated_suffix = re.search(r"(\d{4}-\d{2}-\d{2})$", path.name)
+        if dated_suffix is not None:
+            try:
+                log_day = datetime.fromisoformat(dated_suffix.group(1)).date()
+            except ValueError:
+                log_day = None
+            if log_day is not None and not (
+                scan_start.date() - timedelta(days=1) <= log_day <= end.date()
+            ):
+                continue
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            continue
+        if modified < scan_start - timedelta(days=1):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = COCKPIT_AFFINITY_LINE_RE.search(line)
+            if match is None:
+                continue
+            when = parse_local_log_dt(match.group("timestamp"))
+            if when is None or when < scan_start or when >= end:
+                continue
+            fields = {
+                item.group("key"): item.group("value").strip().strip('"')
+                for item in LOG_FIELD_RE.finditer(match.group("fields"))
+            }
+            request_id = match.group("request_id").strip().strip('"')
+            account_id = normalize_cockpit_auth_id(fields.get("auth"))
+            if not request_id or not account_id:
+                continue
+            action = " ".join(match.group("action").strip().lower().split())
+            source = str(fields.get("source") or "").strip()
+            session_key = str(fields.get("session") or "").strip()
+            identity = (when, request_id, action, account_id, session_key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            events.append(
+                CockpitAffinityEvent(
+                    when=when,
+                    request_id=request_id,
+                    source=source,
+                    session_key=session_key,
+                    account_id=account_id,
+                    label=labels.get(account_id, ""),
+                    action=action,
+                    confirmed=action in COCKPIT_CONFIRMED_AFFINITY_ACTIONS,
+                )
+            )
+    events.sort(key=lambda item: (item.when, item.request_id, item.action))
+    return events
 
 
 def scan_cockpit_codex_switch_markers(root: Path, start: datetime, end: datetime) -> list[AccountMarker]:
@@ -3834,6 +4187,8 @@ def scan_cockpit_codex_switch_markers(root: Path, start: datetime, end: datetime
                 continue
             account_id = match.group("account_id").strip()
             label = labels.get(account_id) or cockpit_account_label(account_id, "", "")
+            if not usable_cockpit_account_label(label):
+                continue
             markers.append(AccountMarker(when=when, label=label, model=CODEX_DEFAULT_MODEL, kind="switch"))
 
     markers.sort(key=lambda marker: marker.when)
@@ -3866,6 +4221,16 @@ def attribute_codex_events_to_account_markers(
         current_label,
         now,
     )
+    request_markers = [
+        marker
+        for marker in markers
+        if marker.kind == "request" and marker.total_tokens > 0
+    ]
+    if request_markers:
+        attributed, _session_accounts, _unresolved = resolve_api_service_event_accounts(
+            attributed,
+            request_markers,
+        )
     return buckets_from_attributed_events(attributed, cost_multiplier_by_label)
 
 
@@ -4195,7 +4560,6 @@ def latest_request_from_attributed_events(
     if is_api_service_mirror_label(latest_label):
         latest_label = (
             concrete_api_service_account_label(latest_event, account_markers or [])
-            or (session_account_labels or {}).get(latest_event.session_id, "")
             or API_SERVICE_AGGREGATE_LABEL
         )
     return {
@@ -4252,6 +4616,7 @@ def concrete_api_service_account_marker(
     event: UsageEvent,
     markers: list[AccountMarker],
     marker_index: dict[int, list[AccountMarker]] | None = None,
+    used_marker_ids: set[int] | None = None,
 ) -> AccountMarker | None:
     # Cockpit writes request markers when the response finishes, matching the
     # Codex token_count timestamp rather than the task-start attribution edge.
@@ -4265,6 +4630,10 @@ def concrete_api_service_account_marker(
             if marker.kind == "request" and marker.total_tokens == event.total_tokens
         ]
     )
+    if used_marker_ids:
+        exact_candidates = [
+            marker for marker in exact_candidates if id(marker) not in used_marker_ids
+        ]
     nearby = [
         marker
         for marker in exact_candidates
@@ -4282,6 +4651,7 @@ def concrete_api_service_account_marker(
         marker
         for marker in fuzzy_pool
         if marker.kind == "request"
+        and (not used_marker_ids or id(marker) not in used_marker_ids)
         and abs((marker.when - event_time).total_seconds()) <= 30
         and abs(marker.total_tokens - event.total_tokens) <= fuzzy_token_delta
     ]
@@ -4293,8 +4663,6 @@ def concrete_api_service_account_marker(
                 abs((marker.when - event_time).total_seconds()),
             ),
         )
-    if len(exact_candidates) == 1:
-        return exact_candidates[0]
     return None
 
 
@@ -4328,10 +4696,225 @@ def previous_active_session_account_labels(path: Path, day: date) -> dict[str, s
     return result
 
 
+def api_service_event_turn_key(event: UsageEvent) -> str:
+    session_id = (event.session_id or event.request_key or "").strip()
+    if not session_id:
+        return ""
+    turn_started_at = event.account_at
+    if turn_started_at is None and event.request_at is not None and event.request_at != event.when:
+        turn_started_at = event.request_at
+    if turn_started_at is None:
+        return ""
+    return f"{session_id}|{account_marker_epoch(turn_started_at):.6f}"
+
+
+def api_service_event_turn_start(event: UsageEvent) -> datetime | None:
+    turn_started_at = event.account_at
+    if turn_started_at is None and event.request_at is not None and event.request_at != event.when:
+        turn_started_at = event.request_at
+    return turn_started_at
+
+
+def cockpit_affinity_turn_anchors(
+    events: list[UsageEvent],
+    account_markers: list[AccountMarker],
+    affinity_events: list[CockpitAffinityEvent],
+) -> dict[str, AccountMarker]:
+    if not events or not affinity_events:
+        return {}
+
+    turn_starts: dict[str, datetime] = {}
+    for event in events:
+        turn_key = api_service_event_turn_key(event)
+        turn_start = api_service_event_turn_start(event)
+        if turn_key and turn_start is not None:
+            turn_starts[turn_key] = turn_start
+    if not turn_starts:
+        return {}
+
+    ordered_turns = sorted(
+        (account_marker_epoch(turn_start), turn_key, turn_start)
+        for turn_key, turn_start in turn_starts.items()
+    )
+    turn_epochs = [item[0] for item in ordered_turns]
+    affinity_by_request: dict[str, list[CockpitAffinityEvent]] = {}
+    request_turns: dict[str, dict[str, datetime]] = {}
+    turn_request_sources: dict[str, dict[str, set[str]]] = {}
+    match_seconds = COCKPIT_AFFINITY_TURN_MATCH_SECONDS
+    ambiguity_seconds = COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS
+    for affinity in affinity_events:
+        affinity_by_request.setdefault(affinity.request_id, []).append(affinity)
+        center = account_marker_epoch(affinity.when)
+        left = bisect_left(turn_epochs, center - match_seconds)
+        right = bisect_right(turn_epochs, center + match_seconds)
+        candidates_by_turn: dict[str, tuple[float, datetime]] = {}
+        for epoch, turn_key, turn_start in ordered_turns[left:right]:
+            delta = abs(epoch - center)
+            previous = candidates_by_turn.get(turn_key)
+            if previous is None or delta < previous[0]:
+                candidates_by_turn[turn_key] = (delta, turn_start)
+        candidates = sorted(
+            (delta, turn_key, turn_start)
+            for turn_key, (delta, turn_start) in candidates_by_turn.items()
+        )
+        if not candidates:
+            continue
+        if (
+            len(candidates) > 1
+            and candidates[1][0] - candidates[0][0] < ambiguity_seconds
+        ):
+            continue
+        _delta, turn_key, turn_start = candidates[0]
+        request_turns.setdefault(affinity.request_id, {})[turn_key] = turn_start
+        turn_request_sources.setdefault(turn_key, {}).setdefault(
+            affinity.request_id,
+            set(),
+        ).add(affinity.source)
+
+    final_by_request: dict[str, AccountMarker] = {}
+    for marker in account_markers:
+        if marker.kind != "request" or not marker.request_id:
+            continue
+        previous = final_by_request.get(marker.request_id)
+        if previous is None or marker.when > previous.when:
+            final_by_request[marker.request_id] = marker
+
+    candidates_by_turn: dict[str, list[tuple[str, str, str, datetime]]] = {}
+    evidenced_requests_by_turn: dict[str, set[str]] = {}
+    for request_id, matched_turns in request_turns.items():
+        trace = sorted(
+            affinity_by_request.get(request_id, []),
+            key=lambda item: item.when,
+        )
+        if not trace:
+            continue
+        boundaries = sorted(
+            (turn_start, turn_key)
+            for turn_key, turn_start in matched_turns.items()
+        )
+        final_marker = final_by_request.get(request_id)
+        final_account_id = normalize_cockpit_auth_id(
+            final_marker.account_id if final_marker is not None else ""
+        )
+        for position, (turn_start, turn_key) in enumerate(boundaries):
+            segment_start = turn_start - timedelta(seconds=match_seconds)
+            segment_end = (
+                boundaries[position + 1][0] - timedelta(seconds=match_seconds)
+                if position + 1 < len(boundaries)
+                else None
+            )
+            segment = [
+                item
+                for item in trace
+                if item.when >= segment_start
+                and (segment_end is None or item.when < segment_end)
+            ]
+            if not segment:
+                continue
+            segment_account_ids = {
+                normalize_cockpit_auth_id(item.account_id)
+                for item in segment
+                if normalize_cockpit_auth_id(item.account_id)
+            }
+            failure_times = [
+                item.when
+                for item in segment
+                if any(
+                    fragment in item.action
+                    for fragment in COCKPIT_FAILED_AFFINITY_ACTION_FRAGMENTS
+                )
+            ]
+            last_failure_at = max(failure_times) if failure_times else None
+            confirmed_items = [
+                item
+                for item in segment
+                if item.confirmed
+                and usable_cockpit_account_label(item.label)
+                and (last_failure_at is None or item.when > last_failure_at)
+            ]
+            confirmed_labels = {item.label for item in confirmed_items}
+            label = ""
+            evidence_kind = ""
+            evidence_when = turn_start
+            if (
+                final_marker is not None
+                and final_account_id
+                and final_account_id in segment_account_ids
+            ):
+                label = final_marker.label
+                evidence_kind = "final"
+            elif len(confirmed_labels) == 1:
+                label = next(iter(confirmed_labels))
+                evidence_kind = "confirmed"
+                evidence_when = min(item.when for item in confirmed_items)
+            else:
+                stable_native_items = [
+                    item
+                    for item in segment
+                    if item.source.startswith("execution_session_id")
+                    and item.action in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
+                    and usable_cockpit_account_label(item.label)
+                    and (last_failure_at is None or item.when > last_failure_at)
+                ]
+                stable_native_labels = {item.label for item in stable_native_items}
+                stable_native_account_ids = {
+                    normalize_cockpit_auth_id(item.account_id)
+                    for item in stable_native_items
+                    if normalize_cockpit_auth_id(item.account_id)
+                }
+                if (
+                    len(stable_native_account_ids) == 1
+                    and len(stable_native_labels) == 1
+                ):
+                    label = next(iter(stable_native_labels))
+                    evidence_kind = "stable-native"
+                    evidence_when = min(item.when for item in stable_native_items)
+            if not usable_cockpit_account_label(label):
+                continue
+            candidates_by_turn.setdefault(turn_key, []).append(
+                (label, evidence_kind, request_id, evidence_when)
+            )
+            evidenced_requests_by_turn.setdefault(turn_key, set()).add(request_id)
+
+    anchors: dict[str, AccountMarker] = {}
+    for turn_key, candidates in candidates_by_turn.items():
+        sources_by_request = turn_request_sources.get(turn_key, {})
+        native_requests = {
+            request_id
+            for request_id, sources in sources_by_request.items()
+            if any(source.startswith("execution_session_id") for source in sources)
+        }
+        expected_requests = native_requests or set(sources_by_request)
+        evidenced_requests = evidenced_requests_by_turn.get(turn_key, set()) & expected_requests
+        selected_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[2] in expected_requests
+        ]
+        labels = {
+            label
+            for label, _kind, _request_id, _evidence_when in selected_candidates
+        }
+        if (
+            not expected_requests
+            or evidenced_requests != expected_requests
+            or len(labels) != 1
+        ):
+            continue
+        label = next(iter(labels))
+        anchors[turn_key] = AccountMarker(
+            when=min(candidate[3] for candidate in selected_candidates),
+            label=label,
+            kind="affinity",
+        )
+    return anchors
+
+
 def resolve_api_service_event_accounts(
     attributed: dict[str, list[UsageEvent]],
     account_markers: list[AccountMarker],
     known_session_accounts: dict[str, str] | None = None,
+    affinity_events: list[CockpitAffinityEvent] | None = None,
 ) -> tuple[dict[str, list[UsageEvent]], dict[str, str], int]:
     marker_index = account_markers_by_total_tokens(account_markers)
     session_accounts = dict(known_session_accounts or {})
@@ -4345,22 +4928,68 @@ def resolve_api_service_event_accounts(
         ),
         key=lambda item: usage_event_attribution_time(item[1]),
     )
+    records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]] = []
+    cockpit_mode = bool(account_markers or affinity_events)
+    used_marker_ids: set[int] = set()
+    anchors_by_turn: dict[str, list[tuple[datetime, AccountMarker]]] = {}
     for label, event in ordered:
         session_id = event.session_id or event.request_key or codex_event_id(event)
+        turn_key = api_service_event_turn_key(event)
+        matched_marker = concrete_api_service_account_marker(
+            event,
+            account_markers,
+            marker_index,
+            used_marker_ids,
+        )
+        if matched_marker is not None:
+            used_marker_ids.add(id(matched_marker))
+        records.append((label, event, session_id, turn_key, matched_marker))
+        if matched_marker is not None and turn_key:
+            anchors_by_turn.setdefault(turn_key, []).append((event.when, matched_marker))
+
+    for anchors in anchors_by_turn.values():
+        anchors.sort(key=lambda item: item[0])
+
+    affinity_anchors = cockpit_affinity_turn_anchors(
+        [record[1] for record in records],
+        account_markers,
+        affinity_events or [],
+    )
+    for turn_key, marker in affinity_anchors.items():
+        if anchors_by_turn.get(turn_key):
+            continue
+        anchors_by_turn[turn_key] = [(marker.when, marker)]
+
+    latest_by_session: dict[str, tuple[str, bool]] = {}
+    for label, event, session_id, turn_key, matched_marker in records:
         resolved_label = label
-        matched_marker = concrete_api_service_account_marker(event, account_markers, marker_index)
+        confirmed = False
         if matched_marker is not None:
             resolved_label = matched_marker.label
-            session_accounts[session_id] = matched_marker.label
+            confirmed = True
             if matched_marker.model:
                 event.model = matched_marker.model
-        elif is_api_service_mirror_label(label):
-            resolved_label = session_accounts.get(session_id, "") or label
-            if is_api_service_mirror_label(resolved_label):
-                unresolved += 1
+        elif turn_key and anchors_by_turn.get(turn_key):
+            anchors = anchors_by_turn[turn_key]
+            anchor_times = [item[0] for item in anchors]
+            position = bisect_right(anchor_times, event.when) - 1
+            if position < 0:
+                position = 0
+            resolved_label = anchors[position][1].label
+            confirmed = True
+        elif cockpit_mode or is_api_service_mirror_label(label):
+            resolved_label = API_SERVICE_AGGREGATE_LABEL
+            unresolved += 1
         else:
-            session_accounts[session_id] = label
+            confirmed = True
         resolved.setdefault(resolved_label, []).append(event)
+        latest_by_session[session_id] = (resolved_label, confirmed)
+
+    for session_id, (label, confirmed) in latest_by_session.items():
+        if confirmed and label and not is_api_service_mirror_label(label):
+            session_accounts[session_id] = label
+        else:
+            session_accounts.pop(session_id, None)
     return resolved, session_accounts, unresolved
 
 
@@ -4370,6 +4999,7 @@ def build_active_session_rows(
     session_lifecycle: dict[str, SessionLifecycle],
     current_label: str,
     now: datetime,
+    api_service_routed: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int], int]:
     """Build concurrency from task lifecycle, with token activity as a legacy fallback."""
     latest_by_session: dict[str, tuple[str, UsageEvent]] = {}
@@ -4398,11 +5028,16 @@ def build_active_session_rows(
     ) -> None:
         nonlocal unresolved
         resolved_label = label if label and not is_api_service_mirror_label(label) else ""
-        if not resolved_label:
+        if not resolved_label and not api_service_routed:
             resolved_label = labels_by_session.get(session_id, "")
             if is_api_service_mirror_label(resolved_label):
                 resolved_label = ""
-        if not resolved_label and current_label and not is_api_service_mirror_label(current_label):
+        if (
+            not resolved_label
+            and not api_service_routed
+            and current_label
+            and not is_api_service_mirror_label(current_label)
+        ):
             resolved_label = current_label
         if not resolved_label:
             unresolved += 1
@@ -5581,7 +6216,6 @@ def build_codex_window_stats(
             window_end,
         )
         markers_30d = switch_markers_30d + account_markers_30d
-        marker_index_30d = account_markers_by_total_tokens(account_markers_30d)
         attributed_30d = attribute_codex_events_by_account(
             events_30d,
             markers_30d,
@@ -5589,19 +6223,14 @@ def build_codex_window_stats(
             current_label,
             now,
         )
+        attributed_30d, _session_accounts_30d, _unresolved_30d = resolve_api_service_event_accounts(
+            attributed_30d,
+            account_markers_30d,
+        )
         raw_30d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_30d.items():
             for event in account_events:
                 resolved_label = label
-                matched_marker = concrete_api_service_account_marker(
-                    event,
-                    account_markers_30d,
-                    marker_index_30d,
-                )
-                if matched_marker is not None:
-                    resolved_label = matched_marker.label
-                    if matched_marker.model:
-                        event.model = matched_marker.model
                 multiplier = cost_multiplier_by_label.get(resolved_label, 1.0)
                 add_codex_event_to_bucket(
                     raw_30d.setdefault(resolved_label, UsageBucket()),
@@ -5642,13 +6271,16 @@ def build_codex_window_stats(
         aligned_markers = scan_cockpit_codex_switch_markers(home, aligned_scan_start, window_end)
         aligned_account_markers = scan_cockpit_codex_account_markers(home, aligned_scan_start, window_end)
         aligned_markers.extend(aligned_account_markers)
-        aligned_marker_index = account_markers_by_total_tokens(aligned_account_markers)
         attributed_events = attribute_codex_events_by_account(
             aligned_events,
             aligned_markers,
             attribution_ledger,
             current_label,
             now,
+        )
+        attributed_events, _session_accounts_aligned, _unresolved_aligned = resolve_api_service_event_accounts(
+            attributed_events,
+            aligned_account_markers,
         )
         raw_5h = {label: UsageBucket() for label in aligned_starts_5h}
         raw_7d = {label: UsageBucket() for label in aligned_starts_7d}
@@ -5657,15 +6289,6 @@ def build_codex_window_stats(
         for label, account_events in attributed_events.items():
             for event in account_events:
                 resolved_label = label
-                matched_marker = concrete_api_service_account_marker(
-                    event,
-                    aligned_account_markers,
-                    aligned_marker_index,
-                )
-                if matched_marker is not None:
-                    resolved_label = matched_marker.label
-                    if matched_marker.model:
-                        event.model = matched_marker.model
                 event_time = usage_event_attribution_time(event)
                 multiplier = cost_multiplier_by_label.get(resolved_label, 1.0)
                 if event_time >= window_7d_start:
@@ -5802,6 +6425,19 @@ def build_live_catchup_payload(
     markers = scan_cockpit_codex_switch_markers(home, day_start, through)
     markers.extend(load_account_timeline())
     account_markers = scan_cockpit_codex_account_markers(home, day_start, through)
+    affinity_turn_starts = [
+        turn_start
+        for event in codex_events
+        if (turn_start := api_service_event_turn_start(event)) is not None
+        and turn_start >= day_start - timedelta(days=1)
+    ]
+    affinity_scan_start = min([day_start, *affinity_turn_starts])
+    affinity_events = scan_cockpit_codex_affinity_events(
+        home,
+        affinity_scan_start,
+        through,
+        account_markers,
+    )
     markers.extend(account_markers)
     raw_attributed = attribute_codex_events_by_account(
         codex_events,
@@ -5818,6 +6454,7 @@ def build_live_catchup_payload(
         raw_attributed,
         account_markers,
         previous_active_session_account_labels(output_path, since.date()),
+        affinity_events,
     )
     speed_by_account = cockpit_codex_speed_by_label(home)
     cost_multiplier_by_label = {
@@ -5973,6 +6610,19 @@ def main() -> int:
     markers = scan_cockpit_codex_switch_markers(home, start, scan_end)
     markers.extend(load_account_timeline())
     account_markers = scan_cockpit_codex_account_markers(home, start, scan_end)
+    affinity_turn_starts = [
+        turn_start
+        for event in codex_events
+        if (turn_start := api_service_event_turn_start(event)) is not None
+        and turn_start >= start - timedelta(days=1)
+    ]
+    affinity_scan_start = min([start, *affinity_turn_starts])
+    affinity_events = scan_cockpit_codex_affinity_events(
+        home,
+        affinity_scan_start,
+        scan_end,
+        account_markers,
+    )
     markers.extend(account_markers)
     raw_attributed_events = attribute_codex_events_by_account(
         codex_events,
@@ -5981,10 +6631,17 @@ def main() -> int:
         current_label,
         now,
     )
-    api_service_routed = any(
-        is_api_service_mirror_label(label)
-        for label in raw_attributed_events
-    ) or bool(account_markers)
+    api_service_routed = (
+        any(
+            is_api_service_mirror_label(label)
+            for label in raw_attributed_events
+        )
+        or bool(account_markers)
+        # An in-flight Cockpit request may have affinity evidence before its
+        # usage row is written. Treat that as routed so an old session label
+        # cannot leak into the active-session display during the handoff.
+        or bool(affinity_events)
+    )
     raw_attributed_events, cockpit_fallback_events = merge_missing_cockpit_account_events(
         raw_attributed_events,
         account_markers,
@@ -5993,6 +6650,7 @@ def main() -> int:
         raw_attributed_events,
         account_markers,
         previous_active_session_account_labels(out, day),
+        affinity_events,
     )
     attributed = buckets_from_attributed_events(
         attributed_events,
@@ -6065,6 +6723,7 @@ def main() -> int:
         session_lifecycle,
         current_label,
         now,
+        api_service_routed=api_service_routed,
     )
 
     codex_providers = []

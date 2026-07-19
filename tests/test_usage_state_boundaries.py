@@ -54,6 +54,13 @@ class CodexAuthIdentityTests(unittest.TestCase):
             "account-official",
         )
 
+    def test_routing_diagnostic_is_not_treated_as_account_identity(self) -> None:
+        auth = {
+            "api_provider_name": "session-affinity: cache hit before new K12 routing"
+        }
+
+        self.assertEqual(client_usage_export.codex_auth_identity(auth), "")
+
     def test_account_plan_type_reads_nested_auth_claim(self) -> None:
         auth = {
             "tokens": {
@@ -101,6 +108,27 @@ class CodexAuthIdentityTests(unittest.TestCase):
                     {"name": "Codex local - removed@example.com"}
                 ),
                 "\u672a\u77e5",
+            )
+
+    def test_api_service_badge_distinguishes_pending_from_pool_total(self) -> None:
+        with patch.object(monitor, "local_account_type_map", return_value={}):
+            self.assertEqual(
+                monitor.account_type_label(
+                    {
+                        "name": "Codex local - api-service-local",
+                        "is_api_service_aggregate": True,
+                    }
+                ),
+                "\u5f85\u5f52\u56e0",
+            )
+            self.assertEqual(
+                monitor.account_type_label(
+                    {
+                        "name": "api-service-local",
+                        "is_pool_aggregate": True,
+                    }
+                ),
+                "\u8d26\u53f7\u6c60",
             )
 
     def test_account_type_history_survives_cockpit_account_deletion(self) -> None:
@@ -1801,7 +1829,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
             )
             self.assertIs(indexed, brute)
 
-    def test_api_service_latest_request_reuses_confirmed_session_account(self) -> None:
+    def test_api_service_latest_request_does_not_reuse_stale_session_account(self) -> None:
         event = client_usage_export.UsageEvent(
             when=datetime(2026, 7, 11, 21, 0, 0),
             model="gpt-test",
@@ -1817,9 +1845,10 @@ class LatestRequestFallbackTests(unittest.TestCase):
             {"known-session": "Codex local - confirmed@example.com"},
         )
 
-        self.assertEqual(latest["provider"], "Codex local - confirmed@example.com")
+        self.assertEqual(latest["provider"], client_usage_export.API_SERVICE_AGGREGATE_LABEL)
 
     def test_api_service_events_are_moved_to_concrete_accounts_without_duplication(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 7, 59, 30)
         first = client_usage_export.UsageEvent(
             when=datetime(2026, 7, 12, 8, 0, 0),
             model="gpt-test",
@@ -1827,6 +1856,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
             cached_tokens=0,
             output_tokens=100,
             session_id="session-1",
+            account_at=turn_started_at,
         )
         second = client_usage_export.UsageEvent(
             when=datetime(2026, 7, 12, 8, 1, 0),
@@ -1835,6 +1865,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
             cached_tokens=0,
             output_tokens=200,
             session_id="session-1",
+            account_at=turn_started_at,
         )
         marker = client_usage_export.AccountMarker(
             when=first.when,
@@ -1853,6 +1884,606 @@ class LatestRequestFallbackTests(unittest.TestCase):
         self.assertEqual(session_accounts["session-1"], "Codex local - account@example.com")
         self.assertEqual(unresolved, 0)
         self.assertEqual(first.model, "gpt-5.6-sol")
+
+    def test_api_service_final_evidence_overrides_stale_initial_account(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 10, 0),
+            model="gpt-test",
+            input_tokens=1_000,
+            cached_tokens=0,
+            output_tokens=10,
+            session_id="session-1",
+            account_at=datetime(2026, 7, 12, 8, 9, 30),
+        )
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 12, 7, 0, 0),
+            label="Codex local - unrelated-plus@example.com",
+            total_tokens=999,
+        )
+
+        resolved, session_accounts, unresolved = client_usage_export.resolve_api_service_event_accounts(
+            {"Codex local - stale-k12@example.com": [event]},
+            [marker],
+            {"session-1": "Codex local - stale-k12@example.com"},
+        )
+
+        self.assertEqual(
+            resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+            [event],
+        )
+        self.assertNotIn("session-1", session_accounts)
+        self.assertEqual(unresolved, 1)
+
+    def test_api_service_account_is_not_reused_across_unconfirmed_turns(self) -> None:
+        first = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 0, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=datetime(2026, 7, 12, 7, 59, 30),
+        )
+        later_turn = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 10, 0),
+            model="gpt-test",
+            input_tokens=1_800,
+            cached_tokens=0,
+            output_tokens=200,
+            session_id="session-1",
+            account_at=datetime(2026, 7, 12, 8, 9, 30),
+        )
+        marker = client_usage_export.AccountMarker(
+            when=first.when,
+            label="Codex local - k12@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=first.total_tokens,
+        )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {"Codex local - api-service-local": [first, later_turn]},
+                [marker],
+                {"session-1": "Codex local - k12@example.com"},
+            )
+        )
+
+        self.assertEqual(
+            sum(event.total_tokens for event in resolved["Codex local - k12@example.com"]),
+            first.total_tokens,
+        )
+        self.assertEqual(
+            sum(event.total_tokens for event in resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL]),
+            later_turn.total_tokens,
+        )
+        self.assertNotIn("session-1", session_accounts)
+        self.assertEqual(unresolved, 1)
+
+    def test_api_service_turn_uses_new_final_account_after_reselection(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        before_reselection = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 1, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        after_reselection = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 2, 0),
+            model="gpt-test",
+            input_tokens=1_800,
+            cached_tokens=0,
+            output_tokens=200,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=before_reselection.when,
+                label="Codex local - k12@example.com",
+                total_tokens=before_reselection.total_tokens,
+            ),
+            client_usage_export.AccountMarker(
+                when=after_reselection.when,
+                label="Codex local - plus@example.com",
+                total_tokens=after_reselection.total_tokens,
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {
+                    "Codex local - api-service-local": [
+                        before_reselection,
+                        after_reselection,
+                    ]
+                },
+                markers,
+            )
+        )
+
+        self.assertEqual(resolved["Codex local - k12@example.com"], [before_reselection])
+        self.assertEqual(resolved["Codex local - plus@example.com"], [after_reselection])
+        self.assertEqual(session_accounts["session-1"], "Codex local - plus@example.com")
+        self.assertEqual(unresolved, 0)
+
+    def test_api_service_affinity_final_row_overrides_failed_initial_route(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 1, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        final_marker = client_usage_export.AccountMarker(
+            when=event.when,
+            label="Codex local - plus@example.com",
+            total_tokens=999,
+            request_id="request-1",
+            account_id="plus-id",
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=50),
+                request_id="request-1",
+                source="execution_session_id",
+                session_key="execution-1",
+                account_id="k12-id",
+                label="Codex local - k12@example.com",
+                action="cache miss, new binding",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=100),
+                request_id="request-1",
+                source="execution_session_id",
+                session_key="execution-1",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit but auth unavailable, reselected",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [final_marker],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved["Codex local - plus@example.com"], [event])
+        self.assertEqual(session_accounts["session-1"], "Codex local - plus@example.com")
+        self.assertEqual(unresolved, 0)
+
+    def test_api_service_native_affinity_is_scoped_to_each_turn(self) -> None:
+        first_turn = datetime(2026, 7, 12, 8, 0, 0)
+        second_turn = datetime(2026, 7, 12, 8, 10, 0)
+        first = client_usage_export.UsageEvent(
+            when=first_turn + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=first_turn,
+        )
+        second = client_usage_export.UsageEvent(
+            when=second_turn + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=1_800,
+            cached_tokens=0,
+            output_tokens=200,
+            session_id="session-1",
+            account_at=second_turn,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=first_turn + timedelta(milliseconds=50),
+                request_id="request-1",
+                source="execution_session_id",
+                session_key="execution-1",
+                account_id="k12-id",
+                label="Codex local - k12@example.com",
+                action="cache hit before new k12 routing",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=second_turn + timedelta(milliseconds=50),
+                request_id="request-1",
+                source="execution_session_id",
+                session_key="execution-1",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit before new k12 routing",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [first, second]},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved["Codex local - k12@example.com"], [first])
+        self.assertEqual(resolved["Codex local - plus@example.com"], [second])
+        self.assertEqual(session_accounts["session-1"], "Codex local - plus@example.com")
+        self.assertEqual(unresolved, 0)
+
+    def test_api_service_native_reselection_waits_for_stable_new_route(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=50),
+                request_id="request-1",
+                source="execution_session_id",
+                account_id="k12-id",
+                label="Codex local - k12@example.com",
+                action="cache miss, new binding",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(seconds=2),
+                request_id="request-1",
+                source="execution_session_id",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit but auth unavailable, reselected",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(seconds=20),
+                request_id="request-1",
+                source="execution_session_id",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit before new k12 routing",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved["Codex local - plus@example.com"], [event])
+        self.assertEqual(session_accounts["session-1"], "Codex local - plus@example.com")
+        self.assertEqual(unresolved, 0)
+
+    def test_api_service_concurrent_affinity_accounts_remain_unresolved(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=50),
+                request_id="request-1",
+                source="execution_session_id",
+                account_id="account-a",
+                label="Codex local - account-a@example.com",
+                action="cache hit before new k12 routing",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=100),
+                request_id="request-2",
+                source="execution_session_id",
+                account_id="account-b",
+                label="Codex local - account-b@example.com",
+                action="cache hit before new k12 routing",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(
+            resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+            [event],
+        )
+        self.assertNotIn("session-1", session_accounts)
+        self.assertEqual(unresolved, 1)
+
+    def test_api_service_prompt_cache_candidate_is_not_token_evidence(self) -> None:
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        affinity = client_usage_export.CockpitAffinityEvent(
+            when=turn_started_at + timedelta(milliseconds=50),
+            request_id="request-1",
+            source="prompt_cache_key",
+            session_key="shared-content-hash",
+            account_id="k12-id",
+            label="Codex local - k12@example.com",
+            action="cache hit before new k12 routing",
+        )
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [],
+                affinity_events=[affinity],
+            )
+        )
+
+        self.assertEqual(
+            resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+            [event],
+        )
+        self.assertEqual(unresolved, 1)
+
+    def test_cockpit_affinity_log_marks_only_confirmed_actions_as_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cockpit = root / ".antigravity_cockpit"
+            logs = cockpit / "logs"
+            logs.mkdir(parents=True)
+            (cockpit / "codex_accounts.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "id": "codex_plus",
+                                "email": "plus@example.com",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Cockpit can keep writing to the previous day's rotated filename
+            # for a short time after midnight; line timestamps stay authoritative.
+            (logs / "codex-api.log.2026-07-11").write_text(
+                "\n".join(
+                    [
+                        '2026-07-12T08:00:00+08:00 WARN msg="session-affinity: cache miss, new binding | source=execution_session_id session=native-1 auth=codex_plus.json provider=mixed model=gpt-test" request_id=request-1',
+                        '2026-07-12T08:00:01+08:00 WARN msg="k12-session-affinity: binding confirmed | source=execution_session_id session=native-1 auth=codex_plus.json" request_id=request-1',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            events = client_usage_export.scan_cockpit_codex_affinity_events(
+                root,
+                datetime(2026, 7, 12, 7, 59, 0),
+                datetime(2026, 7, 12, 8, 1, 0),
+            )
+
+        self.assertEqual(len(events), 2)
+        self.assertFalse(events[0].confirmed)
+        self.assertTrue(events[1].confirmed)
+        self.assertEqual(events[1].label, "Codex local - plus@example.com")
+        self.assertEqual(events[1].account_id, "codex_plus")
+
+    def test_live_catchup_uses_same_affinity_evidence_as_full_export(self) -> None:
+        day_start = datetime(2026, 7, 12, 0, 0, 0)
+        turn_started_at = datetime(2026, 7, 12, 8, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="session-1",
+            account_at=turn_started_at,
+        )
+        final_marker = client_usage_export.AccountMarker(
+            when=turn_started_at + timedelta(seconds=40),
+            label="Codex local - plus@example.com",
+            model="gpt-test",
+            total_tokens=5_000,
+            request_id="request-1",
+            account_id="plus-id",
+        )
+        affinity = client_usage_export.CockpitAffinityEvent(
+            when=turn_started_at + timedelta(milliseconds=50),
+            request_id="request-1",
+            source="execution_session_id",
+            session_key="execution-1",
+            account_id="plus-id",
+            label="Codex local - plus@example.com",
+            action="cache miss, new binding",
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                client_usage_export,
+                "scan_all_codex_events",
+                return_value=[event],
+            ),
+            patch.object(client_usage_export, "codex_speed_history", return_value=[]),
+            patch.object(client_usage_export, "current_codex_account_label", return_value=""),
+            patch.object(client_usage_export, "load_attribution_ledger", return_value={}),
+            patch.object(
+                client_usage_export,
+                "scan_cockpit_codex_switch_markers",
+                return_value=[],
+            ),
+            patch.object(client_usage_export, "load_account_timeline", return_value=[]),
+            patch.object(
+                client_usage_export,
+                "scan_cockpit_codex_account_markers",
+                return_value=[final_marker],
+            ),
+            patch.object(
+                client_usage_export,
+                "scan_cockpit_codex_affinity_events",
+                return_value=[affinity],
+            ) as affinity_scan,
+            patch.object(
+                client_usage_export,
+                "merge_missing_cockpit_account_events",
+                side_effect=lambda attributed, _markers: (attributed, 0),
+            ),
+            patch.object(
+                client_usage_export,
+                "previous_active_session_account_labels",
+                return_value={},
+            ),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+        ):
+            root = Path(temporary_directory)
+            payload = client_usage_export.build_live_catchup_payload(
+                root,
+                root / ".codex" / "sessions",
+                root / "usage.json",
+                day_start,
+                turn_started_at + timedelta(minutes=2),
+            )
+
+        affinity_scan.assert_called_once_with(
+            root,
+            day_start,
+            turn_started_at + timedelta(minutes=2),
+            [final_marker],
+        )
+        providers = {row["name"]: row for row in payload["providers"]}
+        self.assertEqual(payload["unresolved_events"], 0)
+        self.assertEqual(providers["Codex local - plus@example.com"]["tokens"], 1_000)
+        self.assertNotIn(client_usage_export.API_SERVICE_AGGREGATE_LABEL, providers)
+
+    def test_cockpit_zero_usage_failures_are_not_account_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cockpit = root / ".antigravity_cockpit"
+            cockpit.mkdir()
+            database = cockpit / "codex_local_access_logs.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                CREATE TABLE request_logs (
+                    timestamp INTEGER,
+                    account_id TEXT,
+                    email TEXT,
+                    api_key_label TEXT,
+                    model_id TEXT,
+                    success INTEGER,
+                    total_tokens INTEGER,
+                    input_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    output_tokens INTEGER,
+                    event_key TEXT
+                )
+                """
+            )
+            at = datetime(2026, 7, 12, 8, 0, 0)
+            connection.executemany(
+                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        client_usage_export.local_epoch_ms(at),
+                        "k12-id",
+                        "k12@example.com",
+                        "Default",
+                        "gpt-test",
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "failed",
+                    ),
+                    (
+                        client_usage_export.local_epoch_ms(at + timedelta(seconds=1)),
+                        "plus-id",
+                        "plus@example.com",
+                        "Default",
+                        "gpt-test",
+                        1,
+                        123,
+                        120,
+                        20,
+                        3,
+                        "completed",
+                    ),
+                    (
+                        client_usage_export.local_epoch_ms(at + timedelta(seconds=2)),
+                        "cancelled-id",
+                        "cancelled@example.com",
+                        "Default",
+                        "gpt-test",
+                        0,
+                        321,
+                        300,
+                        20,
+                        1,
+                        "cancelled-with-usage",
+                    ),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            markers = client_usage_export.scan_cockpit_codex_account_markers(
+                root,
+                at - timedelta(seconds=1),
+                at + timedelta(seconds=3),
+            )
+
+        self.assertEqual(
+            [marker.label for marker in markers],
+            [
+                "Codex local - plus@example.com",
+                "Codex local - cancelled@example.com",
+            ],
+        )
+        self.assertEqual(markers[0].total_tokens, 123)
+        self.assertEqual(markers[1].total_tokens, 321)
+
+    def test_unique_token_match_outside_activity_window_is_not_reused(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 12, 8, 10, 0),
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+        )
+        stale_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 12, 8, 0, 0),
+            label="Codex local - stale-k12@example.com",
+            total_tokens=event.total_tokens,
+        )
+
+        self.assertIsNone(
+            client_usage_export.concrete_api_service_account_marker(
+                event,
+                [stale_marker],
+            )
+        )
 
     def test_cockpit_union_adds_only_requests_missing_from_client_logs(self) -> None:
         client_event = client_usage_export.UsageEvent(
@@ -2586,6 +3217,46 @@ class WindowSemanticsTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertNotIn("secret-access-token", cache_path.read_text(encoding="utf-8"))
 
+    def test_official_quota_request_uses_account_proxy(self) -> None:
+        checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {
+                "plan_type": "k12",
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 5 * 60 * 60,
+                        "reset_at": checked_at.timestamp() + 3600,
+                        "used_percent": 20,
+                    }
+                },
+            }
+        ).encode("utf-8")
+        opener = MagicMock()
+        opener.open.return_value = response
+        with (
+            patch.object(client_usage_export.request, "ProxyHandler") as proxy_handler,
+            patch.object(client_usage_export.request, "build_opener", return_value=opener),
+        ):
+            quota = client_usage_export.fetch_cockpit_official_quota(
+                {
+                    "access_token": "secret-access-token",
+                    "account_id": "chatgpt-account-id",
+                    "proxy_url": "http://127.0.0.1:7897",
+                },
+                "k12",
+                checked_at,
+            )
+
+        self.assertIsNotNone(quota)
+        proxy_handler.assert_called_once_with(
+            {
+                "http": "http://127.0.0.1:7897",
+                "https": "http://127.0.0.1:7897",
+            }
+        )
+        opener.open.assert_called_once()
+
     def test_official_quota_failure_retains_last_percent_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -2707,6 +3378,88 @@ class WindowSemanticsTests(unittest.TestCase):
             self.assertEqual(quota["window_7d"]["remaining_percent"], 42.0)
             self.assertTrue(quota["window_7d"]["quota_stale"])
             self.assertTrue(quota["window_5h"]["quota_unlimited"])
+
+    def test_removed_account_keeps_last_quota_by_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "official-quota-cache.json"
+            checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+            removed_id = "codex_removed"
+            active_id = "codex_active"
+            removed_label = "Codex local - removed@example.com"
+            quota = {
+                "window_5h": {"quota_available": False},
+                "window_7d": {
+                    "quota_available": True,
+                    "quota_stale": False,
+                    "remaining_percent": 37.0,
+                    "utilization": 63.0,
+                    "resets_at": (checked_at + timedelta(days=2)).isoformat(),
+                },
+                "window_cycle": {"quota_available": False},
+            }
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "accounts": {
+                            removed_id: {
+                                "label": removed_label,
+                                "checked_at": (checked_at - timedelta(days=1)).timestamp(),
+                                "quota": quota,
+                            },
+                            active_id: {
+                                "checked_at": checked_at.timestamp(),
+                                "quota": quota,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                client_usage_export,
+                "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH",
+                cache_path,
+            ):
+                client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    {active_id: {"email": "active@example.com", "plan_type": "k12"}},
+                    checked_at + timedelta(minutes=1),
+                )
+                retained = client_usage_export.cockpit_codex_quota_by_label(root)
+
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))["accounts"]
+            self.assertIn(removed_id, saved)
+            self.assertEqual(saved[active_id]["label"], "Codex local - active@example.com")
+            self.assertEqual(
+                retained[removed_label]["window_7d"]["remaining_percent"],
+                37.0,
+            )
+            self.assertTrue(retained[removed_label]["window_7d"]["quota_stale"])
+
+    def test_sidecar_quota_is_persisted_before_account_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_path = root / "official-quota-cache.json"
+            label = self.write_quota_account(
+                root,
+                plan_type="k12",
+                hourly_minutes=300,
+                weekly_present=True,
+            )
+            with patch.object(
+                client_usage_export,
+                "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH",
+                cache_path,
+            ):
+                fresh = client_usage_export.cockpit_codex_quota_by_label(root)
+                (root / ".antigravity_cockpit" / "codex_accounts" / "account.json").unlink()
+                retained = client_usage_export.cockpit_codex_quota_by_label(root)
+
+            self.assertEqual(fresh[label]["window_7d"]["remaining_percent"], 70.0)
+            self.assertEqual(retained[label]["window_7d"]["remaining_percent"], 70.0)
+            self.assertTrue(retained[label]["window_7d"]["quota_stale"])
 
     def test_plus_primary_7d_maps_to_official_7d_and_unlimited_5h(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2970,6 +3723,62 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertIsNotNone(start)
         assert start is not None
         self.assertEqual(start, datetime(2026, 6, 29, 9, 22, 53))
+
+    def test_stale_quota_window_keeps_last_known_official_boundary(self) -> None:
+        now = datetime(2026, 7, 17, 10, 45, 0)
+        window = {
+            "quota_available": True,
+            "quota_stale": True,
+            "resets_at": "2026-07-17T13:33:07+08:00",
+            "window_minutes": 5 * 60,
+        }
+
+        start = client_usage_export.quota_window_start(window, now, timedelta(hours=5))
+
+        self.assertEqual(start, datetime(2026, 7, 17, 8, 33, 7))
+
+    def test_stale_quota_window_keeps_request_count(self) -> None:
+        now = datetime(2026, 7, 17, 10, 45, 0)
+        reset_at = datetime(2026, 7, 17, 13, 33, 7)
+        cycle_start = reset_at - timedelta(hours=5)
+        label = "Codex local - account@example.com"
+        quota = {
+            label: {
+                "window_5h": {
+                    "quota_available": True,
+                    "quota_stale": True,
+                    "resets_at": reset_at.replace(
+                        tzinfo=client_usage_export.LOCAL_TZ
+                    ).isoformat(timespec="seconds"),
+                    "window_minutes": 5 * 60,
+                },
+                "window_7d": {"quota_available": False},
+                "window_cycle": {"quota_available": False},
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.write_request_log(
+                root,
+                "account@example.com",
+                [
+                    (cycle_start + timedelta(minutes=1), 200),
+                    (cycle_start + timedelta(minutes=2), 300),
+                ],
+            )
+
+            buckets_5h, _, _, starts_5h, _, _, _ = (
+                client_usage_export.scan_cockpit_codex_quota_windows(
+                    root,
+                    quota,
+                    now,
+                    now + timedelta(seconds=1),
+                )
+            )
+
+        self.assertEqual(starts_5h[label], cycle_start)
+        self.assertEqual(buckets_5h[label].requests, 2)
+        self.assertEqual(buckets_5h[label].total_tokens, 500)
 
     def test_full_unused_7d_quota_keeps_official_countdown(self) -> None:
         now = datetime(2026, 7, 13, 12, 0, 0)
@@ -3519,7 +4328,14 @@ class CodexUsageFileWatcherTests(unittest.TestCase):
             watcher = monitor.CodexUsageFileWatcher(root)
 
             self.assertFalse(watcher.poll())
-            path = root / "2026" / "07" / "14" / "rollout-new.jsonl"
+            today = datetime.now()
+            path = (
+                root
+                / f"{today.year:04d}"
+                / f"{today.month:02d}"
+                / f"{today.day:02d}"
+                / "rollout-new.jsonl"
+            )
             path.parent.mkdir(parents=True)
             path.write_text(
                 '{"type":"event_msg","payload":{"type": "token_count"}}\n',
@@ -4015,6 +4831,72 @@ class LiveActiveSessionScanTests(unittest.TestCase):
 
 
 class ActiveSessionLifecycleTests(unittest.TestCase):
+    def test_active_unconfirmed_cockpit_turn_does_not_fallback_to_old_account(self) -> None:
+        now = datetime(2026, 7, 12, 14, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(seconds=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_started",
+            when=now - timedelta(minutes=1),
+            file_activity_at=now - timedelta(seconds=1),
+        )
+
+        rows, active_by_label, sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                {"session-1": "Codex local - stale-k12@example.com"},
+                {"session-1": lifecycle},
+                "Codex local - stale-k12@example.com",
+                now,
+                api_service_routed=True,
+            )
+        )
+
+        self.assertEqual(rows[0]["provider"], "")
+        self.assertEqual(active_by_label, {})
+        self.assertEqual(sessions_by_label, {})
+        self.assertEqual(unresolved, 1)
+
+    def test_affinity_only_cockpit_evidence_disables_old_session_fallback(self) -> None:
+        now = datetime(2026, 7, 12, 14, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(seconds=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_started",
+            when=now - timedelta(minutes=1),
+            file_activity_at=now - timedelta(seconds=1),
+        )
+
+        rows, active_by_label, sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                {"session-1": "Codex local - stale-k12@example.com"},
+                {"session-1": lifecycle},
+                "Codex local - stale-k12@example.com",
+                now,
+                api_service_routed=True,
+            )
+        )
+
+        self.assertEqual(rows[0]["provider"], "")
+        self.assertEqual(active_by_label, {})
+        self.assertEqual(sessions_by_label, {})
+        self.assertEqual(unresolved, 1)
+
     def test_running_lifecycle_wins_over_old_token_activity(self) -> None:
         now = datetime(2026, 7, 12, 14, 0, 0)
         label = "Codex local - account@example.com"
