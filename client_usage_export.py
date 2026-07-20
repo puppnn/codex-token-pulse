@@ -4503,6 +4503,8 @@ def mark_codex_failure_hours(
     failures: list[CodexFailureEvent],
     day: date,
     as_of: datetime,
+    *,
+    activity_events: list[UsageEvent],
 ) -> None:
     by_hour = {
         max(0, min(23, int(bucket.get("hour") or 0))): bucket
@@ -4518,8 +4520,19 @@ def mark_codex_failure_hours(
     if as_of.date() < day:
         return
     last_observed_hour = as_of.hour if as_of.date() == day else 23
+
+    latest_activity_by_hour: dict[int, datetime] = {}
+    for event in activity_events:
+        if event.when.date() != day or event.when > as_of:
+            continue
+        event_hour = max(0, min(23, event.when.hour))
+        previous_activity = latest_activity_by_hour.get(event_hour)
+        if previous_activity is None or event.when > previous_activity:
+            latest_activity_by_hour[event_hour] = event.when
+
+    failures_by_hour: dict[int, list[CodexFailureEvent]] = {}
     for failure in failures:
-        if failure.when.date() != day:
+        if failure.when.date() != day or failure.when > as_of:
             continue
         candidate_hour = failure.when.hour
         candidate = by_hour.get(candidate_hour)
@@ -4533,12 +4546,20 @@ def mark_codex_failure_hours(
             # Background network polling can fail while Codex is idle. Keep
             # that separate from token activity so an empty hour stays empty.
             continue
+        failures_by_hour.setdefault(candidate_hour, []).append(failure)
+
+    for candidate_hour, hour_failures in failures_by_hour.items():
+        latest_failure = max(hour_failures, key=lambda failure: failure.when)
+        latest_activity = latest_activity_by_hour.get(candidate_hour)
+        if latest_activity is not None and latest_activity > latest_failure.when:
+            continue
+        candidate = by_hour[candidate_hour]
         candidate["failure"] = True
-        candidate["failure_count"] = int(candidate.get("failure_count") or 0) + 1
-        failure_at = failure.when.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
-        if failure_at > str(candidate.get("failure_at") or ""):
-            candidate["failure_at"] = failure_at
-            candidate["failure_kind"] = failure.kind
+        candidate["failure_count"] = len(hour_failures)
+        candidate["failure_at"] = latest_failure.when.replace(tzinfo=LOCAL_TZ).isoformat(
+            timespec="seconds"
+        )
+        candidate["failure_kind"] = latest_failure.kind
 
 
 def latest_at_text(bucket: UsageBucket) -> str:
@@ -6681,13 +6702,22 @@ def main() -> int:
 
     claude_root = home / ".claude" / "projects"
     claude = scan_claude(claude_root, start, scan_end)
+    hourly_codex_events = [
+        event
+        for events in attributed_events.values()
+        for event in events
+    ]
     hourly_today = merge_hourly_buckets(
-        codex_hourly_from_events(
-            [event for events in attributed_events.values() for event in events]
-        ),
+        codex_hourly_from_events(hourly_codex_events),
         scan_claude_hourly(claude_root, start, scan_end),
     )
-    mark_codex_failure_hours(hourly_today, codex_failures, day, now)
+    mark_codex_failure_hours(
+        hourly_today,
+        codex_failures,
+        day,
+        now,
+        activity_events=codex_events,
+    )
     if args.include_30d and cached_30d_valid:
         expected_30d_accounts = {
             name
