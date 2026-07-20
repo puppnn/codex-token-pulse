@@ -1367,7 +1367,7 @@ def usage_sync_label(sync: dict[str, Any] | None) -> str:
     state = str(sync.get("state") or "").lower()
     labels = {
         "partial": "\u4eca\u65e5\u5df2\u66f4\u65b0 / \u5386\u53f2\u8865\u5f55\u672a\u5b8c\u6210",
-        "timeout": "\u8865\u5f55\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
+        "timeout": "\u5237\u65b0\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
         "error": "\u5237\u65b0\u5931\u8d25 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
         "unavailable": "\u65e5\u5fd7\u91c7\u96c6\u4e0d\u53ef\u7528",
         "stale": "\u7b49\u5f85\u4eca\u65e5\u6570\u636e",
