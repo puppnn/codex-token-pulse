@@ -1,5 +1,6 @@
 import base64
 import copy
+from contextlib import ExitStack
 import json
 import os
 import sqlite3
@@ -696,6 +697,12 @@ class UsageSyncLabelTests(unittest.TestCase):
         self.assertTrue(monitor.usage_sync_label({"state": "timeout"}))
         self.assertTrue(monitor.usage_sync_label({"state": "error"}))
         self.assertTrue(monitor.usage_sync_label({"state": "stale"}))
+
+    def test_timeout_label_describes_refresh_not_historical_backfill(self) -> None:
+        self.assertEqual(
+            monitor.usage_sync_label({"state": "timeout"}),
+            "刷新超时 / 显示上次数据",
+        )
 
     def test_current_totals_raise_the_today_trend_without_rewriting_history(self) -> None:
         summary = monitor.summarize_trend_rows([])
@@ -2873,6 +2880,73 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["today"]["tokens"], 1_100)
 
 
+class ExporterRefreshEfficiencyTests(unittest.TestCase):
+    def test_main_reuses_one_codex_scan_for_today_and_account_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            output_path = root / "usage.json"
+            history_path = root / "history.json"
+            ledger_path = root / "ledger.json"
+            now = datetime.now()
+            label = "Codex local - account@example.com"
+            event = client_usage_export.UsageEvent(
+                when=now - timedelta(hours=1),
+                model="gpt-test",
+                input_tokens=100,
+                cached_tokens=20,
+                output_tokens=10,
+                session_id="session-1",
+            )
+            ledger = {client_usage_export.codex_event_id(event): label}
+
+            with ExitStack() as stack:
+                contexts = [
+                    patch("sys.argv", ["client_usage_export.py", "--output", str(output_path)]),
+                    patch.object(client_usage_export.os.path, "expanduser", return_value=str(home)),
+                    patch.object(client_usage_export, "ATTRIBUTION_LEDGER_PATH", ledger_path),
+                    patch.object(client_usage_export, "USAGE_HISTORY_PATH", history_path),
+                    patch.object(client_usage_export, "OFFLINE_HISTORY_BACKFILL_MAX_DAYS", 0),
+                    patch.object(client_usage_export, "record_current_account_snapshot"),
+                    patch.object(client_usage_export, "load_attribution_ledger", return_value=ledger),
+                    patch.object(client_usage_export, "current_codex_account_label", return_value=label),
+                    patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+                    patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value={}),
+                    patch.object(client_usage_export, "scan_cockpit_codex_accounts", return_value={}),
+                    patch.object(
+                        client_usage_export,
+                        "scan_cockpit_codex_quota_windows",
+                        return_value=({}, {}, {}, {}, {}, {}, {}),
+                    ),
+                    patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+                    patch.object(client_usage_export, "scan_cockpit_codex_switch_markers", return_value=[]),
+                    patch.object(client_usage_export, "scan_cockpit_codex_account_markers", return_value=[]),
+                    patch.object(client_usage_export, "load_account_timeline", return_value=[]),
+                    patch.object(client_usage_export, "default_codex_desktop_log_roots", return_value=[]),
+                    patch.object(client_usage_export, "scan_claude", return_value=client_usage_export.UsageBucket()),
+                    patch.object(client_usage_export, "scan_claude_hourly", return_value={}),
+                    patch.object(client_usage_export, "estimate_cost", return_value=0.0),
+                    patch.object(client_usage_export, "save_attribution_ledger"),
+                ]
+                for context in contexts:
+                    stack.enter_context(context)
+                scan_events = stack.enter_context(
+                    patch.object(
+                        client_usage_export,
+                        "scan_all_codex_events",
+                        return_value=[event],
+                    )
+                )
+                exit_code = client_usage_export.main()
+
+            saved = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(saved["today"]["tokens"], 130)
+        self.assertEqual(scan_events.call_count, 1)
+
+
 class WindowSemanticsTests(unittest.TestCase):
     def test_unlimited_5h_window_is_not_counted_as_quota_pressure(self) -> None:
         app = object.__new__(monitor.FloatingMonitorApp)
@@ -3644,6 +3718,45 @@ class WindowSemanticsTests(unittest.TestCase):
         )
 
         self.assertIs(merged[label], complete_direct)
+
+    def test_window_stats_reuse_preloaded_events_without_rescanning_logs(self) -> None:
+        now = datetime(2026, 7, 20, 12, 0, 0)
+        label = "Codex local - account@example.com"
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(hours=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=20,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        ledger = {client_usage_export.codex_event_id(event): label}
+        aligned = ({}, {}, {}, {}, {}, {}, {})
+
+        with (
+            patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value={}),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_accounts", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+            patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[label]),
+            patch.object(
+                client_usage_export,
+                "scan_all_codex_events",
+                side_effect=AssertionError("preloaded events should avoid another log scan"),
+            ),
+        ):
+            result = client_usage_export.build_codex_window_stats(
+                Path("."),
+                Path("."),
+                now,
+                ledger,
+                label,
+                preloaded_events=[event],
+                preloaded_start=now - timedelta(days=7, seconds=10),
+            )
+
+        self.assertEqual(result[label]["window_5h"]["tokens"], 130)
+        self.assertEqual(result[label]["window_7d"]["tokens"], 130)
 
     def test_30d_window_uses_rolling_account_usage(self) -> None:
         now = datetime(2026, 6, 23, 12, 0, 0)
@@ -6194,6 +6307,36 @@ class CodexSessionModelTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_session_scan_streams_jsonl_without_reading_the_whole_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(
+                root,
+                "rollout-streamed.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-12T10:00:00",
+                        "type": "session_meta",
+                        "payload": {"id": "streamed-session"},
+                    },
+                    self.token_count("2026-07-12T10:05:00", 100, 10),
+                ],
+            )
+
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("JSONL sessions must be streamed"),
+            ):
+                events = client_usage_export.scan_codex_events(
+                    root,
+                    datetime(2026, 7, 12, 9, 0),
+                    datetime(2026, 7, 12, 11, 0),
+                )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].total_tokens, 110)
 
     def test_token_event_keeps_task_start_as_attribution_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

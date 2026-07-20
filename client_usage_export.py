@@ -2229,6 +2229,18 @@ def usage_event_account_time(event: UsageEvent) -> datetime:
     return event.account_at or usage_event_attribution_time(event)
 
 
+def events_in_time_range(
+    events: list[UsageEvent],
+    start: datetime,
+    end: datetime,
+) -> list[UsageEvent]:
+    return [
+        event
+        for event in events
+        if start <= usage_event_attribution_time(event) < end
+    ]
+
+
 def usage_event_info_score(event: UsageEvent) -> int:
     score = 0
     if event.route:
@@ -6137,6 +6149,9 @@ def build_codex_window_stats(
     attribution_ledger: dict[str, str],
     current_label: str,
     include_30d: bool = False,
+    *,
+    preloaded_events: list[UsageEvent] | None = None,
+    preloaded_start: datetime | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     window_end = now + timedelta(seconds=1)
     window_5h_start = now - timedelta(hours=5)
@@ -6149,6 +6164,12 @@ def build_codex_window_stats(
         label: float(meta.get("cost_multiplier") or 1.0)
         for label, meta in speed_by_account.items()
     }
+
+    def events_for_window(start: datetime) -> list[UsageEvent]:
+        if preloaded_events is not None and preloaded_start is not None and preloaded_start <= start:
+            return events_in_time_range(preloaded_events, start, window_end)
+        return scan_all_codex_events(home, sessions_root, start, window_end)
+
     direct_7d = scan_cockpit_codex_accounts(home, window_7d_start, window_end)
     direct_30d = (
         scan_cockpit_codex_accounts(home, window_30d_start, window_end)
@@ -6168,7 +6189,7 @@ def build_codex_window_stats(
         buckets_30d = direct_30d
     else:
         speed_markers = codex_speed_history(home, window_7d_start, window_end)
-        events_7d = scan_all_codex_events(home, sessions_root, window_7d_start, window_end)
+        events_7d = events_for_window(window_7d_start)
         apply_codex_speed_fallback(events_7d, speed_markers)
         markers_7d = scan_cockpit_codex_switch_markers(home, window_7d_start, window_end)
         markers_7d.extend(scan_cockpit_codex_account_markers(home, window_7d_start, window_end))
@@ -6181,7 +6202,7 @@ def build_codex_window_stats(
             now,
         )
 
-        events_5h = scan_all_codex_events(home, sessions_root, window_5h_start, window_end)
+        events_5h = events_for_window(window_5h_start)
         apply_codex_speed_fallback(events_5h, speed_markers)
         markers_5h = scan_cockpit_codex_switch_markers(home, window_5h_start, window_end)
         markers_5h.extend(scan_cockpit_codex_account_markers(home, window_5h_start, window_end))
@@ -6195,7 +6216,7 @@ def build_codex_window_stats(
         )
         if include_30d:
             speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
-            events_30d = scan_all_codex_events(home, sessions_root, window_30d_start, window_end)
+            events_30d = events_for_window(window_30d_start)
             apply_codex_speed_fallback(events_30d, speed_markers_30d)
             markers_30d = scan_cockpit_codex_switch_markers(home, window_30d_start, window_end)
             markers_30d.extend(
@@ -6211,7 +6232,7 @@ def build_codex_window_stats(
             )
     if include_30d and (direct_total.total_tokens > 0 or direct_total.requests > 0):
         speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
-        events_30d = scan_all_codex_events(home, sessions_root, window_30d_start, window_end)
+        events_30d = events_for_window(window_30d_start)
         apply_codex_speed_fallback(events_30d, speed_markers_30d)
         switch_markers_30d = scan_cockpit_codex_switch_markers(
             home,
@@ -6273,7 +6294,7 @@ def build_codex_window_stats(
         aligned_scan_start = min(scan_starts) - timedelta(
             seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS)
         )
-        aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
+        aligned_events = events_for_window(aligned_scan_start)
         speed_markers = codex_speed_history(home, aligned_scan_start, window_end)
         apply_codex_speed_fallback(aligned_events, speed_markers)
         aligned_markers = scan_cockpit_codex_switch_markers(home, aligned_scan_start, window_end)
@@ -6595,14 +6616,28 @@ def main() -> int:
     }
     session_lifecycle: dict[str, SessionLifecycle] = {}
     codex_failures: list[CodexFailureEvent] = []
-    codex_events = scan_all_codex_events(
+    preload_days = 30 if refresh_30d else max(7, LATEST_REQUEST_LOOKBACK_DAYS)
+    preload_start = (
+        min(
+            start,
+            now
+            - timedelta(
+                days=preload_days,
+                seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS),
+            ),
+        )
+        if day == now.date()
+        else start
+    )
+    preloaded_codex_events = scan_all_codex_events(
         home,
         codex_sessions_root,
-        start,
+        preload_start,
         scan_end,
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
+    codex_events = events_in_time_range(preloaded_codex_events, start, scan_end)
     # A manual auth switch can happen during a long session scan. Re-read the
     # identity here and retain the auth file's mtime as the actual switch edge.
     snapshot_now = datetime.now()
@@ -6706,6 +6741,8 @@ def main() -> int:
             attribution_ledger,
             current_label,
             include_30d=refresh_30d,
+            preloaded_events=preloaded_codex_events,
+            preloaded_start=preload_start,
         )
     window_only_labels = window_only_provider_labels(
         window_stats_by_account,
@@ -6787,7 +6824,11 @@ def main() -> int:
     recent_latest_request: dict[str, Any] = {}
     if not latest_at and day == now.date() and LATEST_REQUEST_LOOKBACK_DAYS > 0:
         lookback_start = now - timedelta(days=LATEST_REQUEST_LOOKBACK_DAYS)
-        lookback_events = scan_all_codex_events(home, codex_sessions_root, lookback_start, scan_end)
+        lookback_events = events_in_time_range(
+            preloaded_codex_events,
+            lookback_start,
+            scan_end,
+        )
         if lookback_events:
             lookback_speed_markers = codex_speed_history(home, lookback_start, scan_end)
             apply_codex_speed_fallback(lookback_events, lookback_speed_markers)
