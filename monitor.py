@@ -5425,6 +5425,111 @@ class FloatingMonitorApp:
             result[key] = value
         return result
 
+    def _live_hourly_snapshot(self, state: MonitorState | None = None) -> dict[str, dict[str, Any]]:
+        state = state or self.state
+        snapshot = {
+            str(hour): {"requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        }
+        client_usage = state.client_usage if state and isinstance(state.client_usage, dict) else {}
+        dashboard = client_usage.get("dashboard") if isinstance(client_usage, dict) else {}
+        rows = dashboard.get("hourly_today") if isinstance(dashboard, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                hour = max(0, min(23, int(row.get("hour") or 0)))
+                snapshot[str(hour)] = {
+                    "requests": max(0, int(row.get("requests") or 0)),
+                    "tokens": max(0, int(row.get("tokens") or 0)),
+                    "cost": max(0.0, float(row.get("cost") or 0.0)),
+                }
+            except (TypeError, ValueError):
+                continue
+        return snapshot
+
+    @staticmethod
+    def _live_event_hour(value: Any) -> int | None:
+        if isinstance(value, datetime):
+            parsed = value
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=CN_TZ)
+        else:
+            parsed = _parse_time(str(value or ""))
+        if parsed is None:
+            return None
+        return parsed.astimezone(CN_TZ).hour
+
+    def _ensure_live_hourly_overlay(self, overlay: dict[str, Any]) -> None:
+        if not isinstance(overlay.get("base_hourly"), dict):
+            overlay["base_hourly"] = self._live_hourly_snapshot()
+        hourly = overlay.get("hourly")
+        if isinstance(hourly, dict):
+            return
+        hourly = {}
+        legacy_tokens = max(0, int(overlay.get("tokens") or 0))
+        legacy_requests = max(0, int(overlay.get("requests") or 0))
+        legacy_cost = max(0.0, float(overlay.get("cost") or 0.0))
+        legacy_hour = self._live_event_hour(overlay.get("latest_when"))
+        if legacy_hour is not None and (legacy_tokens or legacy_requests or legacy_cost):
+            hourly[str(legacy_hour)] = {
+                "requests": legacy_requests,
+                "tokens": legacy_tokens,
+                "cost": legacy_cost,
+            }
+        overlay["hourly"] = hourly
+
+    def _add_live_hourly_delta(self, overlay: dict[str, Any], event: dict[str, Any]) -> None:
+        self._ensure_live_hourly_overlay(overlay)
+        hour = self._live_event_hour(event.get("when"))
+        if hour is None:
+            return
+        hourly = overlay["hourly"]
+        bucket = hourly.setdefault(
+            str(hour),
+            {"requests": 0, "tokens": 0, "cost": 0.0},
+        )
+        bucket["requests"] = int(bucket.get("requests") or 0) + 1
+        bucket["tokens"] = int(bucket.get("tokens") or 0) + max(
+            0,
+            int(event.get("total_tokens") or 0),
+        )
+        bucket["cost"] = float(bucket.get("cost") or 0.0) + max(
+            0.0,
+            float(event.get("cost") or 0.0),
+        )
+
+    def _merge_live_hourly_overlay(self, hourly: list[dict[str, Any]]) -> None:
+        overlay = self._live_usage_overlay
+        if not isinstance(overlay, dict):
+            return
+        base = overlay.get("base_hourly")
+        delta = overlay.get("hourly")
+        if not isinstance(base, dict) or not isinstance(delta, dict):
+            return
+        by_hour: dict[int, dict[str, Any]] = {}
+        for index, row in enumerate(hourly):
+            if not isinstance(row, dict):
+                continue
+            try:
+                hour_value = row.get("hour")
+                hour = int(hour_value if hour_value is not None else index)
+            except (TypeError, ValueError):
+                continue
+            by_hour[max(0, min(23, hour))] = row
+        for hour in range(24):
+            base_row = base.get(str(hour)) if isinstance(base.get(str(hour)), dict) else {}
+            delta_row = delta.get(str(hour)) if isinstance(delta.get(str(hour)), dict) else {}
+            target_tokens = int(base_row.get("tokens") or 0) + int(delta_row.get("tokens") or 0)
+            target_requests = int(base_row.get("requests") or 0) + int(delta_row.get("requests") or 0)
+            target_cost = float(base_row.get("cost") or 0.0) + float(delta_row.get("cost") or 0.0)
+            row = by_hour.get(hour)
+            if row is None:
+                continue
+            row["tokens"] = max(int(row.get("tokens") or 0), target_tokens)
+            row["requests"] = max(int(row.get("requests") or 0), target_requests)
+            row["cost"] = max(float(row.get("cost") or 0.0), target_cost)
+
     def _usage_range_summary(self, range_key: str) -> dict[str, Any]:
         if range_key == "24h":
             hourly: list[dict[str, Any]] = []
@@ -5433,7 +5538,7 @@ class FloatingMonitorApp:
                 if isinstance(dashboard, dict):
                     raw_hourly = dashboard.get("hourly_today")
                     if isinstance(raw_hourly, list):
-                        hourly = [row for row in raw_hourly if isinstance(row, dict)]
+                        hourly = [dict(row) for row in raw_hourly if isinstance(row, dict)]
             if not hourly:
                 hourly = [
                     {
@@ -5444,6 +5549,7 @@ class FloatingMonitorApp:
                     }
                     for hour in range(24)
                 ]
+            self._merge_live_hourly_overlay(hourly)
             mix = self._token_mix()
             authoritative_tokens = 0
             if self.state and isinstance(self.state.client_usage, dict):
@@ -7854,8 +7960,9 @@ class FloatingMonitorApp:
                 seen_ids = {}
                 self._live_usage_seen_ids = seen_ids
             payload_event_ids: set[str] = set()
-            rows = payload.get("events")
-            for row in rows if isinstance(rows, list) else []:
+            raw_rows = payload.get("events")
+            rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+            for row in rows:
                 if isinstance(row, dict) and row.get("event_id"):
                     event_id = str(row["event_id"])
                     payload_event_ids.add(event_id)
@@ -7882,12 +7989,14 @@ class FloatingMonitorApp:
             latest_model = str(summary.get("latest_model") or "")
             records = getattr(self, "_live_usage_event_records", {})
             tail_tokens = 0
+            tail_events: list[dict[str, Any]] = []
             for event_id, event in records.items() if isinstance(records, dict) else []:
                 if event_id in payload_event_ids:
                     continue
                 when = event.get("when")
                 if not isinstance(when, datetime) or when < through:
                     continue
+                tail_events.append(event)
                 raw_input = max(0, int(event.get("input_tokens") or 0))
                 cached = min(raw_input, max(0, int(event.get("cached_tokens") or 0)))
                 output = max(0, int(event.get("output_tokens") or 0))
@@ -7947,10 +8056,16 @@ class FloatingMonitorApp:
                 "output_tokens": 0,
                 "latest_when": latest_when or through,
                 "providers": {},
+                "base_hourly": self._live_hourly_snapshot(),
+                "hourly": {},
                 "catchup_summary_tokens": int(summary.get("tokens") or 0),
                 "catchup_tail_tokens": tail_tokens,
                 "catchup_through": through,
             }
+            for event in rows:
+                self._add_live_hourly_delta(overlay, event)
+            for event in tail_events:
+                self._add_live_hourly_delta(overlay, event)
             raw_providers = client_usage.get("providers") if isinstance(client_usage.get("providers"), list) else []
             top_accounts = self.state.top_accounts if isinstance(self.state.top_accounts, list) else []
             for provider_name, desired in provider_targets.items():
@@ -8325,8 +8440,11 @@ class FloatingMonitorApp:
                 "cached_input_tokens": 0,
                 "output_tokens": 0,
                 "latest_when": recent[0]["when"],
+                "base_hourly": self._live_hourly_snapshot(),
+                "hourly": {},
             }
             self._live_usage_overlay = overlay
+        self._ensure_live_hourly_overlay(overlay)
         accepted_tokens = 0
         accepted_cost = 0.0
         client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
@@ -8356,6 +8474,7 @@ class FloatingMonitorApp:
             overlay["cached_input_tokens"] += cached_input
             overlay["output_tokens"] += output
             overlay["latest_when"] = max(overlay["latest_when"], event["when"])
+            self._add_live_hourly_delta(overlay, event)
             if animate:
                 if not hasattr(self, "_token_flow_samples"):
                     self._token_flow_samples = []
@@ -8438,6 +8557,7 @@ class FloatingMonitorApp:
         overlay = self._live_usage_overlay
         if not isinstance(overlay, dict):
             return
+        self._ensure_live_hourly_overlay(overlay)
         state.today_tokens = max(
             int(state.today_tokens or 0),
             int(overlay["base_today_tokens"]) + int(overlay["tokens"]),

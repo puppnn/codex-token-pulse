@@ -5176,6 +5176,20 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertEqual(app.state.today_requests, 3)
         self.assertEqual(app.state.client_usage, original_client_usage)
 
+    def test_live_event_updates_its_hourly_bucket_immediately(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = None
+        event = self.event()
+
+        self.assertTrue(app._record_live_usage_events([event]))
+
+        summary = app._usage_range_summary("24h")
+        hour = event["when"].astimezone(monitor.CN_TZ).hour
+        bucket = next(row for row in summary["series"] if row["hour"] == hour)
+        self.assertEqual(bucket["tokens"], 150)
+        self.assertEqual(bucket["requests"], 3)
+
     def test_runtime_spike_waits_for_verification_before_updating_total(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
@@ -5414,6 +5428,11 @@ class LiveUsageOverlayTests(unittest.TestCase):
             self.assertEqual(restarted.state.today_tokens, 150)
             self.assertEqual(restarted.state.today_requests, 3)
             self.assertAlmostEqual(restarted.state.today_account_cost, 1.25)
+            summary = restarted._usage_range_summary("24h")
+            hour = event["when"].astimezone(monitor.CN_TZ).hour
+            bucket = next(row for row in summary["series"] if row["hour"] == hour)
+            self.assertEqual(bucket["tokens"], 150)
+            self.assertEqual(bucket["requests"], 3)
 
     def test_legacy_live_checkpoint_is_discarded_after_fork_filter_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5528,6 +5547,60 @@ class LiveUsageOverlayTests(unittest.TestCase):
             self.assertAlmostEqual(app.state.today_account_cost, 2.5)
             self.assertFalse(app._live_usage_verification_pending)
             self.assertFalse(app._live_catchup_lock.locked())
+
+    def test_catchup_event_updates_its_hourly_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state()
+            app._live_usage_overlay = None
+            app._live_usage_seen_ids = {}
+            app._live_usage_event_records = {}
+            app._live_usage_verification_pending = False
+            app._live_usage_verification_latest_when = None
+            app._live_usage_verification_pending_tokens = 0
+            app._live_usage_rate_samples = []
+            app._last_live_checkpoint_write_at = float("-inf")
+            app._live_catchup_lock = threading.Lock()
+            app._live_catchup_lock.acquire()
+            app._live_initial_recheck_scheduled = True
+            app.closed = False
+            app._draw = lambda: None
+            when = datetime.now(timezone.utc)
+            payload = {
+                "through": (when + timedelta(seconds=1)).isoformat(),
+                "events": [
+                    {
+                        "event_id": "catchup-hourly-event",
+                        "when": when.isoformat(),
+                        "total_tokens": 50,
+                        "input_tokens": 40,
+                        "cached_tokens": 20,
+                        "output_tokens": 10,
+                        "cost": 0.5,
+                    }
+                ],
+                "summary": {
+                    "tokens": 150,
+                    "requests": 3,
+                    "cost": 0.5,
+                    "input_tokens": 100,
+                    "cached_input_tokens": 50,
+                    "output_tokens": 20,
+                    "latest_at": when.isoformat(),
+                    "latest_model": "gpt-test",
+                },
+                "providers": [],
+            }
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                app._apply_live_usage_catchup(payload)
+
+            summary = app._usage_range_summary("24h")
+            hour = when.astimezone(monitor.CN_TZ).hour
+            bucket = next(row for row in summary["series"] if row["hour"] == hour)
+            self.assertEqual(bucket["tokens"], 150)
+            self.assertEqual(bucket["requests"], 3)
 
     def test_live_event_updates_recent_request_from_matching_session(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -6612,6 +6685,31 @@ class CodexSessionModelTests(unittest.TestCase):
         )
         self.assertTrue(hourly[3]["failure"])
         self.assertFalse(hourly[4].get("failure"))
+
+    def test_idle_hour_network_failure_does_not_mark_token_activity(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 4, 0, 14),
+                session_id="codex-desktop",
+                kind="desktop_network",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 5, 0),
+        )
+
+        self.assertFalse(hourly[4].get("failure"))
+        self.assertNotIn("failure_count", hourly[4])
+        self.assertNotIn("failure_at", hourly[4])
+        self.assertNotIn("failure_kind", hourly[4])
 
     def test_repeated_desktop_network_failures_mark_the_failure_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
