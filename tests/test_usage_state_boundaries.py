@@ -6195,6 +6195,16 @@ class CodexSessionModelTests(unittest.TestCase):
             },
         }
 
+    def usage_event(self, when: datetime, session_id: str = "recovery-session") -> client_usage_export.UsageEvent:
+        return client_usage_export.UsageEvent(
+            when=when,
+            model="gpt-test",
+            input_tokens=1,
+            cached_tokens=0,
+            output_tokens=0,
+            session_id=session_id,
+        )
+
     def test_token_event_keeps_task_start_as_attribution_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -6648,13 +6658,14 @@ class CodexSessionModelTests(unittest.TestCase):
             failures,
             date(2026, 7, 12),
             datetime(2026, 7, 12, 4, 20),
+            activity_events=[],
         )
 
         self.assertTrue(hourly[3]["failure"])
         self.assertEqual(hourly[3]["failure_count"], 1)
         self.assertFalse(any(row.get("failure") for row in hourly[4:]))
 
-    def test_error_marker_is_visible_immediately_and_survives_later_activity(self) -> None:
+    def test_error_marker_clears_when_codex_activity_resumes_in_same_hour(self) -> None:
         hourly = [
             {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
             for hour in range(24)
@@ -6673,16 +6684,40 @@ class CodexSessionModelTests(unittest.TestCase):
             failures,
             date(2026, 7, 12),
             datetime(2026, 7, 12, 3, 59),
+            activity_events=[],
         )
         self.assertTrue(hourly[3]["failure"])
 
-        hourly[4]["tokens"] = 50
         client_usage_export.mark_codex_failure_hours(
             hourly,
             failures,
             date(2026, 7, 12),
-            datetime(2026, 7, 12, 5, 30),
+            datetime(2026, 7, 12, 3, 59),
+            activity_events=[self.usage_event(datetime(2026, 7, 12, 3, 58))],
         )
+        self.assertFalse(hourly[3].get("failure"))
+
+    def test_error_marker_survives_activity_in_a_later_hour(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="failed-turn",
+            )
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 4, 30),
+            activity_events=[self.usage_event(datetime(2026, 7, 12, 4, 5))],
+        )
+
         self.assertTrue(hourly[3]["failure"])
         self.assertFalse(hourly[4].get("failure"))
 
@@ -6704,12 +6739,43 @@ class CodexSessionModelTests(unittest.TestCase):
             failures,
             date(2026, 7, 12),
             datetime(2026, 7, 12, 5, 0),
+            activity_events=[],
         )
 
         self.assertFalse(hourly[4].get("failure"))
         self.assertNotIn("failure_count", hourly[4])
         self.assertNotIn("failure_at", hourly[4])
         self.assertNotIn("failure_kind", hourly[4])
+
+    def test_activity_before_the_latest_failure_does_not_clear_the_hour(self) -> None:
+        hourly = [
+            {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
+            for hour in range(24)
+        ]
+        failures = [
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 20),
+                session_id="failure-session",
+                turn_id="first-failed-turn",
+            ),
+            client_usage_export.CodexFailureEvent(
+                when=datetime(2026, 7, 12, 3, 55),
+                session_id="failure-session",
+                turn_id="latest-failed-turn",
+            ),
+        ]
+
+        client_usage_export.mark_codex_failure_hours(
+            hourly,
+            failures,
+            date(2026, 7, 12),
+            datetime(2026, 7, 12, 3, 59),
+            activity_events=[self.usage_event(datetime(2026, 7, 12, 3, 30))],
+        )
+
+        self.assertTrue(hourly[3]["failure"])
+        self.assertEqual(hourly[3]["failure_count"], 2)
+        self.assertEqual(hourly[3]["failure_at"], "2026-07-12T03:55:00+08:00")
 
     def test_repeated_desktop_network_failures_mark_the_failure_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6748,6 +6814,7 @@ class CodexSessionModelTests(unittest.TestCase):
             failures,
             date(2026, 7, 12),
             datetime(2026, 7, 12, 5, 0),
+            activity_events=[],
         )
         self.assertTrue(hourly[3]["failure"])
         self.assertEqual(hourly[3]["failure_kind"], "desktop_network")
