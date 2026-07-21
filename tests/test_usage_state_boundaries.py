@@ -940,7 +940,7 @@ class AccountUsageSortTests(unittest.TestCase):
         self.assertEqual(ordered_5h[0]["name"], "current-light")
         self.assertEqual(ordered_7d[0]["name"], "current-light")
 
-    def test_today_and_30d_sort_by_token_usage(self) -> None:
+    def test_today_30d_and_cycle_sort_by_token_usage(self) -> None:
         rows = [
             {
                 "name": "recent-light",
@@ -958,9 +958,11 @@ class AccountUsageSortTests(unittest.TestCase):
 
         ordered_today = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "today"))
         ordered_30d = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "30d"))
+        ordered_cycle = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "cycle"))
 
         self.assertEqual(ordered_today[0]["name"], "old-heavy")
         self.assertEqual(ordered_30d[0]["name"], "old-heavy")
+        self.assertEqual(ordered_cycle[0]["name"], "old-heavy")
 
     def test_window_only_accounts_are_hidden_only_from_today(self) -> None:
         row = {
@@ -971,6 +973,33 @@ class AccountUsageSortTests(unittest.TestCase):
         self.assertFalse(monitor.account_row_available_for_range(row, "today"))
         self.assertTrue(monitor.account_row_available_for_range(row, "5h"))
         self.assertTrue(monitor.account_row_available_for_range(row, "7d"))
+        self.assertTrue(monitor.account_row_available_for_range(row, "cycle"))
+
+    def test_cycle_quota_tab_requires_a_real_cycle_account(self) -> None:
+        self.assertFalse(monitor.account_has_cycle_quota_window({"window_cycle": {}}))
+        self.assertFalse(
+            monitor.account_has_cycle_quota_window(
+                {"window_cycle": {"window_minutes": 7 * 24 * 60}}
+            )
+        )
+        self.assertTrue(
+            monitor.account_has_cycle_quota_window(
+                {"window_cycle": {"quota_available": True}}
+            )
+        )
+        self.assertTrue(
+            monitor.account_has_cycle_quota_window(
+                {"window_cycle": {"quota_available": False, "window_days": 30.4}}
+            )
+        )
+        self.assertFalse(
+            monitor.account_has_cycle_quota_window(
+                {
+                    "is_api_service_aggregate": True,
+                    "window_cycle": {"quota_available": True, "window_days": 30.4},
+                }
+            )
+        )
 
     def test_unattributed_gap_is_not_a_ranked_account(self) -> None:
         row = {"name": "Pending attribution", "is_unattributed_gap": True}

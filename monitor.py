@@ -1419,6 +1419,25 @@ def account_row_available_for_range(row: dict[str, Any], account_range: str) -> 
     return not (account_range == "today" and row.get("window_only"))
 
 
+def account_has_cycle_quota_window(row: dict[str, Any]) -> bool:
+    if row.get("is_unattributed_gap") or row.get("is_pool_aggregate") or row.get("is_api_service_aggregate"):
+        return False
+    window = row.get("window_cycle")
+    if not isinstance(window, dict) or not window:
+        return False
+    if bool(window.get("quota_available")):
+        return True
+    try:
+        if float(window.get("window_minutes") or 0) > 7 * 24 * 60:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(window.get("window_days") or 0) > 7
+    except (TypeError, ValueError):
+        return False
+
+
 def account_display_key(value: Any) -> str:
     name = str(value or "").strip().lower()
     for prefix in ("codex local - ", "local - "):
@@ -4802,7 +4821,7 @@ class FloatingMonitorApp:
         return y + 24
 
     def _account_rank_row_height(self) -> int:
-        if self._account_range in {"5h", "7d"}:
+        if self._account_range in {"5h", "7d", "cycle"}:
             return 51 if self.HEIGHT < 653 else 64
         return 39
 
@@ -7039,22 +7058,30 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
+        all_account_rows = self._filter_account_display_rows(
+            list(self.state.top_accounts or []) if self.state else []
+        )
+        has_cycle_account = any(account_has_cycle_quota_window(account) for account in all_account_rows)
+        if self._account_range == "cycle" and not has_cycle_account:
+            self._account_range = "today"
+            self._scroll_offsets["accounts"] = 0
         raw_top = [
             account
-            for account in (list(self.state.top_accounts or []) if self.state else [])
+            for account in all_account_rows
             if account_row_available_for_range(account, self._account_range)
         ]
-        raw_top = self._filter_account_display_rows(raw_top)
         range_key = {
             "5h": "window_5h",
             "7d": "window_7d",
             "30d": "window_30d",
+            "cycle": "window_cycle",
         }.get(self._account_range)
         range_label = {
             "today": "\u4eca\u65e5",
             "5h": "5h \u989d\u5ea6\u7a97\u53e3",
             "7d": "7d \u989d\u5ea6\u7a97\u53e3",
             "30d": "\u8fd1 30 \u5929",
+            "cycle": "\u5f53\u524d\u5468\u671f",
         }.get(self._account_range, "\u4eca\u65e5")
         if self._account_range == "30d" and not self._needs_server_account_30d():
             top = self._filter_account_display_rows(self._history_account_rows("30d"))
@@ -7062,7 +7089,7 @@ class FloatingMonitorApp:
         elif range_key:
             top = []
             for account in raw_top:
-                if self._account_range in {"5h", "7d"} and account.get("is_pool_aggregate"):
+                if self._account_range in {"5h", "7d", "cycle"} and account.get("is_pool_aggregate"):
                     continue
                 window = account.get(range_key)
                 if not isinstance(window, dict) or not window:
@@ -7104,8 +7131,6 @@ class FloatingMonitorApp:
         y += 9
         c.create_text(COL_L, y + 2, anchor="nw", text="\u8d26\u53f7\u7528\u91cf",
                        font=self._fonts["font_section"], fill=Theme.text_primary)
-        c.create_text(COL_L + 67, y + 5, anchor="nw", text=f"{len(top)} \u4e2a\u8d26\u53f7",
-                      font=self._fonts["font_micro"], fill=Theme.text_muted)
 
         tab_specs = [
             ("rank_today", "\u4eca\u65e5", "today"),
@@ -7113,10 +7138,16 @@ class FloatingMonitorApp:
             ("rank_7d", "7d\u989d\u5ea6", "7d"),
             ("rank_30d", "30d", "30d"),
         ]
+        if has_cycle_account:
+            tab_specs.append(("rank_cycle", "\u5468\u671f\u989d\u5ea6", "cycle"))
         tab_w = 44
         tab_gap = 3
         tab_h = 21
         tabs_x = COL_R - (tab_w * len(tab_specs) + tab_gap * (len(tab_specs) - 1))
+        account_count_x = COL_L + 67
+        if account_count_x + self._text_width(f"{len(top)} \u4e2a\u8d26\u53f7", "font_micro") + 8 < tabs_x:
+            c.create_text(account_count_x, y + 5, anchor="nw", text=f"{len(top)} \u4e2a\u8d26\u53f7",
+                          font=self._fonts["font_micro"], fill=Theme.text_muted)
         self._draw_rounded_rect(tabs_x - 3, y - 3, COL_R + 3, y + tab_h,
                                 r=7, fill=Theme.ag_bg, outline=Theme.border)
         for tab_index, (button_name, label, value) in enumerate(tab_specs):
@@ -7143,7 +7174,7 @@ class FloatingMonitorApp:
                 empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
             c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
-        window_mode = self._account_range in {"5h", "7d"}
+        window_mode = self._account_range in {"5h", "7d", "cycle"}
         row_h = self._account_rank_row_height()
         available_rank_rows = max(1, (H - 44 - y) // row_h)
         max_start_index = max(0, len(top) - available_rank_rows)
@@ -7552,13 +7583,14 @@ class FloatingMonitorApp:
             else:
                 self._draw()
             return
-        if btn in {"rank_today", "rank_5h", "rank_7d", "rank_30d"}:
+        if btn in {"rank_today", "rank_5h", "rank_7d", "rank_30d", "rank_cycle"}:
             self._resizing = False
             self._account_range = {
                 "rank_today": "today",
                 "rank_5h": "5h",
                 "rank_7d": "7d",
                 "rank_30d": "30d",
+                "rank_cycle": "cycle",
             }[btn]
             self._account_range_user_selected = True
             self._scroll_offsets["accounts"] = 0
