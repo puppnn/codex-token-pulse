@@ -42,18 +42,22 @@ Name: "startup"; Description: "登录 Windows 后自动启动"; GroupDescription
 [Files]
 Source: "..\dist\TokenPulse.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\TokenPulseExporter.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\TokenPulseAnalytics.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Token Pulse"; Filename: "{app}\TokenPulse.exe"
+Name: "{group}\Token Pulse Analytics"; Filename: "{app}\TokenPulseAnalytics.exe"; Parameters: "--open"
 Name: "{autodesktop}\Token Pulse"; Filename: "{app}\TokenPulse.exe"; Tasks: desktopicon
 Name: "{userstartup}\Token Pulse"; Filename: "{app}\TokenPulse.exe"; Tasks: startup
 
 [Run]
+Filename: "{app}\TokenPulseAnalytics.exe"; Parameters: "--open"; Description: "Open Token Pulse Analytics"; Flags: nowait postinstall skipifsilent unchecked
 Filename: "{app}\TokenPulse.exe"; Description: "启动 Token Pulse"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 Type: files; Name: "{app}\TokenPulse.exe"
 Type: files; Name: "{app}\TokenPulseExporter.exe"
+Type: files; Name: "{app}\TokenPulseAnalytics.exe"
 Type: dirifempty; Name: "{app}"
 
 [Code]
@@ -77,5 +81,6 @@ begin
   begin
     StopTokenPulseProcess('TokenPulse.exe');
     StopTokenPulseProcess('TokenPulseExporter.exe');
+    StopTokenPulseProcess('TokenPulseAnalytics.exe');
   end;
 end;

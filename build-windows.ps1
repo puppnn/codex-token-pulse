@@ -80,22 +80,58 @@ $CommonArgs = @(
     "--version-file", $VersionFile
 )
 
-& $Python -m PyInstaller @CommonArgs `
+$TkRuntimeBinaryArgs = @()
+foreach ($RuntimeBinaryName in @("tcl86t.dll", "tk86t.dll")) {
+    $RuntimeBinary = @(
+        (Join-Path $PythonPrefix "Library\bin\$RuntimeBinaryName"),
+        (Join-Path $PythonPrefix "DLLs\$RuntimeBinaryName")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($RuntimeBinary) {
+        $TkRuntimeBinaryArgs += @("--add-binary", "$RuntimeBinary;.")
+    }
+}
+$ExpatBinaryArgs = @()
+$ExpatBinary = @(
+    (Join-Path $PythonPrefix "Library\bin\libexpat.dll"),
+    (Join-Path $PythonPrefix "DLLs\libexpat.dll")
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($ExpatBinary) {
+    $ExpatBinaryArgs = @("--add-binary", "$ExpatBinary;.")
+}
+
+& $Python -m PyInstaller @CommonArgs @TkRuntimeBinaryArgs @ExpatBinaryArgs `
     --windowed `
     --name TokenPulse `
     (Join-Path $Root "monitor.py")
 if ($LASTEXITCODE -ne 0) { throw "TokenPulse.exe build failed." }
 
-& $Python -m PyInstaller @CommonArgs `
+& $Python -m PyInstaller @CommonArgs @ExpatBinaryArgs `
     --console `
     --name TokenPulseExporter `
     (Join-Path $Root "client_usage_export.py")
 if ($LASTEXITCODE -ne 0) { throw "TokenPulseExporter.exe build failed." }
 
+& $Python -m PyInstaller @CommonArgs `
+    --windowed `
+    --name TokenPulseAnalytics `
+    --add-data "$(Join-Path $Root 'analytics');analytics" `
+    (Join-Path $Root "analytics_server.py")
+if ($LASTEXITCODE -ne 0) { throw "TokenPulseAnalytics.exe build failed." }
+
 $SmokeDataDir = Join-Path $BuildDir "smoke-data"
 New-Item -ItemType Directory -Force -Path $SmokeDataDir | Out-Null
 $PreviousDataDir = $env:TOKEN_PULSE_DATA_DIR
+$PreviousSmokeReport = $env:TOKEN_PULSE_SMOKE_REPORT
+$PreviousTemp = $env:TEMP
+$PreviousTmp = $env:TMP
+$SmokeReport = Join-Path $BuildDir "tk-smoke-error.txt"
+$SmokeRuntimeDir = Join-Path $BuildDir "smoke-runtime"
+New-Item -ItemType Directory -Force -Path $SmokeRuntimeDir | Out-Null
+Remove-Item -LiteralPath $SmokeReport -Force -ErrorAction SilentlyContinue
 $env:TOKEN_PULSE_DATA_DIR = $SmokeDataDir
+$env:TOKEN_PULSE_SMOKE_REPORT = $SmokeReport
+$env:TEMP = $SmokeRuntimeDir
+$env:TMP = $SmokeRuntimeDir
 try {
     $Smoke = Start-Process `
         -FilePath (Join-Path $DistDir "TokenPulse.exe") `
@@ -104,10 +140,50 @@ try {
         -Wait `
         -WindowStyle Hidden
     if ($Smoke.ExitCode -ne 0) {
+        if (Test-Path -LiteralPath $SmokeReport) {
+            Write-Host (Get-Content -LiteralPath $SmokeReport -Raw)
+        }
         throw "Packaged Tk smoke test failed with exit code $($Smoke.ExitCode)."
     }
 } finally {
     $env:TOKEN_PULSE_DATA_DIR = $PreviousDataDir
+    $env:TOKEN_PULSE_SMOKE_REPORT = $PreviousSmokeReport
+    $env:TEMP = $PreviousTemp
+    $env:TMP = $PreviousTmp
+}
+
+$AnalyticsPort = 18765
+$PreviousAnalyticsDataDir = $env:TOKEN_PULSE_DATA_DIR
+$env:TOKEN_PULSE_DATA_DIR = $SmokeDataDir
+$Analytics = Start-Process `
+    -FilePath (Join-Path $DistDir "TokenPulseAnalytics.exe") `
+    -ArgumentList @("--host", "127.0.0.1", "--port", $AnalyticsPort) `
+    -PassThru `
+    -WindowStyle Hidden
+try {
+    $AnalyticsReady = $false
+    for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+        Start-Sleep -Milliseconds 250
+        try {
+            $Health = Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri "http://127.0.0.1:$AnalyticsPort/api/health" `
+                -TimeoutSec 2
+            if ($Health.StatusCode -eq 200) {
+                $AnalyticsReady = $true
+                break
+            }
+        } catch {
+        }
+    }
+    if (-not $AnalyticsReady) {
+        throw "Packaged analytics smoke test failed."
+    }
+} finally {
+    if ($Analytics -and -not $Analytics.HasExited) {
+        Stop-Process -Id $Analytics.Id -Force
+    }
+    $env:TOKEN_PULSE_DATA_DIR = $PreviousAnalyticsDataDir
 }
 
 $IsccCandidates = @(

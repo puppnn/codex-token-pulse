@@ -209,3 +209,35 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 python -m py_compile monitor.py client_usage_export.py
 python client_usage_export.py --output client_usage_today.json
 ```
+
+## 历史分析网页
+
+Token Pulse 提供独立的本地历史分析控制台。它只监听 `127.0.0.1`，读取 Token Pulse 自己的 `usage_history.json`，不会保存对话正文，也不会把数据上传到第三方。
+
+```powershell
+.\start-analytics.ps1
+```
+
+启动后访问 `http://127.0.0.1:8765`。双击 `run-analytics.cmd` 也可以无控制台启动并自动打开浏览器。
+
+网页包含：
+
+- `7天 / 30天 / 90天 / 全部 / 自定义` 日期范围，以及来源、账号和模型筛选。
+- Token、成本、请求、缓存命中、峰值日和前一周期变化。
+- 每日趋势、7 日均线、前期对比、累计曲线、Token 构成、来源分布、使用日历和周/月汇总。
+- 账号排行、模型排行、单日钻取、单账号钻取、异常检测和数据质量覆盖率。
+- 账号隐私遮罩、明暗主题、自动刷新，以及每日/账号/模型 CSV 和 JSON 导出。
+- ccSwitch 历史缺口回填：主历史已有日期始终优先，只有缺失日期才使用 ccSwitch，明确记录为零的主历史不会被覆盖。
+
+模型筛选无法从旧历史恢复请求级成本时，网页会按模型 Token 占比分配请求、成本和 Token 构成，并用 `~` 与“含比例估算”明确标记。未筛选时的每日总量仍以历史文件记录为准。
+
+主要接口：
+
+- `GET /api/dashboard`
+- `GET /api/day?date=YYYY-MM-DD`
+- `GET /api/account?name=...`
+- `GET /api/export.csv?kind=daily|accounts|models`
+- `GET /api/export.json?kind=daily|accounts|models`
+- `POST /api/refresh`
+
+Windows 安装包会同时安装 `TokenPulseAnalytics.exe`，可从开始菜单的 **Token Pulse Analytics** 打开。

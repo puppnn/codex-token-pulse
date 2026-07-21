@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Token Pulse Analytics</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1217;
+      --panel: #171b22;
+      --panel-2: #1d222b;
+      --panel-3: #242a34;
+      --line: #303744;
+      --line-soft: #252b35;
+      --text: #f0f2f5;
+      --muted: #98a2b1;
+      --faint: #687384;
+      --gold: #f4bd58;
+      --cyan: #62d6e4;
+      --blue: #75aef5;
+      --green: #77cf91;
+      --violet: #aa91f7;
+      --pink: #ed82aa;
+      --red: #ef7079;
+      --shadow: rgba(0, 0, 0, .28);
+      --chart-grid: rgba(255, 255, 255, .09);
+      --header: rgba(15, 18, 23, .96);
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --bg: #f3f5f7;
+      --panel: #ffffff;
+      --panel-2: #f7f8fa;
+      --panel-3: #edf0f4;
+      --line: #d7dce4;
+      --line-soft: #e6e9ee;
+      --text: #1b2028;
+      --muted: #667182;
+      --faint: #8e97a5;
+      --gold: #b87810;
+      --cyan: #118c9d;
+      --blue: #2f74c7;
+      --green: #2f8f50;
+      --violet: #7255c8;
+      --pink: #b84171;
+      --red: #c8434e;
+      --shadow: rgba(25, 35, 48, .10);
+      --chart-grid: rgba(20, 29, 40, .10);
+      --header: rgba(243, 245, 247, .96);
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html { min-width: 320px; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button, select, input {
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      outline: none;
+    }
+    button:focus-visible, select:focus-visible, input:focus-visible { border-color: var(--cyan); box-shadow: 0 0 0 2px color-mix(in srgb, var(--cyan) 22%, transparent); }
+    button { cursor: pointer; }
+    button:disabled { opacity: .52; cursor: wait; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 10px 22px;
+      border-bottom: 1px solid var(--line);
+      background: var(--header);
+      backdrop-filter: blur(14px);
+    }
+    .brand { display: flex; align-items: center; gap: 11px; min-width: 225px; }
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--gold);
+      border-radius: 6px;
+      color: var(--gold);
+      font: 700 17px/1 "Cascadia Mono", Consolas, monospace;
+    }
+    .brand h1 { margin: 0; font-size: 17px; line-height: 1.15; color: var(--gold); }
+    .brand small { display: block; color: var(--muted); margin-top: 2px; font-size: 11px; }
+    .top-status { display: flex; align-items: center; gap: 8px; color: var(--muted); margin-left: auto; white-space: nowrap; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent); }
+    .status-dot.loading { background: var(--gold); }
+    .status-dot.error { background: var(--red); }
+    .icon-actions { display: flex; gap: 6px; align-items: center; }
+    .icon-btn {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      padding: 0;
+      font-size: 18px;
+      background: transparent;
+    }
+    .icon-btn:hover { border-color: var(--cyan); color: var(--cyan); background: var(--panel-2); }
+    .filter-band {
+      display: flex;
+      align-items: end;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--line-soft);
+      background: var(--panel);
+    }
+    .control { display: grid; gap: 5px; min-width: 132px; }
+    .control > span { color: var(--muted); font-size: 11px; }
+    .control select, .control input { height: 34px; padding: 0 9px; min-width: 0; }
+    .control.account { min-width: min(280px, 38vw); flex: 1; max-width: 360px; }
+    .segmented { display: inline-grid; grid-auto-flow: column; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); }
+    .segmented button { min-width: 44px; height: 28px; padding: 0 10px; border: 0; background: transparent; color: var(--muted); }
+    .segmented button.active { background: var(--panel-3); color: var(--cyan); box-shadow: inset 0 0 0 1px var(--line); }
+    .custom-dates { display: none; align-items: end; gap: 7px; }
+    .custom-dates.visible { display: flex; }
+    .switch-control { min-width: auto; }
+    .switch-row { height: 34px; display: flex; align-items: center; gap: 8px; color: var(--muted); }
+    .switch {
+      position: relative;
+      width: 34px;
+      height: 18px;
+      border-radius: 10px;
+      background: var(--panel-3);
+      border: 1px solid var(--line);
+      cursor: pointer;
+    }
+    .switch::after { content: ""; position: absolute; width: 12px; height: 12px; top: 2px; left: 2px; border-radius: 50%; background: var(--muted); transition: transform .16s ease, background .16s ease; }
+    .switch.active::after { transform: translateX(16px); background: var(--cyan); }
+    .page { max-width: 1500px; margin: 0 auto; padding: 18px 22px 40px; }
+    .notice-strip {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 34px;
+      padding: 7px 11px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line-soft);
+      border-left: 3px solid var(--cyan);
+      border-radius: 4px;
+      color: var(--muted);
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .notice-strip strong { color: var(--text); font-weight: 600; }
+    .notice-strip .spacer { margin-left: auto; }
+    .chip { display: inline-flex; align-items: center; min-height: 20px; padding: 1px 7px; border: 1px solid var(--line); border-radius: 10px; font-size: 10px; color: var(--muted); white-space: nowrap; }
+    .chip.sub { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 60%, var(--line)); }
+    .chip.local { color: var(--green); border-color: color-mix(in srgb, var(--green) 60%, var(--line)); }
+    .chip.ccswitch { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 60%, var(--line)); }
+    .chip.mixed { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 60%, var(--line)); }
+    .kpi-grid { display: grid; grid-template-columns: repeat(6, minmax(145px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .kpi {
+      min-height: 106px;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: 0 8px 26px var(--shadow);
+    }
+    .kpi-label { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; }
+    .kpi-value { margin-top: 11px; font: 700 24px/1.05 "Cascadia Mono", Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kpi:nth-child(1) .kpi-value { color: var(--cyan); }
+    .kpi:nth-child(2) .kpi-value { color: var(--violet); }
+    .kpi:nth-child(3) .kpi-value { color: var(--gold); }
+    .kpi:nth-child(4) .kpi-value { color: var(--green); }
+    .kpi:nth-child(5) .kpi-value { color: var(--blue); }
+    .kpi:nth-child(6) .kpi-value { color: var(--pink); }
+    .kpi-foot { margin-top: 8px; color: var(--faint); font-size: 11px; display: flex; align-items: center; gap: 5px; }
+    .delta.up { color: var(--green); }
+    .delta.down { color: var(--red); }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: 0 10px 32px var(--shadow);
+      min-width: 0;
+    }
+    .panel-head { min-height: 48px; display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line-soft); }
+    .panel-head h2 { margin: 0; font-size: 14px; color: var(--gold); }
+    .panel-head .meta { margin-left: auto; color: var(--muted); font-size: 11px; }
+    .panel-body { padding: 14px; }
+    .trend-panel { margin-bottom: 14px; }
+    .chart-shell { position: relative; height: 340px; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .chart-tooltip {
+      position: absolute;
+      display: none;
+      min-width: 164px;
+      padding: 9px 10px;
+      pointer-events: none;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--panel-3);
+      box-shadow: 0 8px 24px var(--shadow);
+      color: var(--text);
+      font-size: 11px;
+      z-index: 5;
+    }
+    .chart-tooltip.visible { display: block; }
+    .chart-tooltip strong { display: block; margin-bottom: 5px; color: var(--gold); }
+    .chart-tooltip .row { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); }
+    .chart-tooltip .row b { color: var(--text); font-weight: 600; }
+    .legend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-mark { width: 15px; height: 3px; border-radius: 2px; background: var(--cyan); }
+    .legend-mark.avg { background: var(--gold); }
+    .legend-mark.previous { height: 0; border-top: 2px dashed var(--violet); background: transparent; }
+    .three-grid { display: grid; grid-template-columns: 1.05fr .95fr 1fr; gap: 14px; margin-bottom: 14px; }
+    .donut-layout { display: grid; grid-template-columns: 180px 1fr; align-items: center; gap: 12px; min-height: 232px; }
+    .donut-wrap { width: 176px; height: 176px; position: relative; }
+    .donut-center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; pointer-events: none; }
+    .donut-center strong { font: 700 17px/1.1 "Cascadia Mono", Consolas, monospace; color: var(--cyan); }
+    .donut-center span { color: var(--muted); font-size: 10px; margin-top: 3px; }
+    .breakdown-list { display: grid; gap: 9px; }
+    .breakdown-row { display: grid; grid-template-columns: 10px minmax(68px, 1fr) auto; align-items: center; gap: 7px; }
+    .swatch { width: 8px; height: 8px; border-radius: 2px; }
+    .breakdown-row span { color: var(--muted); font-size: 11px; }
+    .breakdown-row b { font: 600 11px "Cascadia Mono", Consolas, monospace; }
+    .source-list { display: grid; gap: 13px; min-height: 232px; align-content: center; }
+    .source-row { display: grid; gap: 6px; }
+    .source-title { display: flex; align-items: center; gap: 7px; }
+    .source-title b { margin-left: auto; font: 600 11px "Cascadia Mono", Consolas, monospace; }
+    .bar-track { height: 7px; border-radius: 4px; background: var(--panel-3); overflow: hidden; }
+    .bar-fill { height: 100%; min-width: 2px; border-radius: 4px; background: var(--cyan); }
+    .efficiency-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; min-height: 232px; align-content: center; }
+    .efficiency-item { padding: 11px; border: 1px solid var(--line-soft); border-radius: 5px; background: var(--panel-2); }
+    .efficiency-item span { color: var(--muted); font-size: 10px; }
+    .efficiency-item strong { display: block; margin-top: 7px; font: 650 15px "Cascadia Mono", Consolas, monospace; }
+    .heatmap-panel { margin-bottom: 14px; }
+    .heatmap-scroll { overflow-x: auto; padding-bottom: 4px; }
+    .heatmap { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 4px; min-width: max-content; padding: 4px 2px 5px; }
+    .heat-cell { width: 13px; height: 13px; border: 1px solid var(--line-soft); border-radius: 2px; background: var(--panel-3); cursor: pointer; }
+    .heat-cell:hover { outline: 1px solid var(--text); outline-offset: 1px; }
+    .heat-cell.blank { visibility: hidden; }
+    .heatmap-legend { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
+    .heatmap-legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+    .two-grid { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(300px, .7fr); gap: 14px; margin-bottom: 14px; align-items: start; }
+    .table-tools { display: flex; gap: 7px; align-items: center; margin-left: auto; }
+    .table-tools input { width: 190px; height: 30px; padding: 0 8px; }
+    .table-wrap { overflow: auto; max-height: 560px; }
+    table { width: 100%; border-collapse: collapse; min-width: 920px; }
+    th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+    th { position: sticky; top: 0; z-index: 2; background: var(--panel); color: var(--muted); font-size: 10px; font-weight: 600; cursor: pointer; }
+    th:hover { color: var(--cyan); }
+    td { font-size: 11px; }
+    td.num { text-align: right; font-family: "Cascadia Mono", Consolas, monospace; }
+    tr.data-row { cursor: pointer; }
+    tr.data-row:hover td { background: var(--panel-2); }
+    .account-name { max-width: 270px; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+    .mini-models { color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+    .anomaly-list { display: grid; gap: 8px; max-height: 560px; overflow: auto; padding-right: 3px; }
+    .anomaly {
+      display: grid;
+      grid-template-columns: 4px 1fr;
+      gap: 9px;
+      padding: 9px 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 5px;
+      background: var(--panel-2);
+      cursor: pointer;
+    }
+    .anomaly:hover { border-color: var(--line); }
+    .anomaly-line { border-radius: 2px; background: var(--faint); }
+    .anomaly.high .anomaly-line { background: var(--red); }
+    .anomaly.medium .anomaly-line { background: var(--gold); }
+    .anomaly.low .anomaly-line { background: var(--blue); }
+    .anomaly.info .anomaly-line { background: var(--violet); }
+    .anomaly h3 { margin: 0; font-size: 11px; }
+    .anomaly p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+    .anomaly time { float: right; color: var(--faint); font-weight: 400; }
+    .bottom-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 14px; margin-bottom: 14px; }
+    .model-list { display: grid; gap: 11px; max-height: 340px; overflow: auto; }
+    .model-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(120px, 1.2fr) auto; gap: 10px; align-items: center; }
+    .model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .model-stat { min-width: 120px; text-align: right; font: 600 10px "Cascadia Mono", Consolas, monospace; }
+    .period-shell { height: 300px; position: relative; }
+    .quality-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; }
+    .quality-item { display: grid; gap: 7px; }
+    .quality-title { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+    .quality-title b { color: var(--text); font-family: "Cascadia Mono", Consolas, monospace; }
+    .quality-meter { height: 6px; background: var(--panel-3); border-radius: 4px; overflow: hidden; }
+    .quality-meter span { display: block; height: 100%; background: var(--green); border-radius: 4px; }
+    .quality-counts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; color: var(--muted); font-size: 10px; }
+    .quality-counts b { color: var(--text); }
+    .drawer-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.45); opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      z-index: 41;
+      width: min(600px, 94vw);
+      height: 100vh;
+      transform: translateX(100%);
+      transition: transform .2s ease;
+      background: var(--panel);
+      border-left: 1px solid var(--line);
+      box-shadow: -18px 0 48px var(--shadow);
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer-head { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+    .drawer-head h2 { margin: 0; font-size: 15px; color: var(--gold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .drawer-head button { margin-left: auto; }
+    .drawer-body { overflow: auto; padding: 14px; }
+    .drawer-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
+    .drawer-kpi { padding: 10px; border: 1px solid var(--line-soft); border-radius: 5px; background: var(--panel-2); }
+    .drawer-kpi span { color: var(--muted); font-size: 9px; }
+    .drawer-kpi b { display: block; margin-top: 5px; font: 650 13px "Cascadia Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; }
+    .drawer-section { margin-top: 16px; }
+    .drawer-section h3 { margin: 0 0 8px; color: var(--gold); font-size: 12px; }
+    .drawer table { min-width: 540px; }
+    .export-menu { position: fixed; z-index: 50; display: none; width: 190px; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-3); box-shadow: 0 12px 32px var(--shadow); }
+    .export-menu.open { display: grid; }
+    .export-menu button { height: 34px; text-align: left; padding: 0 9px; border: 0; background: transparent; }
+    .export-menu button:hover { background: var(--panel-2); color: var(--cyan); }
+    .toast { position: fixed; left: 50%; bottom: 24px; z-index: 70; transform: translate(-50%, 20px); opacity: 0; pointer-events: none; padding: 9px 13px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-3); box-shadow: 0 10px 30px var(--shadow); transition: .18s ease; }
+    .toast.show { transform: translate(-50%, 0); opacity: 1; }
+    .empty { min-height: 120px; display: grid; place-items: center; color: var(--muted); }
+    .loading-mask { position: fixed; inset: 0; z-index: 60; display: none; place-items: center; background: color-mix(in srgb, var(--bg) 72%, transparent); backdrop-filter: blur(2px); }
+    .loading-mask.visible { display: grid; }
+    .loader { width: 34px; height: 34px; border: 3px solid var(--line); border-top-color: var(--cyan); border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 1180px) {
+      .kpi-grid { grid-template-columns: repeat(3, minmax(145px, 1fr)); }
+      .three-grid { grid-template-columns: 1fr 1fr; }
+      .three-grid .panel:last-child { grid-column: 1 / -1; }
+      .two-grid { grid-template-columns: 1fr; }
+      .anomaly-list { max-height: 360px; }
+    }
+    @media (max-width: 760px) {
+      .topbar { padding: 9px 12px; gap: 8px; }
+      .brand { min-width: 0; }
+      .brand small, .top-status span { display: none; }
+      .top-status { margin-left: auto; }
+      .filter-band { padding: 11px 12px; align-items: stretch; }
+      .control, .control.account { min-width: calc(50% - 6px); max-width: none; flex: 1; }
+      .control.range-control { min-width: 100%; }
+      .page { padding: 12px 12px 28px; }
+      .notice-strip { align-items: flex-start; flex-wrap: wrap; }
+      .notice-strip .spacer { display: none; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+      .kpi { min-height: 96px; }
+      .kpi-value { font-size: 20px; }
+      .chart-shell { height: 285px; }
+      .three-grid, .bottom-grid { grid-template-columns: 1fr; }
+      .three-grid .panel:last-child { grid-column: auto; }
+      .donut-layout { grid-template-columns: 150px 1fr; }
+      .donut-wrap { width: 146px; height: 146px; }
+      .quality-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      .table-tools input { width: 130px; }
+      .panel-head { flex-wrap: wrap; }
+      .panel-head .meta { margin-left: 0; }
+    }
+    @media (max-width: 430px) {
+      .brand-mark { display: none; }
+      .icon-btn { width: 32px; height: 32px; }
+      .control { min-width: calc(50% - 6px); }
+      .control.account, .control.range-control { min-width: 100%; }
+      .switch-control { min-width: calc(50% - 6px); }
+      .notice-strip { display: grid; grid-template-columns: auto 1fr; gap: 5px 8px; font-size: 11px; }
+      .notice-strip #updatedText, .notice-strip .spacer { display: none; }
+      .notice-strip .chip { grid-column: 1 / -1; justify-self: start; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi-value { font-size: 18px; }
+      .donut-layout { grid-template-columns: 1fr; justify-items: center; }
+      .breakdown-list { width: 100%; }
+      .quality-grid { grid-template-columns: 1fr; }
+      .drawer-kpis { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">TP</div>
+      <div><h1>TOKEN PULSE</h1><small>本地使用分析</small></div>
+    </div>
+    <div class="top-status"><i id="statusDot" class="status-dot loading"></i><span id="statusText">正在读取历史</span></div>
+    <div class="icon-actions">
+      <button id="privacyBtn" class="icon-btn" type="button" title="切换账号隐私遮罩" aria-label="切换账号隐私遮罩">◉</button>
+      <button id="themeBtn" class="icon-btn" type="button" title="切换明暗主题" aria-label="切换明暗主题">◐</button>
+      <button id="exportBtn" class="icon-btn" type="button" title="导出当前视图" aria-label="导出当前视图">⇩</button>
+      <button id="refreshBtn" class="icon-btn" type="button" title="刷新数据" aria-label="刷新数据">↻</button>
+    </div>
+  </header>
+
+  <section class="filter-band">
+    <div class="control range-control"><span>时间范围</span><div id="rangeTabs" class="segmented">
+      <button data-range="7d">7天</button><button data-range="30d">30天</button><button class="active" data-range="90d">90天</button><button data-range="all">全部</button><button data-range="custom">自定义</button>
+    </div></div>
+    <div id="customDates" class="custom-dates">
+      <label class="control"><span>开始</span><input id="startDate" type="date"></label>
+      <label class="control"><span>结束</span><input id="endDate" type="date"></label>
+    </div>
+    <label class="control"><span>来源</span><select id="sourceSelect"><option value="ALL">全部来源</option></select></label>
+    <label class="control account"><span>账号</span><input id="accountInput" list="accountOptions" placeholder="全部账号" autocomplete="off"><datalist id="accountOptions"></datalist></label>
+    <label class="control"><span>模型</span><select id="modelSelect"><option value="">全部模型</option></select></label>
+    <div class="control switch-control"><span>前期对比</span><div class="switch-row"><button id="compareSwitch" class="switch active" type="button" role="switch" aria-checked="true"></button><span id="compareLabel">开启</span></div></div>
+    <label class="control"><span>自动刷新</span><select id="autoRefresh"><option value="0">关闭</option><option value="15">15秒</option><option value="30" selected>30秒</option><option value="60">60秒</option><option value="300">5分钟</option></select></label>
+  </section>
+
+  <main class="page">
+    <div id="noticeStrip" class="notice-strip"><strong>数据范围</strong><span id="coverageText">-</span><span class="spacer"></span><span id="estimateBadge" class="chip" hidden>含比例估算</span><span id="updatedText">-</span></div>
+
+    <section id="kpiGrid" class="kpi-grid"></section>
+
+    <section class="panel trend-panel">
+      <div class="panel-head"><h2>每日趋势</h2><div id="metricTabs" class="segmented"><button class="active" data-metric="tokens">Token</button><button data-metric="cost">成本</button><button data-metric="requests">请求</button><button data-metric="cumulative_tokens">累计</button></div><div class="legend"><span class="legend-item"><i class="legend-mark"></i>每日</span><span class="legend-item"><i class="legend-mark avg"></i>7日均线</span><span class="legend-item"><i class="legend-mark previous"></i>前期</span></div></div>
+      <div class="panel-body"><div class="chart-shell"><canvas id="trendChart"></canvas><div id="trendTooltip" class="chart-tooltip"></div></div></div>
+    </section>
+
+    <section class="three-grid">
+      <article class="panel"><div class="panel-head"><h2>Token 构成</h2><span id="compositionMeta" class="meta"></span></div><div class="panel-body"><div class="donut-layout"><div class="donut-wrap"><canvas id="compositionChart"></canvas><div class="donut-center"><strong id="compositionTotal">-</strong><span>可归类 Token</span></div></div><div id="compositionLegend" class="breakdown-list"></div></div></div></article>
+      <article class="panel"><div class="panel-head"><h2>来源分布</h2><span class="meta">权威日总量</span></div><div class="panel-body"><div id="sourceList" class="source-list"></div></div></article>
+      <article class="panel"><div class="panel-head"><h2>效率指标</h2><span class="meta">UTC+8</span></div><div class="panel-body"><div id="efficiencyGrid" class="efficiency-grid"></div></div></article>
+    </section>
+
+    <section class="panel heatmap-panel">
+      <div class="panel-head"><h2>使用日历</h2><span id="heatmapMeta" class="meta"></span><div class="heatmap-legend"><span>低</span><i style="background:var(--panel-3)"></i><i style="background:color-mix(in srgb,var(--cyan) 25%,var(--panel-3))"></i><i style="background:color-mix(in srgb,var(--cyan) 50%,var(--panel-3))"></i><i style="background:color-mix(in srgb,var(--cyan) 75%,var(--panel-3))"></i><i style="background:var(--cyan)"></i><span>高</span></div></div>
+      <div class="panel-body heatmap-scroll"><div id="heatmap" class="heatmap"></div></div>
+    </section>
+
+    <section class="two-grid">
+      <article class="panel">
+        <div class="panel-head"><h2>账号分析</h2><span id="accountCount" class="meta"></span><div class="table-tools"><input id="accountSearch" placeholder="搜索账号"><button id="clearAccountBtn" class="icon-btn" type="button" title="清除账号筛选" aria-label="清除账号筛选">×</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th data-sort="source">来源</th><th data-sort="account_name">账号</th><th data-sort="tokens" style="text-align:right">Token</th><th data-sort="cost" style="text-align:right">成本</th><th data-sort="requests" style="text-align:right">请求</th><th data-sort="active_days" style="text-align:right">活跃天</th><th data-sort="cache_hit_rate" style="text-align:right">缓存命中</th><th data-sort="tokens_per_request" style="text-align:right">Token/请求</th><th>主要模型</th><th data-sort="last_date">最后使用</th></tr></thead><tbody id="accountTableBody"></tbody></table></div>
+      </article>
+      <aside class="panel"><div class="panel-head"><h2>异常与变化</h2><span id="anomalyCount" class="meta"></span></div><div class="panel-body"><div id="anomalyList" class="anomaly-list"></div></div></aside>
+    </section>
+
+    <section class="bottom-grid">
+      <article class="panel"><div class="panel-head"><h2>模型排行</h2><span id="modelCount" class="meta"></span></div><div class="panel-body"><div id="modelList" class="model-list"></div></div></article>
+      <article class="panel"><div class="panel-head"><h2>周期汇总</h2><div id="periodTabs" class="segmented"><button class="active" data-period="weekly">按周</button><button data-period="monthly">按月</button></div></div><div class="panel-body"><div class="period-shell"><canvas id="periodChart"></canvas><div id="periodTooltip" class="chart-tooltip"></div></div></div></article>
+    </section>
+
+    <section class="panel"><div class="panel-head"><h2>数据质量</h2><span class="meta">明细覆盖不改变每日权威总量</span></div><div class="panel-body"><div id="qualityGrid" class="quality-grid"></div><div id="qualityCounts" class="quality-counts"></div></div></section>
+  </main>
+
+  <div id="drawerBackdrop" class="drawer-backdrop"></div>
+  <aside id="drawer" class="drawer" aria-hidden="true"><div class="drawer-head"><h2 id="drawerTitle">详情</h2><button id="drawerClose" class="icon-btn" type="button" aria-label="关闭详情">×</button></div><div id="drawerBody" class="drawer-body"></div></aside>
+  <div id="exportMenu" class="export-menu"><button data-export="daily:csv">每日明细 CSV</button><button data-export="accounts:csv">账号排行 CSV</button><button data-export="models:csv">模型排行 CSV</button><button data-export="daily:json">每日明细 JSON</button></div>
+  <div id="toast" class="toast"></div>
+  <div id="loadingMask" class="loading-mask"><div class="loader"></div></div>
+
+  <script>
+    const $ = id => document.getElementById(id)
+    const COLORS = { cyan:'#62d6e4', gold:'#f4bd58', violet:'#aa91f7', green:'#77cf91', pink:'#ed82aa', red:'#ef7079', blue:'#75aef5' }
+    const SOURCE_COLORS = { SUB:COLORS.cyan, LOCAL:COLORS.green, CCSWITCH:COLORS.gold, MIXED:COLORS.violet, MISSING:'#687384' }
+    const state = {
+      data:null, range:'90d', source:'ALL', account:'', model:'', metric:'tokens', compare:true,
+      period:'weekly', privacy:false, theme:localStorage.getItem('tp-theme') || 'dark',
+      accountSort:{key:'tokens', direction:-1}, autoTimer:null, loadSeq:0
+    }
+    document.documentElement.dataset.theme = state.theme
+
+    function compact(value, digits=1) {
+      const n = Number(value || 0), abs = Math.abs(n)
+      if (abs >= 1e12) return (n/1e12).toFixed(digits)+'T'
+      if (abs >= 1e9) return (n/1e9).toFixed(digits)+'B'
+      if (abs >= 1e6) return (n/1e6).toFixed(digits)+'M'
+      if (abs >= 1e3) return (n/1e3).toFixed(digits)+'K'
+      return Math.round(n).toLocaleString('zh-CN')
+    }
+    function money(value) { return '$'+Number(value || 0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) }
+    function pct(value, digits=1) { return Number(value || 0).toFixed(digits)+'%' }
+    function dateText(value) { if(!value) return '-'; const d=new Date(value+'T00:00:00'); return `${d.getMonth()+1}月${d.getDate()}日` }
+    function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])) }
+    function maskName(value) {
+      const text=String(value || '')
+      if(!state.privacy || text.startsWith('Unassigned') || text.startsWith('ccSwitch')) return text
+      return text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+/ig, mail=>{ const [a,b]=mail.split('@'); return `${a.slice(0,2)}***@${b}` })
+        .replace(/(Codex local - )(?!..\*\*\*)[^@]{5,}/i, (_,p)=>p+'••••••')
+    }
+    function sourceClass(source) { return String(source||'').toLowerCase() }
+    function sourceName(source) { return ({SUB:'Sub2API',LOCAL:'本地',CCSWITCH:'ccSwitch 回填',MIXED:'混合',MISSING:'缺失'})[source] || source || '未知' }
+    function sourceChip(source) { return `<span class="chip ${sourceClass(source)}">${escapeHtml(sourceName(source))}</span>` }
+    function estimatedMark(flag) { return flag ? '<span title="由 Token 占比推算">~</span>' : '' }
+    function metricValue(row, key=state.metric) { return Number(row?.[key] || 0) }
+    function metricFormat(value, key=state.metric) { return key==='cost' ? money(value) : compact(value) }
+    function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() }
+
+    function buildQuery(extra={}) {
+      const params=new URLSearchParams()
+      params.set('range',state.range)
+      params.set('source',state.source)
+      if(state.account) params.set('account',state.account)
+      if(state.model) params.set('model',state.model)
+      if(state.range==='custom') { if($('startDate').value) params.set('start',$('startDate').value); if($('endDate').value) params.set('end',$('endDate').value) }
+      for(const [key,value] of Object.entries(extra)) params.set(key,value)
+      return params.toString()
+    }
+    async function api(path, options={}) {
+      const response=await fetch(path,{cache:'no-store',...options})
+      if(!response.ok) { let message=`HTTP ${response.status}`; try{message=(await response.json()).error||message}catch{}; throw new Error(message) }
+      return response.json()
+    }
+    function setStatus(kind,text) { $('statusDot').className=`status-dot ${kind||''}`; $('statusText').textContent=text }
+    function showToast(message) { const el=$('toast'); el.textContent=message; el.classList.add('show'); clearTimeout(showToast.timer); showToast.timer=setTimeout(()=>el.classList.remove('show'),2600) }
+
+    async function loadDashboard(force=false) {
+      const seq=++state.loadSeq
+      setStatus('loading','正在刷新')
+      $('refreshBtn').disabled=true
+      if(!state.data) $('loadingMask').classList.add('visible')
+      try {
+        if(force) await api('/api/refresh',{method:'POST'})
+        const data=await api(`/api/dashboard?${buildQuery()}`)
+        if(seq!==state.loadSeq) return
+        state.data=data
+        applyOptions(data.options)
+        renderAll()
+        const generated=new Date(data.meta.generated_at)
+        setStatus('',`已更新 ${generated.toLocaleTimeString('zh-CN',{hour12:false})}`)
+        updateUrl()
+      } catch(error) {
+        setStatus('error','读取失败')
+        showToast(error.message)
+      } finally {
+        if(seq===state.loadSeq) { $('refreshBtn').disabled=false; $('loadingMask').classList.remove('visible') }
+      }
+    }
+    function applyOptions(options) {
+      const source=$('sourceSelect'), current=state.source
+      source.innerHTML='<option value="ALL">全部来源</option>'+options.sources.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(sourceName(x))}</option>`).join('')
+      source.value=options.sources.includes(current)?current:'ALL'; state.source=source.value
+      $('accountOptions').innerHTML=options.accounts.map(x=>`<option value="${escapeHtml(x)}"></option>`).join('')
+      const model=$('modelSelect'), selected=state.model
+      model.innerHTML='<option value="">全部模型</option>'+options.models.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('')
+      model.value=options.models.includes(selected)?selected:''; state.model=model.value
+    }
+    function updateUrl() {
+      const url=new URL(location.href); url.search=buildQuery(); history.replaceState(null,'',url)
+    }
+    function restoreUrl() {
+      const p=new URLSearchParams(location.search)
+      state.range=p.get('range')||'90d'; state.source=p.get('source')||'ALL'; state.account=p.get('account')||''; state.model=p.get('model')||''
+      $('accountInput').value=state.account
+      if(p.get('start')) $('startDate').value=p.get('start'); if(p.get('end')) $('endDate').value=p.get('end')
+      document.querySelectorAll('#rangeTabs button').forEach(btn=>btn.classList.toggle('active',btn.dataset.range===state.range))
+      $('customDates').classList.toggle('visible',state.range==='custom')
+    }
+
+    function changeHtml(change) {
+      if(change===null || change===undefined) return '<span class="delta">无前期基线</span>'
+      const cls=change>0?'up':change<0?'down':''
+      return `<span class="delta ${cls}">${change>0?'↑':change<0?'↓':'•'} ${Math.abs(change).toFixed(1)}%</span>`
+    }
+    function renderKpis() {
+      const s=state.data.summary, estimated=s.estimated
+      const cards=[
+        ['总 Token',compact(s.tokens),changeHtml(s.changes.tokens),`${s.active_days}/${s.calendar_days} 个活跃日`],
+        ['总成本',`${estimated?'~':''}${money(s.cost)}`,changeHtml(s.changes.cost),`${money(s.cost_per_million_tokens)} / M Token`],
+        ['请求数',`${estimated?'~':''}${compact(s.requests)}`,changeHtml(s.changes.requests),`${compact(s.tokens_per_request)} Token / 请求`],
+        ['日均 Token',compact(s.average_tokens_per_day),'',`活跃日均 ${compact(s.average_tokens_per_active_day)}`],
+        ['缓存命中',pct(s.cache_hit_rate),'',`输出占比 ${pct(s.output_share)}`],
+        ['峰值日',compact(s.peak_day.tokens),'',`${dateText(s.peak_day.date)} · ${money(s.peak_day.cost)}`]
+      ]
+      $('kpiGrid').innerHTML=cards.map(([label,value,delta,foot])=>`<article class="kpi"><div class="kpi-label"><span>${label}</span>${delta}</div><div class="kpi-value" title="${escapeHtml(value)}">${value}</div><div class="kpi-foot">${foot}</div></article>`).join('')
+    }
+    function renderNotice() {
+      const {meta,quality,summary}=state.data
+      $('coverageText').textContent=`${meta.start} 至 ${meta.end} · ${quality.recorded_days}/${quality.calendar_days} 天有记录 · ${quality.backfill_days} 天 ccSwitch 回填`
+      $('updatedText').textContent=`UTC+8 · ${quality.last_updated_at ? new Date(quality.last_updated_at).toLocaleString('zh-CN',{hour12:false}) : '未记录更新时间'}`
+      $('estimateBadge').hidden=!summary.estimated
+    }
+
+    function setupCanvas(canvas) {
+      const rect=canvas.getBoundingClientRect(), dpr=Math.min(devicePixelRatio||1,2)
+      canvas.width=Math.max(1,Math.round(rect.width*dpr)); canvas.height=Math.max(1,Math.round(rect.height*dpr))
+      const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0)
+      return {ctx,w:rect.width,h:rect.height}
+    }
+    function drawLine(ctx,points,color,width=2,dash=[]) { if(!points.length)return; ctx.save();ctx.strokeStyle=color;ctx.lineWidth=width;ctx.setLineDash(dash);ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke();ctx.restore() }
+    function renderTrend() {
+      const canvas=$('trendChart'), {ctx,w,h}=setupCanvas(canvas), rows=state.data.daily, previous=state.data.previous_daily
+      const pad={l:58,r:20,t:22,b:36}, chartW=Math.max(1,w-pad.l-pad.r), chartH=Math.max(1,h-pad.t-pad.b)
+      const values=rows.map(row=>metricValue(row)), previousValues=previous.map(row=>metricValue(row))
+      const avgValues=state.metric==='tokens'?rows.map(row=>Number(row.moving_average_7||0)):values.map((_,i)=>{const win=values.slice(Math.max(0,i-6),i+1);return win.reduce((a,b)=>a+b,0)/Math.max(1,win.length)})
+      const max=Math.max(1,...values,...(state.compare?previousValues:[]),...avgValues)*1.08
+      const x=i=>pad.l+(rows.length<=1?chartW/2:i*chartW/(rows.length-1)), y=v=>pad.t+chartH-(Number(v||0)/max)*chartH
+      ctx.clearRect(0,0,w,h); ctx.font='10px Segoe UI'; ctx.fillStyle=css('--muted'); ctx.strokeStyle=css('--chart-grid'); ctx.lineWidth=1
+      for(let i=0;i<5;i++){const yy=pad.t+i*chartH/4;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.fillText(metricFormat(max*(4-i)/4),4,yy+3)}
+      const main=values.map((v,i)=>({x:x(i),y:y(v)})), avg=avgValues.map((v,i)=>({x:x(i),y:y(v)}))
+      if(main.length){ctx.save();ctx.fillStyle='rgba(98,214,228,.10)';ctx.beginPath();main.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.lineTo(main.at(-1).x,pad.t+chartH);ctx.lineTo(main[0].x,pad.t+chartH);ctx.closePath();ctx.fill();ctx.restore()}
+      if(state.compare && previous.length){const prev=previousValues.map((v,i)=>({x:x(i),y:y(v)}));drawLine(ctx,prev,css('--violet'),1.5,[5,4])}
+      drawLine(ctx,avg,css('--gold'),1.5); drawLine(ctx,main,css('--cyan'),2)
+      main.forEach((p,i)=>{const row=rows[i];ctx.fillStyle=SOURCE_COLORS[row.source]||css('--faint');ctx.beginPath();ctx.arc(p.x,p.y,2.6,0,Math.PI*2);ctx.fill()})
+      const labels=Math.min(7,rows.length), step=Math.max(1,Math.floor((rows.length-1)/Math.max(1,labels-1)))
+      ctx.fillStyle=css('--muted');ctx.textAlign='center'
+      rows.forEach((row,i)=>{if(i===0||i===rows.length-1||i%step===0)ctx.fillText(row.date.slice(5),x(i),h-10)})
+      canvas._chart={rows,points:main,pad,w,h}
+    }
+    function trendMove(event) {
+      const canvas=$('trendChart'), chart=canvas._chart; if(!chart?.rows.length)return
+      const rect=canvas.getBoundingClientRect(), mx=event.clientX-rect.left
+      let best=0,dist=Infinity; chart.points.forEach((p,i)=>{const d=Math.abs(p.x-mx);if(d<dist){best=i;dist=d}})
+      const row=chart.rows[best], tip=$('trendTooltip'), estimate=row.estimated?' · 含估算':''
+      tip.innerHTML=`<strong>${row.date}${estimate}</strong><div class="row"><span>Token</span><b>${compact(row.tokens,2)}</b></div><div class="row"><span>成本</span><b>${money(row.cost)}</b></div><div class="row"><span>请求</span><b>${compact(row.requests)}</b></div><div class="row"><span>来源</span><b>${sourceName(row.source)}</b></div>`
+      tip.classList.add('visible'); const left=Math.min(rect.width-tip.offsetWidth-8,Math.max(8,chart.points[best].x+12)); tip.style.left=left+'px'; tip.style.top=Math.max(8,chart.points[best].y-tip.offsetHeight-10)+'px'
+    }
+    function renderComposition() {
+      const canvas=$('compositionChart'), {ctx,w,h}=setupCanvas(canvas), c=state.data.composition
+      const segments=[['输入',c.input_tokens,COLORS.blue],['缓存读取',c.cached_input_tokens,COLORS.cyan],['缓存创建',c.cache_creation_input_tokens,COLORS.violet],['输出',c.output_tokens,COLORS.gold]]
+      const total=segments.reduce((sum,x)=>sum+Number(x[1]||0),0), cx=w/2,cy=h/2,r=Math.min(w,h)*.42,inner=r*.62
+      let angle=-Math.PI/2; ctx.clearRect(0,0,w,h)
+      if(!total){ctx.strokeStyle=css('--line');ctx.lineWidth=r-inner;ctx.beginPath();ctx.arc(cx,cy,(r+inner)/2,0,Math.PI*2);ctx.stroke()}
+      for(const [,value,color] of segments){if(!value)continue;const next=angle+Math.PI*2*value/total;ctx.beginPath();ctx.arc(cx,cy,r,angle,next);ctx.arc(cx,cy,inner,next,angle,true);ctx.closePath();ctx.fillStyle=color;ctx.fill();angle=next}
+      $('compositionTotal').textContent=compact(total); $('compositionMeta').textContent=`覆盖 ${pct(state.data.quality.component_coverage)}`
+      $('compositionLegend').innerHTML=segments.map(([name,value,color])=>`<div class="breakdown-row"><i class="swatch" style="background:${color}"></i><span>${name} · ${total?pct(value/total*100):'0.0%'}</span><b>${compact(value)}</b></div>`).join('')
+    }
+    function renderSources() {
+      const rows=state.data.sources
+      $('sourceList').innerHTML=rows.length?rows.map(row=>`<div class="source-row"><div class="source-title">${sourceChip(row.source)}<span>${row.days} 天</span><b>${compact(row.tokens)} · ${pct(row.share)}</b></div><div class="bar-track"><div class="bar-fill" style="width:${Math.max(1,row.share)}%;background:${SOURCE_COLORS[row.source]||COLORS.blue}"></div></div></div>`).join(''):'<div class="empty">暂无来源数据</div>'
+    }
+    function renderEfficiency() {
+      const s=state.data.summary
+      const items=[['Token / 请求',compact(s.tokens_per_request)],['成本 / M Token',money(s.cost_per_million_tokens)],['活跃日均',compact(s.average_tokens_per_active_day)],['日历日均',compact(s.average_tokens_per_day)],['缓存命中',pct(s.cache_hit_rate)],['输出占比',pct(s.output_share)],['活跃天',`${s.active_days} / ${s.calendar_days}`],['峰值日期',s.peak_day.date||'-']]
+      $('efficiencyGrid').innerHTML=items.map(([label,value])=>`<div class="efficiency-item"><span>${label}</span><strong title="${escapeHtml(value)}">${value}</strong></div>`).join('')
+    }
+    function heatColor(value,max,source) { if(!value)return css('--panel-3');const ratio=Math.max(.12,Math.min(1,Math.sqrt(value/max)));return `color-mix(in srgb, ${SOURCE_COLORS[source]||COLORS.cyan} ${Math.round(ratio*88)}%, ${css('--panel-3')})` }
+    function renderHeatmap() {
+      const rows=state.data.daily, root=$('heatmap');root.innerHTML=''; if(!rows.length)return
+      const first=new Date(rows[0].date+'T00:00:00'), monday=(first.getDay()+6)%7, max=Math.max(1,...rows.map(r=>metricValue(r)))
+      for(let i=0;i<monday;i++){const cell=document.createElement('i');cell.className='heat-cell blank';root.appendChild(cell)}
+      rows.forEach(row=>{const cell=document.createElement('button');cell.type='button';cell.className='heat-cell';cell.style.background=heatColor(metricValue(row),max,row.source);cell.title=`${row.date} · ${metricFormat(metricValue(row))} · ${sourceName(row.source)}`;cell.addEventListener('click',()=>openDay(row.date));root.appendChild(cell)})
+      $('heatmapMeta').textContent=`${rows.length} 天 · 点击日期查看明细`
+    }
+
+    function sortedAccounts() {
+      const search=$('accountSearch').value.trim().toLowerCase(), {key,direction}=state.accountSort
+      return state.data.accounts.filter(row=>!search||row.account_name.toLowerCase().includes(search)).sort((a,b)=>{const av=a[key]??'',bv=b[key]??'';return (typeof av==='number'?av-bv:String(av).localeCompare(String(bv),'zh-CN'))*direction})
+    }
+    function renderAccounts() {
+      const rows=sortedAccounts(); $('accountCount').textContent=`${rows.length}/${state.data.accounts.length} 个账号`
+      $('accountTableBody').innerHTML=rows.length?rows.map(row=>`<tr class="data-row" data-account="${escapeHtml(row.account_name)}"><td>${sourceChip(row.source)}</td><td class="account-name" title="${escapeHtml(maskName(row.account_name))}">${escapeHtml(maskName(row.account_name))}${row.plan_type?` <span class="chip">${escapeHtml(row.plan_type)}</span>`:''}</td><td class="num" style="color:var(--cyan)">${compact(row.tokens,2)}</td><td class="num" style="color:var(--violet)">${estimatedMark(row.estimated)}${money(row.cost)}</td><td class="num">${estimatedMark(row.estimated)}${compact(row.requests)}</td><td class="num">${row.active_days}</td><td class="num">${pct(row.cache_hit_rate)}</td><td class="num">${compact(row.tokens_per_request)}</td><td class="mini-models">${escapeHtml(row.top_models.map(x=>x.name).join(' · ')||'-')}</td><td>${row.last_date||'-'}</td></tr>`).join(''):'<tr><td colspan="10"><div class="empty">没有匹配账号</div></td></tr>'
+      document.querySelectorAll('#accountTableBody tr[data-account]').forEach(tr=>tr.addEventListener('click',()=>openAccount(tr.dataset.account)))
+    }
+    function renderAnomalies() {
+      const rows=state.data.anomalies; $('anomalyCount').textContent=`${rows.length} 项`
+      $('anomalyList').innerHTML=rows.length?rows.map(row=>`<article class="anomaly ${row.severity}" data-date="${row.date||''}"><i class="anomaly-line"></i><div><h3>${escapeHtml(row.title)}<time>${row.date||''}</time></h3><p>${escapeHtml(row.message)}</p></div></article>`).join(''):'<div class="empty">当前范围未检测到异常</div>'
+      document.querySelectorAll('.anomaly[data-date]').forEach(el=>el.addEventListener('click',()=>el.dataset.date&&openDay(el.dataset.date)))
+    }
+    function renderModels() {
+      const rows=state.data.models, max=Math.max(1,...rows.map(x=>x.tokens));$('modelCount').textContent=`${rows.length} 个模型`
+      $('modelList').innerHTML=rows.length?rows.map(row=>`<div class="model-row"><div class="model-name" title="${escapeHtml(row.name)}">${escapeHtml(row.name)} <span class="chip">${pct(row.share)}</span></div><div class="bar-track"><div class="bar-fill" style="width:${row.tokens/max*100}%;background:var(--violet)"></div></div><div class="model-stat">${compact(row.tokens)} · ~${money(row.cost)}</div></div>`).join(''):'<div class="empty">暂无模型明细</div>'
+    }
+    function renderPeriod() {
+      const rows=state.data[state.period]||[], canvas=$('periodChart'),{ctx,w,h}=setupCanvas(canvas),pad={l:48,r:16,t:18,b:34},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b
+      const values=rows.map(x=>metricValue(x,state.metric==='cumulative_tokens'?'tokens':state.metric)),max=Math.max(1,...values)*1.08,slot=cw/Math.max(1,rows.length),bar=Math.max(4,Math.min(34,slot*.62))
+      ctx.clearRect(0,0,w,h);ctx.font='10px Segoe UI';ctx.strokeStyle=css('--chart-grid');ctx.fillStyle=css('--muted')
+      for(let i=0;i<4;i++){const yy=pad.t+i*ch/3;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.fillText(metricFormat(max*(3-i)/3,state.metric==='cumulative_tokens'?'tokens':state.metric),2,yy+3)}
+      rows.forEach((row,i)=>{const value=values[i],x=pad.l+i*slot+(slot-bar)/2,y=pad.t+ch-value/max*ch;ctx.fillStyle=i===rows.length-1?css('--gold'):css('--blue');ctx.fillRect(x,y,bar,pad.t+ch-y);if(rows.length<=16||i%Math.ceil(rows.length/12)===0){ctx.save();ctx.translate(x+bar/2,h-8);ctx.textAlign='center';ctx.fillStyle=css('--muted');ctx.fillText(row.label,0,0);ctx.restore()}})
+      canvas._chart={rows,values,pad,slot,bar,w,h,max}
+    }
+    function periodMove(event) {
+      const canvas=$('periodChart'),chart=canvas._chart;if(!chart?.rows.length)return;const rect=canvas.getBoundingClientRect(),x=event.clientX-rect.left,index=Math.max(0,Math.min(chart.rows.length-1,Math.floor((x-chart.pad.l)/chart.slot))),row=chart.rows[index],tip=$('periodTooltip')
+      tip.innerHTML=`<strong>${escapeHtml(row.key)}</strong><div class="row"><span>Token</span><b>${compact(row.tokens,2)}</b></div><div class="row"><span>成本</span><b>${money(row.cost)}</b></div><div class="row"><span>请求</span><b>${compact(row.requests)}</b></div><div class="row"><span>活跃日</span><b>${row.active_days}</b></div>`;tip.classList.add('visible');tip.style.left=Math.min(rect.width-tip.offsetWidth-8,Math.max(8,index*chart.slot+chart.pad.l))+'px';tip.style.top='8px'
+    }
+    function renderQuality() {
+      const q=state.data.quality,items=[['日期覆盖',q.day_coverage],['账号归属',q.provider_coverage],['模型归属',q.model_coverage],['Token 构成',q.component_coverage]]
+      $('qualityGrid').innerHTML=items.map(([label,value])=>`<div class="quality-item"><div class="quality-title"><span>${label}</span><b>${pct(value)}</b></div><div class="quality-meter"><span style="width:${Math.min(100,value)}%;background:${value>=90?'var(--green)':value>=70?'var(--gold)':'var(--red)'}"></span></div></div>`).join('')
+      $('qualityCounts').innerHTML=`<span>主历史 <b>${q.primary_days}</b> 天</span><span>ccSwitch 回填 <b>${q.backfill_days}</b> 天</span><span>缺失 <b>${q.missing_days}</b> 天</span><span>明确零值 <b>${q.explicit_zero_days}</b> 天</span><span>含明细 <b>${q.detailed_days}</b> 天</span><span>ccSwitch ${q.ccswitch.available?'<b>可用</b>':'不可用'}</span>`
+    }
+    function renderAll() { renderNotice();renderKpis();renderTrend();renderComposition();renderSources();renderEfficiency();renderHeatmap();renderAccounts();renderAnomalies();renderModels();renderPeriod();renderQuality() }
+
+    function openDrawer(title,html) { $('drawerTitle').textContent=title;$('drawerBody').innerHTML=html;$('drawer').classList.add('open');$('drawerBackdrop').classList.add('open');$('drawer').setAttribute('aria-hidden','false') }
+    function closeDrawer() { $('drawer').classList.remove('open');$('drawerBackdrop').classList.remove('open');$('drawer').setAttribute('aria-hidden','true') }
+    async function openDay(day) {
+      openDrawer(day,'<div class="empty">正在读取…</div>')
+      try { const data=await api(`/api/day?date=${encodeURIComponent(day)}`); if(!data.found){openDrawer(day,'<div class="empty">该日期没有记录</div>');return}
+        const d=data.day,q=data.quality,providers=data.providers||[],models=data.models||[]
+        openDrawer(`${day} · ${sourceName(d.source)}`,`<div class="drawer-kpis"><div class="drawer-kpi"><span>Token</span><b>${compact(d.tokens,2)}</b></div><div class="drawer-kpi"><span>成本</span><b>${money(d.cost)}</b></div><div class="drawer-kpi"><span>请求</span><b>${compact(d.requests)}</b></div><div class="drawer-kpi"><span>缓存读取</span><b>${compact(d.cached_input_tokens)}</b></div><div class="drawer-kpi"><span>输出</span><b>${compact(d.output_tokens)}</b></div><div class="drawer-kpi"><span>账号覆盖</span><b>${pct(q.provider_coverage)}</b></div></div><div class="drawer-section"><h3>账号明细</h3><div class="table-wrap"><table><thead><tr><th>账号</th><th style="text-align:right">Token</th><th style="text-align:right">成本</th><th style="text-align:right">请求</th><th>模型</th></tr></thead><tbody>${providers.map(p=>`<tr><td>${escapeHtml(maskName(p.name))}</td><td class="num">${compact(p.tokens)}</td><td class="num">${money(p.cost)}</td><td class="num">${compact(p.requests)}</td><td>${escapeHtml(Object.keys(p.models||{}).join(' · ')||'-')}</td></tr>`).join('')}</tbody></table></div></div><div class="drawer-section"><h3>模型分布</h3><div class="breakdown-list">${models.map(m=>`<div class="breakdown-row"><i class="swatch" style="background:var(--violet)"></i><span>${escapeHtml(m.name)} · ${pct(m.share)}</span><b>${compact(m.tokens)}</b></div>`).join('')||'<div class="empty">无模型明细</div>'}</div></div>`)
+      } catch(error){showToast(error.message)}
+    }
+    async function openAccount(name) {
+      openDrawer(maskName(name),'<div class="empty">正在读取…</div>')
+      try { const data=await api(`/api/account?name=${encodeURIComponent(name)}&${buildQuery({account:name})}`),s=data.summary,models=data.models||[],daily=data.daily||[]
+        openDrawer(maskName(name),`<div class="drawer-kpis"><div class="drawer-kpi"><span>Token</span><b>${compact(s.tokens,2)}</b></div><div class="drawer-kpi"><span>成本</span><b>${estimatedMark(s.estimated)}${money(s.cost)}</b></div><div class="drawer-kpi"><span>请求</span><b>${estimatedMark(s.estimated)}${compact(s.requests)}</b></div><div class="drawer-kpi"><span>活跃天</span><b>${s.active_days}</b></div><div class="drawer-kpi"><span>缓存命中</span><b>${pct(s.cache_hit_rate)}</b></div><div class="drawer-kpi"><span>Token/请求</span><b>${compact(s.tokens_per_request)}</b></div></div><div class="drawer-section"><h3>模型分布</h3><div class="breakdown-list">${models.map(m=>`<div class="breakdown-row"><i class="swatch" style="background:var(--violet)"></i><span>${escapeHtml(m.name)} · ${pct(m.share)}</span><b>${compact(m.tokens)}</b></div>`).join('')||'<div class="empty">无模型明细</div>'}</div></div><div class="drawer-section"><h3>每日使用</h3><div class="table-wrap"><table><thead><tr><th>日期</th><th>来源</th><th style="text-align:right">Token</th><th style="text-align:right">成本</th><th style="text-align:right">请求</th></tr></thead><tbody>${daily.filter(x=>x.tokens||x.requests||x.cost).map(x=>`<tr><td>${x.date}</td><td>${sourceChip(x.source)}</td><td class="num">${compact(x.tokens)}</td><td class="num">${estimatedMark(x.estimated)}${money(x.cost)}</td><td class="num">${estimatedMark(x.estimated)}${compact(x.requests)}</td></tr>`).join('')}</tbody></table></div></div>`)
+      } catch(error){showToast(error.message)}
+    }
+
+    function scheduleAutoRefresh() { clearInterval(state.autoTimer);const seconds=Number($('autoRefresh').value||0);localStorage.setItem('tp-auto-refresh',seconds);if(seconds)state.autoTimer=setInterval(()=>loadDashboard(false),seconds*1000) }
+    function download(kind,format) { location.href=`/api/export.${format}?${buildQuery({kind})}` }
+    function positionExportMenu() { const rect=$('exportBtn').getBoundingClientRect(),menu=$('exportMenu');menu.style.top=(rect.bottom+6)+'px';menu.style.left=Math.max(8,rect.right-190)+'px' }
+
+    document.querySelectorAll('#rangeTabs button').forEach(btn=>btn.addEventListener('click',()=>{state.range=btn.dataset.range;document.querySelectorAll('#rangeTabs button').forEach(x=>x.classList.toggle('active',x===btn));$('customDates').classList.toggle('visible',state.range==='custom');if(state.range!=='custom'||($('startDate').value&&$('endDate').value))loadDashboard()}))
+    document.querySelectorAll('#metricTabs button').forEach(btn=>btn.addEventListener('click',()=>{state.metric=btn.dataset.metric;document.querySelectorAll('#metricTabs button').forEach(x=>x.classList.toggle('active',x===btn));renderTrend();renderHeatmap();renderPeriod()}))
+    document.querySelectorAll('#periodTabs button').forEach(btn=>btn.addEventListener('click',()=>{state.period=btn.dataset.period;document.querySelectorAll('#periodTabs button').forEach(x=>x.classList.toggle('active',x===btn));renderPeriod()}))
+    $('sourceSelect').addEventListener('change',()=>{state.source=$('sourceSelect').value;loadDashboard()})
+    $('modelSelect').addEventListener('change',()=>{state.model=$('modelSelect').value;loadDashboard()})
+    $('accountInput').addEventListener('change',()=>{state.account=$('accountInput').value.trim();loadDashboard()})
+    $('accountInput').addEventListener('keydown',event=>{if(event.key==='Enter'){state.account=$('accountInput').value.trim();loadDashboard()}})
+    $('startDate').addEventListener('change',()=>{if($('startDate').value&&$('endDate').value)loadDashboard()});$('endDate').addEventListener('change',()=>{if($('startDate').value&&$('endDate').value)loadDashboard()})
+    $('compareSwitch').addEventListener('click',()=>{state.compare=!state.compare;$('compareSwitch').classList.toggle('active',state.compare);$('compareSwitch').setAttribute('aria-checked',String(state.compare));$('compareLabel').textContent=state.compare?'开启':'关闭';renderTrend()})
+    $('autoRefresh').value=localStorage.getItem('tp-auto-refresh')||'30';$('autoRefresh').addEventListener('change',scheduleAutoRefresh)
+    $('refreshBtn').addEventListener('click',()=>loadDashboard(true))
+    $('privacyBtn').addEventListener('click',()=>{state.privacy=!state.privacy;$('privacyBtn').style.color=state.privacy?'var(--gold)':'';renderAccounts();if($('drawer').classList.contains('open'))closeDrawer()})
+    $('themeBtn').addEventListener('click',()=>{state.theme=state.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=state.theme;localStorage.setItem('tp-theme',state.theme);renderAll()})
+    $('accountSearch').addEventListener('input',renderAccounts);$('clearAccountBtn').addEventListener('click',()=>{$('accountSearch').value='';state.account='';$('accountInput').value='';renderAccounts();if(state.data?.meta.account)loadDashboard()})
+    document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>{const key=th.dataset.sort;state.accountSort={key,direction:state.accountSort.key===key?-state.accountSort.direction:(['account_name','source','last_date'].includes(key)?1:-1)};renderAccounts()}))
+    $('trendChart').addEventListener('mousemove',trendMove);$('trendChart').addEventListener('mouseleave',()=>$('trendTooltip').classList.remove('visible'));$('trendChart').addEventListener('click',event=>{const chart=$('trendChart')._chart;if(!chart)return;const rect=$('trendChart').getBoundingClientRect(),x=event.clientX-rect.left;let best=0,dist=Infinity;chart.points.forEach((p,i)=>{if(Math.abs(p.x-x)<dist){best=i;dist=Math.abs(p.x-x)}});openDay(chart.rows[best].date)})
+    $('periodChart').addEventListener('mousemove',periodMove);$('periodChart').addEventListener('mouseleave',()=>$('periodTooltip').classList.remove('visible'))
+    $('drawerClose').addEventListener('click',closeDrawer);$('drawerBackdrop').addEventListener('click',closeDrawer);document.addEventListener('keydown',event=>{if(event.key==='Escape'){closeDrawer();$('exportMenu').classList.remove('open')}})
+    $('exportBtn').addEventListener('click',event=>{event.stopPropagation();positionExportMenu();$('exportMenu').classList.toggle('open')});$('exportMenu').addEventListener('click',event=>{const spec=event.target.dataset.export;if(!spec)return;const [kind,format]=spec.split(':');download(kind,format);$('exportMenu').classList.remove('open')});document.addEventListener('click',event=>{if(!event.target.closest('#exportMenu')&&!event.target.closest('#exportBtn'))$('exportMenu').classList.remove('open')})
+    let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(state.data){renderTrend();renderComposition();renderPeriod()}},120)})
+
+    restoreUrl();scheduleAutoRefresh();loadDashboard()
+  </script>
+</body>
+</html>
