@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import json
@@ -11,13 +11,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-
 import tkinter.font as tkfont
-
-try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageTk
-except Exception:  # Pillow optional: fall back to flat canvas drawing
-    Image = ImageDraw = ImageFilter = ImageTk = None
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
@@ -3937,83 +3931,75 @@ class Sub2APIClient:
 
 
 class Theme:
-    """Aurora console palette: quiet navy neutrals, one mint live accent, editorial hierarchy."""
+    """Graphite telemetry palette with clear live, data, and warning roles."""
     # ── base surfaces ──
-    bg_dark = "#0B0E14"
-    bg_card = "#0F131B"
-    bg_section = "#141A28"
-    bg_lift = "#1A2233"
-    bg_hover = "#212C44"
+    bg_dark = "#111417"
+    bg_card = "#171B1F"
+    bg_section = "#1D2328"
+    bg_lift = "#242C32"
+    bg_hover = "#2B353C"
 
     # ── signature accents ──
-    live = "#45DDAE"
-    data = "#5EB3F7"
-    warn = "#DFAF5D"
-    coral = "#DF666E"
+    live = "#58D6AD"
+    data = "#78A8FF"
+    warn = "#F2BF62"
+    coral = "#FF756B"
 
     # Compatibility aliases used by the drawing code.
-    amber_dim = "#123A44"
+    amber_dim = "#28584F"
     amber = live
-    amber_bright = "#EDF2F7"
-    amber_glow = "#8FCBF5"
+    amber_bright = "#F4F2ED"
+    amber_glow = "#A7C2FF"
     cyan = data
-    cyan_dim = "#1A3A52"
-    violet = "#A793E0"
-    blue = "#5E8FE0"
+    cyan_dim = "#29424C"
+    violet = "#C7A6FF"
+    blue = "#5A83D8"
 
     # ── text ──
-    text_primary = "#EBEEF4"
-    text_secondary = "#A1ABBA"
-    text_muted = "#7E8A9C"
+    text_primary = "#F4F2ED"
+    text_secondary = "#C1C8CB"
+    text_muted = "#98A2A8"
 
     # ── semantic ──
     accent_cyan = data
     accent_red = coral
     accent_green = live
-    quota_red_bg = "#2A181F"
-    quota_amber_bg = "#292114"
-    quota_green_bg = "#10251E"
-    ag_bg = "#0C1018"
-    ag_surface = "#121828"
-    ag_surface_hover = "#182238"
-    ag_border = "#1F2940"
-    ag_divider = "#1B2436"
+    quota_red_bg = "#3B2527"
+    quota_amber_bg = "#3A3122"
+    quota_green_bg = "#20352F"
+    ag_bg = "#151A1E"
+    ag_surface = "#1D2328"
+    ag_surface_hover = "#29333A"
+    ag_border = "#303A41"
+    ag_divider = "#2A3238"
     ag_accent = data
-    ag_bar = "#6FBBF8"
+    ag_bar = "#82AFFF"
     ag_success = live
     ag_warn = warn
     ag_crit = coral
-    ag_muted = "#656F7E"
-    ag_input = "#63C8D8"
+    ag_muted = "#929CA2"
+    ag_input = "#83D4E4"
     ag_cache = data
-    ag_output = "#A793E0"
+    ag_output = "#C7A6FF"
     ag_reason = warn
 
-    # ── legacy chrome attrs (kept for compatibility) ──
-    grid = "#0F131B"
-    bracket = "#2A3852"
-    trace_idle = "#26506E"
-
     # ── misc ──
-    border = "#1D2739"
-    shadow = "#04060A"
+    border = "#303940"
+    shadow = "#080A0C"
     transparent = "#010203"
 
-    # ── fonts (family or (candidates...), size, weight) ──
-    font_title = ("Bahnschrift", 17, "bold")
-    font_hero = ("Microsoft YaHei UI", 12, "bold")
+    # ── fonts (family, size, weight) ──
+    font_title = ("Bahnschrift", 19, "bold")
+    font_hero = ("Microsoft YaHei UI", 11, "bold")
     font_section = ("Microsoft YaHei UI", 10, "bold")
     font_label = ("Microsoft YaHei UI", 9, "normal")
     font_label_bold = ("Microsoft YaHei UI", 9, "bold")
-    font_badge = ("Microsoft YaHei UI", 8, "bold")
-    font_value = (("Bahnschrift SemiLight", "Bahnschrift", "Segoe UI Variable", "Segoe UI"), 23, "normal")
-    font_value_sm = (("Bahnschrift SemiLight", "Bahnschrift", "Segoe UI Variable", "Segoe UI"), 17, "normal")
-    font_value_xs = (("Bahnschrift SemiLight", "Bahnschrift", "Segoe UI Variable", "Segoe UI"), 12, "normal")
-    font_display = (("Bahnschrift SemiLight", "Bahnschrift", "Segoe UI Variable", "Segoe UI"), 28, "normal")
+    font_value = ("Bahnschrift", 19, "bold")
+    font_value_sm = ("Bahnschrift", 14, "bold")
+    font_value_xs = ("Bahnschrift", 12, "bold")
     font_tiny = ("Microsoft YaHei UI", 8, "normal")
     font_micro = ("Microsoft YaHei UI", 8, "normal")
-    font_data = ("Cascadia Mono", 9, "normal")
-    font_eyebrow = ("Cascadia Mono", 8, "bold")
+    font_data = ("Cascadia Mono", 8, "normal")
     font_delta = ("Cascadia Mono", 10, "bold")
     font_icon = ("Segoe Fluent Icons", 10, "normal")
 
@@ -4149,6 +4135,7 @@ class FloatingMonitorApp:
         self._topmost_repair_scheduled = False
         self._ignore_configure = False
         self._current_day_key = today_key()
+
         # ── root window ──
         self.root = tk.Tk()
         self.root.title("Token Monitor")
@@ -4173,7 +4160,6 @@ class FloatingMonitorApp:
         )
         self.canvas.pack(fill="both", expand=True)
 
-
         # ── fonts (resolved) ──
         self._fonts: dict[str, tkfont.Font] = {}
         available_fonts = {family.casefold(): family for family in tkfont.families(self.root)}
@@ -4182,7 +4168,7 @@ class FloatingMonitorApp:
             if attr.startswith("font_"):
                 family, size, weight = getattr(Theme, attr)
                 if attr == "font_icon":
-                    icon_family = available_fonts.get(str(family).casefold())
+                    icon_family = available_fonts.get(family.casefold())
                     if not icon_family:
                         icon_family = available_fonts.get("segoe mdl2 assets")
                     if icon_family:
@@ -4191,19 +4177,23 @@ class FloatingMonitorApp:
                     else:
                         family = "Segoe UI Symbol"
                 else:
-                    candidates = list(family) if isinstance(family, (tuple, list)) else [family]
-                    if attr in {"font_data", "font_eyebrow"}:
-                        candidates.extend(("Consolas", "Segoe UI"))
-                    else:
-                        candidates.extend(("Segoe UI Variable", "Segoe UI"))
-                    family = next(
-                        (
-                            available_fonts[name.casefold()]
-                            for name in candidates
-                            if name.casefold() in available_fonts
-                        ),
-                        candidates[0],
-                    )
+                    resolved_family = available_fonts.get(family.casefold())
+                    if not resolved_family:
+                        if attr == "font_data":
+                            fallback_names = ("Consolas", "Segoe UI")
+                        elif attr in {"font_title", "font_value", "font_value_sm", "font_value_xs"}:
+                            fallback_names = ("Segoe UI Variable", "Segoe UI")
+                        else:
+                            fallback_names = ("Segoe UI Variable", "Segoe UI")
+                        resolved_family = next(
+                            (
+                                available_fonts[name.casefold()]
+                                for name in fallback_names
+                                if name.casefold() in available_fonts
+                            ),
+                            family,
+                        )
+                    family = resolved_family
                 self._fonts[attr] = tkfont.Font(
                     family=family, size=size, weight=weight
                 )
@@ -4231,16 +4221,6 @@ class FloatingMonitorApp:
         self._refresh_live_usage_catchup_async()
         self._schedule_midnight_refresh()
 
-    def _switch_main_tab(self, tab: str) -> bool:
-        if tab not in {"accounts", "stats"}:
-            return False
-        self._main_tab = tab
-        self._scroll_offsets[tab] = 0
-        if tab == "accounts":
-            self._scroll_offsets["active"] = 0
-        self._draw()
-        return True
-
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  GEOMETRY HELPERS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4266,117 +4246,6 @@ class FloatingMonitorApp:
             pts += [x1 + r + r * math.cos(rad), y2 - r + r * math.sin(rad)]
         return pts
 
-
-    # ── PIL-rendered surfaces (flat-canvas fallback when Pillow missing) ──
-    @staticmethod
-    def _pil_ready() -> bool:
-        return Image is not None and ImageTk is not None
-
-    @staticmethod
-    def _hex_rgb(color: str) -> tuple[int, int, int]:
-        value = str(color).lstrip("#")
-        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
-
-    @staticmethod
-    def _vertical_gradient(width: int, height: int, top: tuple, bottom: tuple):
-        gradient = Image.new("RGBA", (width, height))
-        draw = ImageDraw.Draw(gradient)
-        for yy in range(height):
-            ratio = yy / max(1, height - 1)
-            color = tuple(int(top[i] + (bottom[i] - top[i]) * ratio) for i in range(4))
-            draw.line([(0, yy), (width, yy)], fill=color)
-        return gradient
-
-    def _window_backdrop(self, W: int, H: int):
-        """Soft-shadowed rounded card with a quiet vertical gradient."""
-        if not self._pil_ready():
-            return None
-        cache = getattr(self, "_backdrop_cache", None)
-        if cache is None:
-            cache = self._backdrop_cache = {}
-        if len(cache) > 6:
-            cache.clear()
-        key = (W, H)
-        if key in cache:
-            return cache[key]
-        scale = 2
-        sw, sh = W * scale, H * scale
-        img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        shadow = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).rounded_rectangle(
-            [3 * scale, 6 * scale, (W - 1) * scale, (H - 1) * scale],
-            radius=11 * scale, fill=(0, 0, 0, 150))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(2.5 * scale))
-        img.alpha_composite(shadow)
-        card = self._vertical_gradient(sw, sh, (18, 23, 34, 255), (10, 13, 20, 255))
-        mask = Image.new("L", (sw, sh), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(
-            [scale, scale, (W - 1) * scale, (H - 4) * scale], radius=11 * scale, fill=255)
-        img.paste(card, (0, 0), mask)
-        draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle(
-            [scale, scale, (W - 1) * scale, (H - 4) * scale],
-            radius=11 * scale, outline=(39, 51, 75, 255), width=scale)
-        draw.line([(16 * scale, 2 * scale), ((W - 16) * scale, 2 * scale)],
-                  fill=(94, 179, 247, 90), width=scale)
-        photo = ImageTk.PhotoImage(img.resize((W, H), Image.LANCZOS))
-        cache[key] = photo
-        return photo
-
-    def _glass_card(self, width: int, height: int, glow: str):
-        """Hero card: gradient panel with a soft status-colored glow."""
-        if not self._pil_ready():
-            return None
-        cache = getattr(self, "_glass_cache", None)
-        if cache is None:
-            cache = self._glass_cache = {}
-        if len(cache) > 12:
-            cache.clear()
-        try:
-            glow_rgb = self._hex_rgb(glow)
-        except (ValueError, IndexError):
-            glow_rgb = self._hex_rgb(Theme.live)
-        key = (width, height, glow_rgb)
-        if key in cache:
-            return cache[key]
-        scale = 2
-        sw, sh = width * scale, height * scale
-        img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        base = self._vertical_gradient(sw, sh, (24, 31, 47, 255), (14, 19, 30, 255))
-        mask = Image.new("L", (sw, sh), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(
-            [0, 0, sw - 1, sh - 1], radius=8 * scale, fill=255)
-        img.paste(base, (0, 0), mask)
-        halo = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        ImageDraw.Draw(halo).ellipse(
-            [int(sw * 0.55), int(-sh * 0.75), int(sw * 1.35), int(sh * 0.65)],
-            fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2], 46))
-        halo = halo.filter(ImageFilter.GaussianBlur(10 * scale))
-        halo.putalpha(Image.composite(halo.getchannel("A"), Image.new("L", (sw, sh), 0), mask))
-        img.alpha_composite(halo)
-        draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle([0, 0, sw - 1, sh - 1], radius=8 * scale,
-                               outline=(47, 61, 90, 255), width=scale)
-        draw.line([(10 * scale, scale), ((width - 10) * scale, scale)],
-                  fill=(130, 160, 210, 60), width=scale)
-        photo = ImageTk.PhotoImage(img.resize((width, height), Image.LANCZOS))
-        cache[key] = photo
-        return photo
-
-    @staticmethod
-    def _halo_color(color: str) -> str:
-        return {
-            Theme.live: "#0E3A30",
-            Theme.data: "#12334A",
-            Theme.warn: "#3A2C14",
-            Theme.coral: "#3A1B20",
-        }.get(color, Theme.bg_lift)
-
-    def _draw_glow_dot(self, cx: int, cy: int, color: str) -> None:
-        self.canvas.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
-                                fill=self._halo_color(color), outline="")
-        self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline="")
-
     def _draw_rounded_rect(
         self,
         x1: int,
@@ -4398,7 +4267,7 @@ class FloatingMonitorApp:
         *,
         fill: str | None = None,
         outline: str | None = None,
-        radius: int = 3,
+        radius: int = 8,
     ) -> int:
         return self._draw_rounded_rect(
             x1,
@@ -4412,24 +4281,24 @@ class FloatingMonitorApp:
         )
 
     def _draw_header_mark(self, x: int, y: int, color: str) -> None:
-        """Compact pulse-line product mark."""
+        """Draw the compact pulse-line product mark."""
         self._draw_rounded_rect(
             x,
             y,
-            x + 22,
-            y + 22,
-            r=6,
+            x + 29,
+            y + 29,
+            r=7,
             fill=Theme.bg_section,
             outline=Theme.border,
             width=1,
         )
         points = [
-            x + 5, y + 12,
-            x + 8, y + 12,
-            x + 10, y + 8,
-            x + 13, y + 15,
-            x + 15, y + 10,
-            x + 18, y + 10,
+            x + 6, y + 16,
+            x + 10, y + 16,
+            x + 13, y + 10,
+            x + 17, y + 21,
+            x + 20, y + 14,
+            x + 24, y + 14,
         ]
         self.canvas.create_line(
             *points,
@@ -4502,7 +4371,7 @@ class FloatingMonitorApp:
                 bx + column_w,
                 segment_bottom,
                 r=1,
-                fill="#15202F",
+                fill="#183B35",
                 outline="",
                 tags=("token_flow_meter_segment",),
             )
@@ -4520,17 +4389,17 @@ class FloatingMonitorApp:
             solid_top,
             bx + column_w,
             bottom_y,
-            fill=Theme.live,
+            fill="#55E3B0",
             outline="",
             tags=("token_flow_meter_fill",),
         )
         head_colors = (
-            "#15202F",
-            "#17344A",
-            "#17565F",
-            "#1C8268",
-            "#25B28C",
-            Theme.live,
+            "#203F39",
+            "#245448",
+            "#2A6555",
+            "#32846B",
+            "#40B38A",
+            "#55E3B0",
         )
         for (band_top, band_bottom), color in zip(head_bands, head_colors):
             self.canvas.create_rectangle(
@@ -4880,7 +4749,7 @@ class FloatingMonitorApp:
             for point_x, point_y in points
             for coordinate in (x1 + point_x, y1 + point_y)
         ]
-        signal_color = Theme.live if pulses or level > 0.02 else Theme.trace_idle
+        signal_color = Theme.live if pulses or level > 0.02 else "#284B49"
         self.canvas.create_line(
             *coords,
             fill=signal_color,
@@ -4913,7 +4782,7 @@ class FloatingMonitorApp:
             for point_x, point_y in points
             for coordinate in (x1 + point_x, y1 + point_y)
         ]
-        signal_color = Theme.live if pulses or level > 0.02 else Theme.trace_idle
+        signal_color = Theme.live if pulses or level > 0.02 else "#284B49"
 
         signal_items = self.canvas.find_withtag("token_flow_trace_signal")
         if not signal_items:
@@ -4949,13 +4818,7 @@ class FloatingMonitorApp:
                 font=self._fonts["font_tiny"],
                 fill=Theme.text_muted,
             )
-        else:
-            title_w = self._text_width(title, "font_section")
-            self.canvas.create_line(
-                col_l + title_w + 10, y + 6, col_r, y + 6,
-                fill=Theme.ag_divider, width=1,
-            )
-        return y + 22
+        return y + 24
 
     def _account_rank_row_height(self) -> int:
         if self._account_range in {"5h", "7d", "cycle"}:
@@ -5036,8 +4899,8 @@ class FloatingMonitorApp:
         height = 18 * len(lines) + 8
         x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
         y = min(max(8, self._tooltip_pos[1] + 14), max(8, H - height - 8))
-        self._draw_rounded_rect(x, y, x + width, y + height, r=3,
-                                fill=Theme.bg_lift, outline=Theme.ag_border, width=1)
+        self._draw_rounded_rect(x, y, x + width, y + height, r=6,
+                                fill=Theme.bg_lift, outline=Theme.data, width=1)
         for index, line in enumerate(lines):
             self.canvas.create_text(x + 9, y + 7 + index * 18, anchor="nw",
                                     text=line, font=self._fonts["font_micro"], fill=Theme.text_primary)
@@ -5080,7 +4943,7 @@ class FloatingMonitorApp:
     def _draw_pill(self, x: int, y: int, text: str, color: str, max_w: int) -> None:
         label = self._truncate(text, "font_tiny", max_w - 14)
         width = min(max_w, self._text_width(label, "font_tiny") + 14)
-        self._draw_rounded_rect(x, y, x + width, y + 21, r=3, fill=Theme.bg_dark, outline=Theme.border)
+        self._draw_rounded_rect(x, y, x + width, y + 21, r=6, fill=Theme.bg_dark, outline=Theme.border)
         self.canvas.create_text(x + 7, y + 4, anchor="nw", text=label, font=self._fonts["font_tiny"], fill=color)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5114,24 +4977,15 @@ class FloatingMonitorApp:
         if not label:
             return 0
         color = self._health_color(label)
-        width = self._text_width(label, "font_badge") + 14
-        self.canvas.create_text(x + 1, y + 2, anchor="nw", text=label,
-                                font=self._fonts["font_badge"], fill=color)
+        width = self._text_width(label, "font_micro") + 14
+        self._draw_rounded_rect(x, y, x + width, y + 17, r=7, fill=Theme.bg_dark, outline=color)
+        self.canvas.create_text(x + 7, y + 2, anchor="nw", text=label, font=self._fonts["font_micro"], fill=color)
         return width
 
     def _draw_footer(self, W: int, H: int) -> None:
-        self.canvas.create_line(16, H - 26, W - 16, H - 26, fill=Theme.ag_divider, width=1)
-        now_str = datetime.now(CN_TZ).strftime("%H:%M:%S")
-        prefix = "SYS.CLOCK "
-        clock_text = f"{now_str} UTC+8"
-        eyebrow = self._fonts["font_eyebrow"]
-        prefix_w = eyebrow.measure(prefix)
-        total_w = prefix_w + eyebrow.measure(clock_text)
-        start_x = (W - total_w) // 2
-        self.canvas.create_text(start_x, H - 9, anchor="sw", text=prefix,
-                                font=eyebrow, fill=Theme.text_muted)
-        self.canvas.create_text(start_x + prefix_w, H - 9, anchor="sw", text=clock_text,
-                                font=eyebrow, fill=Theme.text_secondary)
+        now_str = datetime.now(CN_TZ).strftime("%H:%M:%S UTC+8")
+        self.canvas.create_text(W // 2, H - 10, anchor="s", text=now_str,
+                                font=self._fonts["font_data"], fill=Theme.text_muted)
         self.canvas.create_line(W - 18, H - 7, W - 7, H - 18, fill=Theme.border, width=1)
         self.canvas.create_line(W - 13, H - 7, W - 7, H - 13, fill=Theme.text_muted, width=1)
 
@@ -5192,37 +5046,50 @@ class FloatingMonitorApp:
 
     def _draw_main_tabs(self, col_l: int, col_r: int, y: int) -> int:
         tabs = [
-            ("main_accounts", "账号", "accounts"),
-            ("main_stats", "用量统计", "stats"),
+            ("main_accounts", "\u8d26\u53f7", "accounts"),
+            ("main_stats", "\u7528\u91cf\u7edf\u8ba1", "stats"),
         ]
-        tab_h = 26
-        tab_w = (col_r - col_l) // len(tabs)
+        gap = 2
+        tab_h = 29
+        inset = 3
+        self._draw_rounded_rect(col_l, y, col_r, y + tab_h, r=8,
+                                fill=Theme.ag_bg, outline=Theme.border)
+        inner_l = col_l + inset
+        inner_r = col_r - inset
+        total_gap = gap * (len(tabs) - 1)
+        tab_w = max(62, (inner_r - inner_l - total_gap) // len(tabs))
         for index, (button_name, label, value) in enumerate(tabs):
-            x1 = col_l + index * tab_w
-            x2 = col_r if index == len(tabs) - 1 else x1 + tab_w
-            self._btn_rects[button_name] = (x1, y, x2, y + tab_h)
+            x1 = inner_l + index * (tab_w + gap)
+            x2 = inner_r if index == len(tabs) - 1 else x1 + tab_w
+            self._btn_rects[button_name] = (x1, y + 2, x2, y + tab_h - 2)
             selected = self._main_tab == value
             hovered = self._hover_btn == button_name
-            text_color = (
-                Theme.text_primary
-                if selected
-                else (Theme.text_secondary if hovered else Theme.text_muted)
-            )
-            cx = (x1 + x2) // 2
-            self.canvas.create_text(cx, y + 4, anchor="n", text=label,
-                                    font=self._fonts["font_label_bold"], fill=text_color)
+            fill = Theme.bg_lift if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            text_color = Theme.text_primary if selected or hovered else Theme.ag_muted
+            self._draw_rounded_rect(x1, y + 3, x2, y + tab_h - 3, r=6, fill=fill, outline="")
             if selected:
-                self.canvas.create_line(cx - 16, y + tab_h - 2, cx + 16, y + tab_h - 2,
-                                        fill=Theme.data, width=2)
-        return y + tab_h + 12
+                self.canvas.create_line(
+                    x1 + 18,
+                    y + tab_h - 3,
+                    x2 - 18,
+                    y + tab_h - 3,
+                    fill=Theme.data,
+                    width=2,
+                )
+            self.canvas.create_text((x1 + x2) // 2, y + 14, anchor="center", text=label,
+                                    font=self._fonts["font_label_bold"], fill=text_color)
+        return y + tab_h + 10
 
     def _draw_ag_section(self, col_l: int, col_r: int, y: int, title: str, badge: str = "") -> int:
         self.canvas.create_text(col_l, y, anchor="nw", text=title,
                                 font=self._fonts["font_section"], fill=Theme.text_primary)
         if badge:
-            self.canvas.create_text(col_r, y + 2, anchor="ne", text=badge,
-                                    font=self._fonts["font_tiny"], fill=Theme.text_muted)
-        return y + 22
+            bw = self._text_width(badge, "font_micro") + 14
+            self._draw_rounded_rect(col_r - bw, y - 1, col_r, y + 18, r=6,
+                                    fill=Theme.ag_bg, outline=Theme.ag_border)
+            self.canvas.create_text(col_r - bw // 2, y + 8, anchor="center", text=badge,
+                                    font=self._fonts["font_tiny"], fill=Theme.ag_muted)
+        return y + 24
 
     def _draw_donut(self, x: int, y: int, size: int, pct: float, color: str, label: str) -> None:
         pct = max(0.0, min(100.0, float(pct or 0)))
@@ -5246,7 +5113,7 @@ class FloatingMonitorApp:
 
     def _draw_ag_chip(self, x: int, y: int, text: str, dot: str | None = None) -> int:
         width = self._text_width(text, "font_micro") + (24 if dot else 14)
-        self._draw_rounded_rect(x, y, x + width, y + 20, r=3, fill=Theme.ag_surface, outline=Theme.ag_border)
+        self._draw_rounded_rect(x, y, x + width, y + 20, r=8, fill=Theme.ag_surface, outline=Theme.ag_border)
         tx = x + 7
         if dot:
             self.canvas.create_oval(x + 7, y + 7, x + 13, y + 13, fill=dot, outline="")
@@ -5270,16 +5137,16 @@ class FloatingMonitorApp:
     @staticmethod
     def _activity_color(intensity: float) -> str:
         if intensity <= 0:
-            return "#151B28"
+            return "#252C31"
         if intensity < 0.18:
-            return "#173143"
+            return "#284B49"
         if intensity < 0.38:
-            return "#155061"
+            return "#347A6A"
         if intensity < 0.68:
-            return "#1D8A74"
+            return "#4FB895"
         if intensity < 0.9:
-            return "#33C398"
-        return "#7BE3C0"
+            return "#68DAB2"
+        return "#8AE9C8"
 
     def _trend_token_color(self, intensity: float, is_today: bool = False) -> str:
         if is_today:
@@ -6045,7 +5912,7 @@ class FloatingMonitorApp:
         c.create_text(col_l, legend_y + 1, anchor="nw", text="\u4f4e",
                       font=self._fonts["font_micro"], fill=Theme.ag_muted)
         legend_x = col_l + 18
-        for idx, color in enumerate(["#151B28", "#173143", "#155061", "#1D8A74", "#7BE3C0"]):
+        for idx, color in enumerate(["#252C31", "#284B49", "#347A6A", "#4FB895", "#8AE9C8"]):
             self._draw_rounded_rect(legend_x + idx * 14, legend_y, legend_x + idx * 14 + 10, legend_y + 10,
                                     r=2, fill=color, outline=Theme.ag_border)
         c.create_text(legend_x + 74, legend_y + 1, anchor="nw", text="\u9ad8",
@@ -6347,7 +6214,7 @@ class FloatingMonitorApp:
         y += 28
 
         compact_layout = H < 700
-        hero_h = 94 if compact_layout else 98
+        hero_h = 82 if compact_layout else 86
         token_x = col_l + 12
         compact_tokens = compact_number(summary["tokens"])
         delta_text, delta_color, delta_visible = self._token_delta_badge_visual()
@@ -6395,9 +6262,9 @@ class FloatingMonitorApp:
             state="normal" if delta_visible else "hidden",
             tags=("token_delta_badge",),
         )
-        c.create_text(token_x, y + 60, anchor="nw", text=exact_token_count(summary["tokens"]),
+        c.create_text(token_x, y + 50, anchor="nw", text=exact_token_count(summary["tokens"]),
                       font=self._fonts["font_data"], fill=Theme.text_secondary)
-        c.create_text(token_x, y + 77, anchor="nw", text=f"{compact_number(summary['requests'])} \u6b21\u8bf7\u6c42",
+        c.create_text(token_x, y + 67, anchor="nw", text=f"{compact_number(summary['requests'])} \u6b21\u8bf7\u6c42",
                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         c.create_line(divider_x, y + 12, divider_x, y + hero_h - 12, fill=Theme.ag_divider, width=1)
         self._draw_token_flow_meter(meter_l, y + 12, meter_r, y + hero_h - 10, bars=10)
@@ -6416,7 +6283,7 @@ class FloatingMonitorApp:
             state="normal" if cost_delta_visible else "hidden",
             tags=("cost_delta_badge",),
         )
-        c.create_text(cost_x, y + 66, anchor="nw", text=f"{summary['label']} \u65f6\u95f4\u7a97\u53e3",
+        c.create_text(cost_x, y + 58, anchor="nw", text=f"{summary['label']} \u65f6\u95f4\u7a97\u53e3",
                       font=self._fonts["font_tiny"], fill=Theme.text_secondary)
         self._add_tooltip(
             col_l,
@@ -6678,33 +6545,29 @@ class FloatingMonitorApp:
         actual_h = self.root.winfo_height()
         if actual_w > 50 and actual_h > 50 and (actual_w != W or actual_h != H):
             self._apply_window_size(W, H)
-        PAD = 16
+        PAD = 14
         COL_L = PAD
         COL_R = W - PAD
-        GAP = 12 if H >= 700 else 8
 
-        # ── window backdrop (PIL gradient card; flat fallback) ──
-        backdrop = self._window_backdrop(W, H)
-        if backdrop is not None:
-            c.create_image(0, 0, anchor="nw", image=backdrop, tags=("window_backdrop",))
-        else:
-            self._draw_rounded_rect(3, 6, W - 2, H - 2, r=10, fill=Theme.shadow, outline="")
-            self._draw_rounded_rect(0, 0, W, H - 5, r=10, fill=Theme.bg_card, outline=Theme.border, width=1)
+        # ── outer card background ──
+        self._draw_rounded_rect(3, 6, W - 2, H - 2, r=14, fill=Theme.shadow, outline="")
+        self._draw_rounded_rect(0, 0, W, H - 5, r=14, fill=Theme.bg_card, outline=Theme.border, width=1)
+        c.create_line(18, 1, W - 18, 1, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
-        #  HEADER
+        #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
         sync_state = str((self.state.usage_sync or {}).get("state") or "") if self.state else ""
         verifying_live_usage = bool(
             getattr(self, "_live_usage_verification_pending", False)
         )
-        y = 15
+        y = 12
         if self._loading:
             phase = (math.sin(self._pulse_phase) + 1.0) / 2.0
             pulse_rgb = (
-                int(24 + 29 * phase),
-                int(110 + 132 * phase),
-                int(86 + 92 * phase),
+                int(40 + 48 * phase),
+                int(88 + 126 * phase),
+                int(79 + 94 * phase),
             )
             pulse_color = "#%02x%02x%02x" % pulse_rgb
         elif verifying_live_usage:
@@ -6720,8 +6583,8 @@ class FloatingMonitorApp:
             pulse_color = Theme.text_muted
         self._draw_header_mark(COL_L, y, pulse_color)
 
-        title_x = COL_L + 32
-        c.create_text(title_x, y - 2, anchor="nw", text="Token Pulse",
+        title_x = COL_L + 39
+        c.create_text(title_x, y - 1, anchor="nw", text="Token Pulse",
                       font=self._fonts["font_title"], fill=Theme.text_primary)
 
         active_count = len(self.state.active_accounts or []) if self.state else 0
@@ -6732,9 +6595,9 @@ class FloatingMonitorApp:
             )
             updated = f"核对 {compact_number(pending_tokens)} Token"
         elif self._refresh_pending:
-            updated = "刷新已排队"
+            updated = "\u5237\u65b0\u5df2\u6392\u961f"
         else:
-            updated = "正在刷新" if self._loading else "等待刷新"
+            updated = "\u6b63\u5728\u5237\u65b0" if self._loading else "\u7b49\u5f85\u5237\u65b0"
         if (
             self.state
             and self.state.updated_at
@@ -6751,12 +6614,12 @@ class FloatingMonitorApp:
             and not verifying_live_usage
         ):
             updated = sync_label
-        subtitle = f"活跃 {active_count}  ·  {updated}"
-        c.create_text(title_x, y + 25, anchor="nw", text=subtitle,
+        subtitle = f"\u6d3b\u8dc3 {active_count}  \u00b7  {updated}"
+        c.create_text(title_x, y + 24, anchor="nw", text=subtitle,
                       font=self._fonts["font_tiny"],
                       fill=pulse_color if self.state else Theme.text_muted)
 
-        btn_y = y + 2
+        btn_y = y + 1
         close_glyph = "\ue8bb" if self._fluent_icons else "\u00d7"
         pin_glyph = (
             ("\ue718" if self._pinned else "\ue77a")
@@ -6765,14 +6628,14 @@ class FloatingMonitorApp:
         )
         refresh_glyph = "\ue72c" if self._fluent_icons else "\u21bb"
         btn_specs = [
-            ("btn_close", close_glyph, COL_R - 11, "关闭"),
+            ("btn_close", close_glyph, COL_R - 11, "\u5173\u95ed"),
             (
                 "btn_pin",
                 pin_glyph,
                 COL_R - 37,
-                "取消置顶" if self._pinned else "保持置顶",
+                "\u53d6\u6d88\u7f6e\u9876" if self._pinned else "\u4fdd\u6301\u7f6e\u9876",
             ),
-            ("btn_refresh", refresh_glyph, COL_R - 63, "刷新数据"),
+            ("btn_refresh", refresh_glyph, COL_R - 63, "\u5237\u65b0\u6570\u636e"),
         ]
         self._btn_rects.clear()
         for name, glyph, bx, tooltip in btn_specs:
@@ -6782,18 +6645,18 @@ class FloatingMonitorApp:
             is_hover = self._hover_btn == name
             bg = Theme.bg_hover if is_hover else ""
             if bg:
-                self._draw_rounded_rect(bx1, by1, bx2, by2, r=5, fill=bg, outline="")
-            fg = Theme.text_primary if is_hover else Theme.text_muted
+                self._draw_rounded_rect(bx1, by1, bx2, by2, r=6, fill=bg, outline="")
+            fg = Theme.text_primary if is_hover else Theme.text_secondary
             if name == "btn_close":
-                fg = Theme.accent_red if is_hover else Theme.text_muted
+                fg = Theme.accent_red if is_hover else Theme.text_secondary
             elif name == "btn_refresh" and (self._loading or self._refresh_pending):
                 fg = Theme.live
-            c.create_text(bx, btn_y + 9, text=glyph, font=self._fonts["font_icon"],
+            c.create_text(bx, btn_y + 8, text=glyph, font=self._fonts["font_icon"],
                            fill=fg, anchor="center")
 
-        y = 60
+        y = 55
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
-        y += 6
+        y += 8
         y = self._draw_main_tabs(COL_L, COL_R, y)
         if self._main_tab == "stats":
             self._draw_usage_stats_page(COL_L, COL_R, y, H)
@@ -6802,10 +6665,10 @@ class FloatingMonitorApp:
             return
 
         # ════════════════════════════════════════════════════════
-        #  CURRENT CHANNEL HERO (glass card, big number, ECG strip)
+        #  CURRENT CHANNEL HERO
         # ════════════════════════════════════════════════════════
-        y += 6
-        hero_h = 116 if H >= 700 else 108
+        y += 8
+        self._draw_panel(COL_L, y, COL_R, y + 72, fill=Theme.bg_section, radius=8)
         all_active_accounts = list(self.state.active_accounts or []) if self.state else []
         accounts = all_active_accounts
         latest_name = self.state.latest_account_name if self.state else ""
@@ -6814,66 +6677,65 @@ class FloatingMonitorApp:
             raw_hero_name = accounts[0].get("name", latest_name or "-")
             hero_name = ranking_account_display_name(str(raw_hero_name))
             hero_type = account_type_label(accounts[0], raw_hero_name)
-            hero_sub = f"{len(all_active_accounts)} 个账号在线  ·  路由正常"
+            hero_sub = f"{len(all_active_accounts)} \u4e2a\u8d26\u53f7\u5728\u7ebf  \u00b7  \u8def\u7531\u6b63\u5e38"
             if hero_type:
-                hero_sub = f"{hero_type}  ·  {hero_sub}"
+                hero_sub = f"{hero_type}  \u00b7  {hero_sub}"
             hero_color = Theme.accent_green
         else:
             status, _model, ago, color = self._latest_status()
             hero_name = ranking_account_display_name(str(latest_name)) if latest_name else (
-                "正在读取数据"
+                "\u6b63\u5728\u8bfb\u53d6\u6570\u636e"
                 if self._loading or not self.state
-                else "暂无数据"
+                else "\u6682\u65e0\u6570\u636e"
             )
             hero_sub = (
-                f"最近 {status}  ·  {ago}"
+                f"\u6700\u8fd1 {status}  \u00b7  {ago}"
                 if status != "-"
-                else ("初始化中" if self._loading or not self.state else "暂无活跃请求")
+                else ("\u521d\u59cb\u5316\u4e2d" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42")
             )
             hero_color = color if status != "-" else Theme.cyan
-        glass = self._glass_card(COL_R - COL_L, hero_h, hero_color)
-        if glass is not None:
-            c.create_image(COL_L, y, anchor="nw", image=glass, tags=("hero_glass",))
-        else:
-            self._draw_panel(COL_L, y, COL_R, y + hero_h, fill=Theme.bg_section, radius=8)
-        hx = COL_L + 16
-        c.create_text(hx, y + 12, anchor="nw", text="当前路由",
+        metric_l = COL_R - 72
+        c.create_rectangle(COL_L, y + 12, COL_L + 3, y + 60, fill=hero_color, outline="")
+        c.create_oval(COL_L + 13, y + 13, COL_L + 21, y + 21, fill=hero_color, outline="")
+        c.create_text(COL_L + 28, y + 10, anchor="nw", text="\u5f53\u524d\u8def\u7531",
                       font=self._fonts["font_tiny"], fill=Theme.text_muted)
-        source_label = (
-            hero_type
-            if accounts and hero_type
-            else (
+        self._draw_token_flow_trace(COL_L + 92, y + 5, metric_l - 12, y + 26)
+        display_name = self._truncate(str(hero_name), "font_hero", metric_l - COL_L - 42)
+        c.create_text(COL_L + 14, y + 29, anchor="nw", text=display_name,
+                      font=self._fonts["font_hero"], fill=Theme.text_primary)
+        c.create_text(COL_L + 14, y + 52, anchor="nw", text=hero_sub,
+                      font=self._fonts["font_tiny"], fill=hero_color)
+        if display_name != str(hero_name):
+            self._add_tooltip(COL_L + 14, y + 27, metric_l - 8, y + 48, str(hero_name))
+        c.create_line(metric_l, y + 13, metric_l, y + 59, fill=Theme.ag_divider, width=1)
+        metric_x = (metric_l + COL_R) // 2
+        metric_value_y = y + 17
+        metric_label_y = y + 44
+        if not accounts:
+            source_label = (
                 "DIRECT"
                 if self.state and self.state.client_usage
                 else str(self.state.source_label if self.state else "WAIT").upper()
             )
-        )
-        source_drawn = self._truncate(source_label, "font_data", 64)
-        c.create_text(COL_R - 16, y + 13, anchor="ne", text=source_drawn,
-                      font=self._fonts["font_data"], fill=Theme.data)
-        hero_value = compact_number(total_current)
-        value_w = self._text_width(hero_value, "font_display")
-        reserve_w = max(value_w, self._text_width(source_drawn, "font_data")) + 16
-        display_name = self._truncate(str(hero_name), "font_hero", COL_R - reserve_w - hx - 28)
-        self._draw_glow_dot(hx + 4, y + 41, hero_color)
-        c.create_text(hx + 14, y + 33, anchor="nw", text=display_name,
-                      font=self._fonts["font_hero"], fill=Theme.text_primary)
-        if display_name != str(hero_name):
-            self._add_tooltip(hx + 14, y + 31, COL_R - reserve_w - 4, y + 50, str(hero_name))
-        c.create_text(hx + 14, y + 53, anchor="nw", text=hero_sub,
-                      font=self._fonts["font_tiny"], fill=hero_color)
-        c.create_text(COL_R - 16, y + 30, anchor="ne", text=hero_value,
-                      font=self._fonts["font_display"], fill=Theme.text_primary)
-        c.create_text(COL_R - 16, y + 66, anchor="ne", text="并发",
+            c.create_text(metric_x, y + 9, anchor="n",
+                          text=self._truncate(source_label, "font_data", 54),
+                          font=self._fonts["font_data"], fill=Theme.data)
+            metric_value_y = y + 28
+            metric_label_y = y + 51
+        c.create_text(metric_x, metric_value_y, anchor="n", text=compact_number(total_current),
+                      font=self._fonts["font_value_sm"], fill=Theme.text_primary)
+        c.create_text(metric_x, metric_label_y, anchor="n", text="\u5e76\u53d1",
                       font=self._fonts["font_tiny"], fill=Theme.text_muted)
-        self._draw_token_flow_trace(hx, y + hero_h - 30, COL_R - 16, y + hero_h - 10)
-        y += hero_h + GAP + 4
+        y += 82
 
         # ════════════════════════════════════════════════════════
-        #  ACTIVE ACCOUNTS (flat rows, hairline dividers)
+        #  ACTIVE ACCOUNTS
         # ════════════════════════════════════════════════════════
         section_y = y
-        y = self._draw_section_label(COL_L, COL_R, y, "当前活跃")
+        c.create_text(COL_L, section_y, anchor="nw", text="\u5f53\u524d\u6d3b\u8dc3",
+                      font=self._fonts["font_section"], fill=Theme.text_primary)
+
+        y += 24
         active_row_h = 26
         default_height = int(type(self).HEIGHT)
         base_capacity = 1 + max(
@@ -6905,15 +6767,15 @@ class FloatingMonitorApp:
             last_active_index = first_active_index + len(visible_accounts)
             c.create_text(
                 COL_R,
-                section_y + 2,
+                section_y + 1,
                 anchor="ne",
                 text=f"{first_active_index + 1}-{last_active_index}/{len(accounts)}",
-                font=self._fonts["font_eyebrow"],
+                font=self._fonts["font_micro"],
                 fill=Theme.text_muted,
             )
 
         if not accounts:
-            c.create_text(COL_L, y + 2, anchor="nw", text=("正在读取账号状态" if self._loading or not self.state else "暂无活跃"),
+            c.create_text(COL_L + 8, y, anchor="nw", text=("\u6b63\u5728\u8bfb\u53d6\u8d26\u53f7\u72b6\u6001" if self._loading or not self.state else "\u6682\u65e0\u6d3b\u8dc3"),
                            font=self._fonts["font_label"], fill=Theme.text_muted)
             y += 20
         else:
@@ -6926,30 +6788,31 @@ class FloatingMonitorApp:
                 active_list_bottom,
             )
 
-        for row_i, acc in enumerate(visible_accounts):
+        for acc in visible_accounts:
             raw_name = str(acc.get("name") or "-")
             full_name = ranking_account_display_name(raw_name)
             type_badge = account_type_label(acc, raw_name)
             cur = acc.get("current", 0)
             mx = acc.get("max", 1)
-            type_w = self._text_width(type_badge, "font_badge") + 14 if type_badge else 0
-            name_x = COL_L + (type_w if type_badge else 0)
-            frac_text = f"{compact_number(cur)}/{compact_number(mx)}"
-            frac_w = self._text_width(frac_text, "font_data")
-            name_max_w = max(60, COL_R - frac_w - 14 - name_x)
+            pill_w = 54
+            type_w = self._text_width(type_badge, "font_micro") + 14 if type_badge else 0
+            name_x = COL_L + 8 + (type_w + 6 if type_badge else 0)
+            pill_left = COL_R - pill_w
+            name_max_w = max(60, pill_left - name_x - 10)
             name = self._truncate(full_name, "font_label", name_max_w)
 
             if type_badge:
-                self._draw_health_badge(COL_L, y + 3, type_badge)
-            c.create_text(name_x, y + 4, anchor="nw", text=name,
+                self._draw_health_badge(COL_L + 8, y - 1, type_badge)
+            c.create_text(name_x, y, anchor="nw", text=name,
                            font=self._fonts["font_label"], fill=Theme.text_primary)
             if name != full_name:
-                self._add_tooltip(name_x, y + 2, COL_R - frac_w - 12, y + 22, full_name)
-            c.create_text(COL_R, y + 8, anchor="ne", text=frac_text,
-                           font=self._fonts["font_data"], fill=Theme.accent_green)
+                self._add_tooltip(name_x, y, pill_left - 8, y + 21, full_name)
+            frac_text = f"{compact_number(cur)}/{compact_number(mx)}"
+            self._draw_rounded_rect(COL_R - pill_w, y - 2, COL_R - 4, y + 21, r=8,
+                                    fill=Theme.bg_section, outline=Theme.border)
+            c.create_text(COL_R - 4 - pill_w / 2, y + 9, anchor="center", text=frac_text,
+                           font=self._fonts["font_label_bold"], fill=Theme.accent_green)
             y += active_row_h
-            if row_i < len(visible_accounts) - 1:
-                c.create_line(COL_L, y - 2, COL_R, y - 2, fill=Theme.ag_divider, width=1)
 
         if active_scroll_limit > 0 and self._active_scroll_rect is not None:
             self._draw_list_scrollbar(
@@ -6962,15 +6825,16 @@ class FloatingMonitorApp:
                 active_scroll_limit,
             )
 
-        y += 6
+        y += 4
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
         #  LATEST REQUEST
         # ════════════════════════════════════════════════════════
-        y += GAP
-        y = self._draw_section_label(COL_L, COL_R, y, "最近请求")
-        request_h = 50
+        y += 10
+        y = self._draw_section_label(COL_L, COL_R, y, "\u6700\u8fd1\u8bf7\u6c42")
+        request_h = 52
+        self._draw_panel(COL_L, y, COL_R, y + request_h, fill=Theme.ag_surface, radius=7)
 
         if self.state and self.state.latest_request:
             req = self.state.latest_request
@@ -6983,78 +6847,81 @@ class FloatingMonitorApp:
             raw_acct = self.state.latest_account_name or "-"
             acct = ranking_account_display_name(raw_acct)
             acct_type = account_type_label(name=raw_acct)
-            status_text = "错误" if kind == "error" else ("成功" if kind else "-")
+            status_text = "\u9519\u8bef" if kind == "error" else ("\u6210\u529f" if kind else "-")
             status_color = Theme.accent_red if kind == "error" else Theme.accent_green
 
-            status_w = self._text_width(status_text, "font_tiny")
-            c.create_oval(COL_R - status_w - 13, y + 6, COL_R - status_w - 7, y + 12,
+            status_w = self._text_width(status_text, "font_tiny") + 22
+            status_x = COL_R - status_w - 9
+            self._draw_rounded_rect(status_x, y + 8, COL_R - 9, y + 27, r=6,
+                                    fill=Theme.bg_dark, outline=Theme.border)
+            c.create_oval(status_x + 7, y + 14, status_x + 13, y + 20,
                           fill=status_color, outline="")
-            c.create_text(COL_R, y + 3, anchor="ne", text=status_text,
+            c.create_text(status_x + 17, y + 11, anchor="nw", text=status_text,
                           font=self._fonts["font_tiny"], fill=status_color)
-            account_type_w = self._text_width(acct_type, "font_badge") + 14 if acct_type else 0
-            account_x = COL_L + (account_type_w if acct_type else 0)
-            account_text = self._truncate(acct, "font_label_bold", COL_R - status_w - 26 - account_x)
+            account_type_w = self._text_width(acct_type, "font_micro") + 14 if acct_type else 0
+            account_x = COL_L + 10 + (account_type_w + 6 if acct_type else 0)
+            account_text = self._truncate(acct, "font_label_bold", status_x - account_x - 6)
             if acct_type:
-                self._draw_health_badge(COL_L, y + 1, acct_type)
-            c.create_text(account_x, y + 2, anchor="nw", text=account_text,
+                self._draw_health_badge(COL_L + 10, y + 8, acct_type)
+            c.create_text(account_x, y + 9, anchor="nw", text=account_text,
                           font=self._fonts["font_label_bold"], fill=Theme.text_primary)
             if account_text != acct:
-                self._add_tooltip(account_x, y, COL_R - status_w - 24, y + 20, acct)
-            c.create_text(COL_L, y + 28, anchor="nw", text="MODEL",
+                self._add_tooltip(COL_L + 10, y + 7, status_x - 6, y + 27, acct)
+            c.create_text(COL_L + 10, y + 32, anchor="nw", text="MODEL",
                           font=self._fonts["font_data"], fill=Theme.text_muted)
-            c.create_text(COL_L + 40, y + 27, anchor="nw",
-                          text=self._truncate(model, "font_data", COL_R - COL_L - 130),
+            c.create_text(COL_L + 54, y + 31, anchor="nw",
+                          text=self._truncate(model, "font_data", COL_R - COL_L - 142),
                           font=self._fonts["font_data"], fill=Theme.data)
-            c.create_text(COL_R, y + 27, anchor="ne",
+            c.create_text(COL_R - 10, y + 31, anchor="ne",
                           text=relative_time(created) if created else "-",
                           font=self._fonts["font_tiny"], fill=Theme.text_muted)
         else:
             empty_request = (
-                "正在读取最近请求"
+                "\u6b63\u5728\u8bfb\u53d6\u6700\u8fd1\u8bf7\u6c42"
                 if self._loading or not self.state
-                else "暂无请求记录"
+                else "\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55"
             )
-            c.create_text(COL_L, y + 16, anchor="nw", text=empty_request,
+            c.create_text(COL_L + 10, y + 17, anchor="nw", text=empty_request,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
 
-        y += request_h + 6
+        y += request_h + 8
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
-        #  TODAY STATS (open columns, large light numerals)
+        #  TODAY STATS
         # ════════════════════════════════════════════════════════
-        y += GAP
+        y += 10
         source_text = ""
         if self.state and self.state.client_usage:
             client_tokens = int(self.state.client_usage.get("tokens") or 0)
             client_requests = int(self.state.client_usage.get("requests") or 0)
             if client_tokens or client_requests:
-                source_text = f"总量 {compact_number(client_tokens)} tok"
+                source_text = f"\u603b\u91cf {compact_number(client_tokens)} tok"
         elif self.state and self.state.usage_note:
             source_text = self._truncate(self.state.usage_note, "font_tiny", 180)
-        y = self._draw_section_label(COL_L, COL_R, y, "今日概览", source_text)
+        y = self._draw_section_label(COL_L, COL_R, y, "\u4eca\u65e5\u6982\u89c8", source_text)
 
         today_requests = int(self.state.today_requests or 0) if self.state else 0
         today_tokens = int(self.state.today_tokens or 0) if self.state else 0
         today_cost = float(self.state.today_account_cost or 0) if self.state else 0.0
         stats = [
             (
-                "请求",
+                "\u8bf7\u6c42",
                 compact_number(today_requests),
                 Theme.amber_bright,
-                f"今日请求\n{today_requests:,} 次",
+                f"\u4eca\u65e5\u8bf7\u6c42\n{today_requests:,} \u6b21",
             ),
             (
                 "Token",
                 compact_number(today_tokens),
                 Theme.cyan,
-                f"今日 Token\n{exact_token_count(today_tokens)} Token",
+                f"\u4eca\u65e5 Token\n{exact_token_count(today_tokens)} Token",
             ),
             (
-                "成本",
+                "\u6210\u672c",
                 money(today_cost),
                 Theme.warn,
-                f"今日成本\n{money(today_cost)}",
+                f"\u4eca\u65e5\u6210\u672c\n{money(today_cost)}",
             ),
         ]
         overview_width = COL_R - COL_L
@@ -7064,13 +6931,14 @@ class FloatingMonitorApp:
             COL_L + round(overview_width * 0.64),
             COL_R,
         )
-        col_w = (COL_R - COL_L) // 3
+        col_w = overview_width // 3
+        self._draw_panel(COL_L, y - 5, COL_R, y + 43, fill=Theme.ag_surface, radius=7)
         for i, (lbl, val, color, tooltip) in enumerate(stats):
             stat_x1 = column_edges[i]
             stat_x2 = column_edges[i + 1]
             cx = (stat_x1 + stat_x2) // 2
             if i:
-                c.create_line(stat_x1, y + 5, stat_x1, y + 43,
+                c.create_line(stat_x1, y + 2, stat_x1, y + 36,
                               fill=Theme.ag_divider, width=1)
             available_width = max(32, stat_x2 - stat_x1 - 10)
             display_value = val
@@ -7092,17 +6960,14 @@ class FloatingMonitorApp:
             value_y = y + (3 if value_font_key != "font_value" else 0)
             c.create_text(cx, value_y, anchor="n", text=display_value,
                            font=self._fonts[value_font_key], fill=color)
-            c.create_text(cx, y + 31, anchor="n", text=lbl,
-                           font=self._fonts["font_tiny"], fill=Theme.text_muted)
-            self._add_tooltip(stat_x1, y - 4, stat_x2, y + 46, tooltip)
+            c.create_text(cx, y + 26, anchor="n", text=lbl,
+                           font=self._fonts["font_tiny"], fill=Theme.text_secondary)
+            self._add_tooltip(stat_x1, y - 5, stat_x2, y + 43, tooltip)
 
-        y += 56
+        y += 50
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
-        # ════════════════════════════════════════════════════════
-        #  TOKEN TREND
-        # ════════════════════════════════════════════════════════
-        y += GAP
+        y += 10
         history = (self.state.cost_history if self.state else None) or summarize_trend_rows([])
         seven_day_tokens = float(history.get("seven_day_tokens") or 0)
         trend_header_y = y
@@ -7111,7 +6976,7 @@ class FloatingMonitorApp:
             COL_L,
             COL_R,
             y,
-            "Token 趋势",
+            "Token \u8d8b\u52bf",
             trend_meta,
         )
         trend_meta_width = self._text_width(trend_meta, "font_tiny")
@@ -7120,29 +6985,29 @@ class FloatingMonitorApp:
             trend_header_y,
             COL_R,
             trend_header_y + 22,
-            f"近 7 天 Token\n{exact_token_count(seven_day_tokens)} Token",
+            f"\u8fd1 7 \u5929 Token\n{exact_token_count(seven_day_tokens)} Token",
         )
         trend_today = float(history.get("today_tokens") or 0)
         trend_yesterday = float(history.get("yesterday_tokens") or 0)
         trend_average = seven_day_tokens / 7
         cost_stats = [
             (
-                "今日",
+                "\u4eca\u65e5",
                 f"{compact_number(trend_today)} tok",
                 Theme.ag_accent,
-                f"今日 Token\n{exact_token_count(trend_today)} Token",
+                f"\u4eca\u65e5 Token\n{exact_token_count(trend_today)} Token",
             ),
             (
-                "昨日",
+                "\u6628\u65e5",
                 f"{compact_number(trend_yesterday)} tok",
                 Theme.ag_success,
-                f"昨日 Token\n{exact_token_count(trend_yesterday)} Token",
+                f"\u6628\u65e5 Token\n{exact_token_count(trend_yesterday)} Token",
             ),
             (
-                "日均",
+                "\u65e5\u5747",
                 f"{compact_number(trend_average)} tok",
                 Theme.amber_glow,
-                f"近 7 天日均\n{exact_token_count(trend_average)} Token",
+                f"\u8fd1 7 \u5929\u65e5\u5747\n{exact_token_count(trend_average)} Token",
             ),
         ]
         for i, (lbl, val, color, tooltip) in enumerate(cost_stats):
@@ -7151,9 +7016,9 @@ class FloatingMonitorApp:
             cx = COL_L + col_w * i + col_w // 2
             c.create_text(cx, y, anchor="n", text=val,
                            font=self._fonts["font_value_sm"], fill=color)
-            c.create_text(cx, y + 24, anchor="n", text=lbl,
-                           font=self._fonts["font_micro"], fill=Theme.text_muted)
-            self._add_tooltip(metric_x1, y - 3, metric_x2, y + 44, tooltip)
+            c.create_text(cx, y + 21, anchor="n", text=lbl,
+                           font=self._fonts["font_micro"], fill=Theme.text_secondary)
+            self._add_tooltip(metric_x1, y - 3, metric_x2, y + 38, tooltip)
         series = history.get("series") if isinstance(history, dict) else []
         if isinstance(series, list) and series:
             bar_y = y + 40
@@ -7167,7 +7032,7 @@ class FloatingMonitorApp:
                 x1 = COL_L + index * (bar_w + gap)
                 x2 = min(COL_R, x1 + bar_w)
                 fill_h = max(2, int(bar_h * min(1.0, cost / max_cost))) if cost > 0 else 2
-                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=2, fill=Theme.ag_bg, outline="")
+                self._draw_rounded_rect(x1, bar_y, x2, bar_y + bar_h, r=3, fill=Theme.ag_bg, outline="")
                 color = self._trend_token_color(intensity, index == 6)
                 self._draw_rounded_rect(x1, bar_y + bar_h - fill_h, x2, bar_y + bar_h, r=3, fill=color, outline="")
                 c.create_text(
@@ -7187,7 +7052,7 @@ class FloatingMonitorApp:
                 )
             y += 94
         else:
-            y += 52
+            y += 46
         c.create_line(COL_L, y, COL_R, y, fill=Theme.border, width=1)
 
         # ════════════════════════════════════════════════════════
@@ -7264,49 +7129,50 @@ class FloatingMonitorApp:
             top = raw_top
 
         y += 9
-        c.create_text(COL_L, y + 2, anchor="nw", text="账号用量",
+        c.create_text(COL_L, y + 2, anchor="nw", text="\u8d26\u53f7\u7528\u91cf",
                        font=self._fonts["font_section"], fill=Theme.text_primary)
+
         tab_specs = [
-            ("rank_today", "今日", "today"),
-            ("rank_5h", "5h", "5h"),
-            ("rank_7d", "7d", "7d"),
+            ("rank_today", "\u4eca\u65e5", "today"),
+            ("rank_5h", "5h\u989d\u5ea6", "5h"),
+            ("rank_7d", "7d\u989d\u5ea6", "7d"),
             ("rank_30d", "30d", "30d"),
         ]
         if has_cycle_account:
-            tab_specs.append(("rank_cycle", "周期", "cycle"))
+            tab_specs.append(("rank_cycle", "\u5468\u671f\u989d\u5ea6", "cycle"))
         tab_w = 44
-        tab_gap = 6
-        tab_h = 22
+        tab_gap = 3
+        tab_h = 21
         tabs_x = COL_R - (tab_w * len(tab_specs) + tab_gap * (len(tab_specs) - 1))
-        account_count_x = COL_L + self._text_width("账号用量", "font_section") + 8
-        if account_count_x + self._text_width(f"{len(top)} 个账号", "font_micro") + 8 < tabs_x:
-            c.create_text(account_count_x, y + 5, anchor="nw", text=f"{len(top)} 个账号",
+        account_count_x = COL_L + 67
+        if account_count_x + self._text_width(f"{len(top)} \u4e2a\u8d26\u53f7", "font_micro") + 8 < tabs_x:
+            c.create_text(account_count_x, y + 5, anchor="nw", text=f"{len(top)} \u4e2a\u8d26\u53f7",
                           font=self._fonts["font_micro"], fill=Theme.text_muted)
+        self._draw_rounded_rect(tabs_x - 3, y - 3, COL_R + 3, y + tab_h,
+                                r=7, fill=Theme.ag_bg, outline=Theme.border)
         for tab_index, (button_name, label, value) in enumerate(tab_specs):
             x1 = tabs_x + tab_index * (tab_w + tab_gap)
             x2 = x1 + tab_w
-            self._btn_rects[button_name] = (x1, y - 2, x2, y - 2 + tab_h)
+            self._btn_rects[button_name] = (x1, y - 1, x2, y - 1 + tab_h)
             selected = self._account_range == value
             hovered = self._hover_btn == button_name
-            text_color = (
-                Theme.text_primary
-                if selected
-                else (Theme.text_secondary if hovered else Theme.text_muted)
-            )
-            c.create_text((x1 + x2) // 2, y + 2, anchor="n", text=label,
-                          font=self._fonts["font_tiny"], fill=text_color)
+            fill = Theme.bg_lift if selected else (Theme.ag_surface_hover if hovered else Theme.ag_bg)
+            text_color = Theme.text_primary if selected or hovered else Theme.ag_muted
+            self._draw_rounded_rect(x1, y - 1, x2, y - 1 + tab_h, r=5, fill=fill, outline="")
             if selected:
-                c.create_line(x1 + 10, y + tab_h - 2, x2 - 10, y + tab_h - 2,
+                c.create_line(x1 + 9, y + tab_h - 1, x2 - 9, y + tab_h - 1,
                               fill=Theme.data, width=2)
-        y += 30
+            c.create_text((x1 + x2) // 2, y + 9, anchor="center", text=label,
+                          font=self._fonts["font_tiny"], fill=text_color)
+        y += 27
         rank_list_top = y
 
         if not top:
             if self._loading or not self.state:
-                empty_text = "正在读取用量数据"
+                empty_text = "\u6b63\u5728\u8bfb\u53d6\u7528\u91cf\u6570\u636e"
             else:
-                empty_text = "该时间范围暂无账号记录" if range_key else "暂无用量"
-            c.create_text(COL_L, y + 2, anchor="nw", text=empty_text,
+                empty_text = "\u8be5\u65f6\u95f4\u8303\u56f4\u6682\u65e0\u8d26\u53f7\u8bb0\u5f55" if range_key else "\u6682\u65e0\u7528\u91cf"
+            c.create_text(COL_L + 8, y, anchor="nw", text=empty_text,
                           font=self._fonts["font_label"], fill=Theme.text_muted)
         window_mode = self._account_range in {"5h", "7d", "cycle"}
         row_h = self._account_rank_row_height()
@@ -7327,8 +7193,8 @@ class FloatingMonitorApp:
             source_label = account_type_label(acc, acc.get("name"))
             if not source_label and source_badge == "SUB":
                 source_label = "SUB2"
-            source_w = self._text_width(source_label, "font_badge") + 14 if source_label else 0
-            speed_w = self._text_width(speed_badge, "font_badge") + 14 if speed_badge else 0
+            source_w = self._text_width(source_label, "font_micro") + 14 if source_label else 0
+            speed_w = self._text_width(speed_badge, "font_micro") + 14 if speed_badge else 0
             badges_w = (source_w + 7 if source_label else 0) + (speed_w + 7 if speed_badge else 0)
             name_x = COL_L + 8 + badges_w
             metric_start_x = COL_R - (76 if window_mode else 150)
@@ -7363,8 +7229,10 @@ class FloatingMonitorApp:
             else:
                 bar_color = Theme.amber if index == 0 else (Theme.cyan if index == 1 else (Theme.violet if index == 2 else Theme.blue))
 
+            self._draw_rounded_rect(COL_L, y - 3, COL_R, y + row_h - 5, r=6,
+                                    fill=Theme.ag_surface, outline=Theme.ag_border)
             marker_bottom = y + (42 if window_mode else 23)
-            c.create_rectangle(COL_L, y + 2, COL_L + 2, marker_bottom, fill=bar_color, outline="")
+            c.create_rectangle(COL_L, y + 2, COL_L + 3, marker_bottom, fill=bar_color, outline="")
             if source_label:
                 self._draw_health_badge(COL_L + 8, y + 1, source_label)
             if speed_badge:
@@ -7377,19 +7245,19 @@ class FloatingMonitorApp:
                 if quota_unlimited:
                     percentage_text = "无5h限制"
                 elif quota_idle:
-                    percentage_text = "满额"
+                    percentage_text = "\u6ee1\u989d"
                 elif quota_available:
                     try:
                         percent_value = float(utilization)
-                        percentage_text = f"已用 {percent_value:.0f}%"
+                        percentage_text = f"\u5df2\u7528 {percent_value:.0f}%"
                     except (TypeError, ValueError):
                         percentage_text = "--%"
                 elif has_cycle_quota and self._account_range in {"5h", "7d"}:
-                    percentage_text = "周期账号"
+                    percentage_text = "\u5468\u671f\u8d26\u53f7"
                 elif historical_fallback:
-                    percentage_text = "近7日"
+                    percentage_text = "\u8fd17\u65e5"
                 else:
-                    percentage_text = "暂无额度"
+                    percentage_text = "\u6682\u65e0\u989d\u5ea6"
                 percentage_color = (
                     Theme.accent_green
                     if quota_unlimited
@@ -7416,11 +7284,11 @@ class FloatingMonitorApp:
                 pill_x1 = COL_R - max(56, pill_w)
                 pill_x2 = COL_R - 2
                 self._draw_rounded_rect(pill_x1, y - 2, pill_x2, y + 18,
-                                        r=4, fill=percentage_fill, outline=percentage_outline, width=1)
+                                        r=6, fill=percentage_fill, outline=percentage_outline, width=1)
                 c.create_text((pill_x1 + pill_x2) // 2, y + 8, anchor="center", text=percentage_text,
                               font=self._fonts["font_label_bold"], fill=percentage_color)
 
-                metric_text = f"{tokens} Token  ·  {cost}"
+                metric_text = f"{tokens} Token  \u00b7  {cost}"
                 c.create_text(name_x, y + 20, anchor="nw", text=metric_text,
                               font=self._fonts["font_label_bold"], fill=Theme.cyan)
                 if health_badge:
@@ -7440,23 +7308,23 @@ class FloatingMonitorApp:
                         right_detail = "\u989d\u5ea6\u5f85\u5237\u65b0"
                     right_color = Theme.amber_bright
                 elif quota_idle:
-                    right_detail = "满额待使用"
+                    right_detail = "\u6ee1\u989d\u5f85\u4f7f\u7528"
                     right_color = Theme.accent_green
                 elif has_cycle_quota and not quota_available and self._account_range in {"5h", "7d"}:
-                    right_detail = "看周期页"
+                    right_detail = "\u770b\u5468\u671f\u9875"
                     right_color = Theme.amber_bright
                 elif historical_fallback:
-                    right_detail = f"历史 · {reqs} 次"
+                    right_detail = f"\u5386\u53f2 \u00b7 {reqs} \u6b21"
                     right_color = Theme.text_muted
                 elif not quota_available:
-                    right_detail = "无该窗口额度"
+                    right_detail = "\u65e0\u8be5\u7a97\u53e3\u989d\u5ea6"
                     right_color = Theme.text_muted
                 else:
                     try:
                         remaining_text = f"{float(remaining_percent):.0f}%"
                     except (TypeError, ValueError):
                         remaining_text = "--%"
-                    right_detail = f"剩余 {remaining_text} · {reqs} 次"
+                    right_detail = f"\u5269\u4f59 {remaining_text} \u00b7 {reqs} \u6b21"
                     right_color = Theme.text_muted
                 c.create_text(COL_R - 4, y + 20, anchor="ne", text=right_detail,
                               font=self._fonts["font_micro"], fill=right_color)
@@ -7469,23 +7337,23 @@ class FloatingMonitorApp:
                     elif quota_idle:
                         reset_text = "\u9996\u6b21\u4f7f\u7528\u540e\u5f00\u59cb 5h \u5012\u8ba1\u65f6"
                     elif quota_reset_unavailable:
-                        reset_text = "重置时间待同步"
+                        reset_text = "\u91cd\u7f6e\u65f6\u95f4\u5f85\u540c\u6b65"
                     else:
                         reset_text = quota_reset_text(str(acc.get("resets_at") or ""))
                     if self._account_range == "7d" and reset_text:
-                        reset_text = f"周限额 · {reset_text}"
+                        reset_text = f"\u5468\u9650\u989d \u00b7 {reset_text}"
                     elif self._account_range == "cycle" and reset_text:
-                        reset_text = f"周期 · {reset_text}"
+                        reset_text = f"\u5468\u671f \u00b7 {reset_text}"
                     elif self._account_range == "5h" and reset_text and not quota_idle:
-                        reset_text = f"5h 限额 · {reset_text}"
+                        reset_text = f"5h \u9650\u989d \u00b7 {reset_text}"
                 elif historical_fallback:
-                    reset_text = "无官方周额度 · 近7日汇总"
+                    reset_text = "\u65e0\u5b98\u65b9\u5468\u989d\u5ea6 \u00b7 \u8fd17\u65e5\u6c47\u603b"
                 elif self._account_range == "7d":
-                    reset_text = "该账号使用周期额度" if has_cycle_quota else "未提供周额度"
+                    reset_text = "\u8be5\u8d26\u53f7\u4f7f\u7528\u5468\u671f\u989d\u5ea6" if has_cycle_quota else "\u672a\u63d0\u4f9b\u5468\u989d\u5ea6"
                 elif self._account_range == "cycle":
-                    reset_text = "未提供周期额度"
+                    reset_text = "\u672a\u63d0\u4f9b\u5468\u671f\u989d\u5ea6"
                 else:
-                    reset_text = "暂无额度数据"
+                    reset_text = "\u6682\u65e0\u989d\u5ea6\u6570\u636e"
                 reset_w = self._text_width(reset_text, "font_micro") if reset_text else 0
                 progress_x1 = name_x
                 progress_x2 = max(progress_x1 + 42, COL_R - reset_w - 14)
@@ -7506,7 +7374,7 @@ class FloatingMonitorApp:
                     c.create_text(COL_R - 4, y + 33, anchor="ne", text=reset_text,
                                   font=self._fonts["font_micro"], fill=Theme.text_muted)
                 divider_y = y + min(48, row_h - 5)
-                c.create_line(COL_L + 8, divider_y, COL_R - 4, divider_y, fill=Theme.ag_divider, width=1)
+                c.create_line(COL_L + 8, divider_y, COL_R - 4, divider_y, fill=Theme.border, width=1)
             else:
                 cost_w = self._text_width(cost, "font_label_bold")
                 c.create_text(COL_R - 4, y, anchor="ne", text=cost,
@@ -7514,13 +7382,13 @@ class FloatingMonitorApp:
                 c.create_text(COL_R - 12 - cost_w, y, anchor="ne", text=f"{tokens} Token",
                               font=self._fonts["font_label_bold"], fill=bar_color)
 
-                detail_text = f"{range_label}  ·  {reqs} 次请求"
+                detail_text = f"{range_label}  \u00b7  {reqs} \u6b21\u8bf7\u6c42"
                 c.create_text(name_x, y + 15, anchor="nw", text=detail_text,
                               font=self._fonts["font_micro"], fill=Theme.text_muted)
                 if health_badge:
                     c.create_text(COL_R - 4, y + 15, anchor="ne", text=health_badge,
                                   font=self._fonts["font_micro"], fill=self._health_color(health_badge))
-                c.create_line(COL_L + 8, y + 34, COL_R - 4, y + 34, fill=Theme.ag_divider, width=1)
+                c.create_line(COL_L + 8, y + 27, COL_R - 4, y + 27, fill=Theme.border, width=1)
             y += row_h
 
         self._draw_list_scrollbar(
@@ -7536,6 +7404,7 @@ class FloatingMonitorApp:
         self._draw_footer(W, H)
         self._draw_tooltip(W, H)
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  ANIMATION
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -7682,10 +7551,14 @@ class FloatingMonitorApp:
             return
         if btn in {"main_accounts", "main_stats"}:
             self._resizing = False
-            self._switch_main_tab({
+            self._main_tab = {
                 "main_accounts": "accounts",
                 "main_stats": "stats",
-            }[btn])
+            }[btn]
+            self._scroll_offsets[self._main_tab] = 0
+            if self._main_tab == "accounts":
+                self._scroll_offsets["active"] = 0
+            self._draw()
             return
         if 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
             self._resizing = False
@@ -7693,7 +7566,11 @@ class FloatingMonitorApp:
             tab_index = int(max(0, min(1, (event.x - 14) // tab_width)))
             tab_value = ("accounts", "stats")[tab_index]
             if self._main_tab != tab_value:
-                self._switch_main_tab(tab_value)
+                self._main_tab = tab_value
+                self._scroll_offsets[tab_value] = 0
+                if tab_value == "accounts":
+                    self._scroll_offsets["active"] = 0
+                self._draw()
             return
         if btn in {"usage_range_24h", "usage_range_7d", "usage_range_30d", "usage_range_all"}:
             self._resizing = False
