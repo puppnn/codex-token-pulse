@@ -205,6 +205,105 @@ SINGLE_INSTANCE_MUTEX_NAME = os.environ.get(
     "Local\\TokenPulseFloatingMonitor",
 )
 ERROR_ALREADY_EXISTS = 183
+WINDOW_RECOVERY_WIDTH = 80
+WINDOW_RECOVERY_HEIGHT = 32
+WINDOW_POSITION_GUARD_MS = 2_000
+
+
+@dataclass(frozen=True)
+class WorkArea:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+
+def constrain_window_position(
+    x: int,
+    y: int,
+    width: int,
+    work_area: WorkArea,
+    *,
+    recovery_width: int = WINDOW_RECOVERY_WIDTH,
+    recovery_height: int = WINDOW_RECOVERY_HEIGHT,
+) -> tuple[int, int]:
+    """Keep a usable piece of the top drag region inside one work area."""
+    width = max(1, int(width))
+    work_width = max(1, work_area.right - work_area.left)
+    work_height = max(1, work_area.bottom - work_area.top)
+    visible_width = min(width, work_width, max(1, int(recovery_width)))
+    visible_height = min(work_height, max(1, int(recovery_height)))
+
+    min_x = work_area.left - (width - visible_width)
+    max_x = work_area.right - visible_width
+    min_y = work_area.top
+    max_y = work_area.bottom - visible_height
+    return (
+        max(min_x, min(max_x, int(x))),
+        max(min_y, min(max_y, int(y))),
+    )
+
+
+def format_tk_geometry(width: int, height: int, x: int, y: int) -> str:
+    """Format absolute virtual-desktop coordinates, including negative monitors."""
+    # Tk treats ``-1920`` as an offset from the virtual desktop's right edge.
+    # Prefixing the signed integer with ``+`` preserves an absolute x/y value.
+    return f"{int(width)}x{int(height)}+{int(x)}+{int(y)}"
+
+
+def windows_monitor_work_area(
+    *,
+    point: tuple[int, int] | None = None,
+    rect: tuple[int, int, int, int] | None = None,
+) -> WorkArea | None:
+    """Return the nearest Windows monitor's taskbar-excluded work area."""
+    if os.name != "nt" or (point is None) == (rect is None):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            )
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if point is not None:
+            user32.MonitorFromPoint.argtypes = (wintypes.POINT, wintypes.DWORD)
+            user32.MonitorFromPoint.restype = ctypes.c_void_p
+            monitor = user32.MonitorFromPoint(
+                wintypes.POINT(int(point[0]), int(point[1])),
+                2,  # MONITOR_DEFAULTTONEAREST
+            )
+        else:
+            assert rect is not None
+            target = wintypes.RECT(*(int(value) for value in rect))
+            user32.MonitorFromRect.argtypes = (ctypes.POINTER(wintypes.RECT), wintypes.DWORD)
+            user32.MonitorFromRect.restype = ctypes.c_void_p
+            monitor = user32.MonitorFromRect(
+                ctypes.byref(target),
+                2,  # MONITOR_DEFAULTTONEAREST
+            )
+        if not monitor:
+            return None
+        user32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.POINTER(MonitorInfo))
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(MonitorInfo)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        return WorkArea(
+            int(info.rcWork.left),
+            int(info.rcWork.top),
+            int(info.rcWork.right),
+            int(info.rcWork.bottom),
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def acquire_single_instance_mutex() -> int | None:
@@ -4140,7 +4239,7 @@ class FloatingMonitorApp:
         self.root = tk.Tk()
         self.root.title("Token Monitor")
         self.root.overrideredirect(True)
-        self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+1120+70")
+        self.root.geometry(format_tk_geometry(self.WIDTH, self.HEIGHT, 1120, 70))
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.0)
         self.root.configure(bg=Theme.transparent)
@@ -4159,6 +4258,8 @@ class FloatingMonitorApp:
             bd=0,
         )
         self.canvas.pack(fill="both", expand=True)
+        self.root.update_idletasks()
+        self._ensure_window_recoverable()
 
         # ── fonts (resolved) ──
         self._fonts: dict[str, tkfont.Font] = {}
@@ -4215,6 +4316,7 @@ class FloatingMonitorApp:
         if self.state is None:
             self.refresh_async()
         self.root.after(REFRESH_SECONDS * 1000, self._schedule_auto_refresh)
+        self.root.after(WINDOW_POSITION_GUARD_MS, self._window_position_guard)
         self._schedule_live_active_refresh()
         self._schedule_auth_switch_refresh()
         self._schedule_live_usage_refresh()
@@ -4832,12 +4934,56 @@ class FloatingMonitorApp:
         self.HEIGHT = height
         x = self.root.winfo_x()
         y = self.root.winfo_y()
+        work_area = self._work_area_for_window(x, y, width)
+        x, y = constrain_window_position(x, y, width, work_area)
         self._ignore_configure = True
         try:
-            self.root.geometry(f"{width}x{height}+{x}+{y}")
+            self.root.geometry(format_tk_geometry(width, height, x, y))
             self.canvas.configure(width=width, height=height)
         finally:
             self.root.after_idle(self._clear_ignore_configure)
+
+    def _fallback_work_area(self) -> WorkArea:
+        try:
+            left = int(self.root.winfo_vrootx())
+            top = int(self.root.winfo_vrooty())
+            width = max(1, int(self.root.winfo_vrootwidth()))
+            height = max(1, int(self.root.winfo_vrootheight()))
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            left = top = 0
+            width = max(1, int(self.root.winfo_screenwidth()))
+            height = max(1, int(self.root.winfo_screenheight()))
+        return WorkArea(left, top, left + width, top + height)
+
+    def _work_area_for_point(self, x: int, y: int) -> WorkArea:
+        return windows_monitor_work_area(point=(x, y)) or self._fallback_work_area()
+
+    def _work_area_for_window(self, x: int, y: int, width: int) -> WorkArea:
+        recovery_bottom = y + WINDOW_RECOVERY_HEIGHT
+        return windows_monitor_work_area(
+            rect=(x, y, x + max(1, width), recovery_bottom)
+        ) or self._fallback_work_area()
+
+    def _ensure_window_recoverable(self) -> None:
+        if self.closed:
+            return
+        try:
+            width = max(1, int(self.root.winfo_width()))
+            height = max(1, int(self.root.winfo_height()))
+            x = int(self.root.winfo_x())
+            y = int(self.root.winfo_y())
+            work_area = self._work_area_for_window(x, y, width)
+            safe_x, safe_y = constrain_window_position(x, y, width, work_area)
+            if (safe_x, safe_y) != (x, y):
+                self.root.geometry(format_tk_geometry(width, height, safe_x, safe_y))
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            return
+
+    def _window_position_guard(self) -> None:
+        if self.closed:
+            return
+        self._ensure_window_recoverable()
+        self.root.after(WINDOW_POSITION_GUARD_MS, self._window_position_guard)
 
     def _clear_ignore_configure(self) -> None:
         self._ignore_configure = False
@@ -7618,6 +7764,7 @@ class FloatingMonitorApp:
         if self._list_scrollbar_drag_tab is not None:
             self._list_scrollbar_drag_tab = None
             self._draw()
+        self._ensure_window_recoverable()
 
     def _on_drag(self, event: tk.Event) -> None:
         if self._list_scrollbar_drag_tab is not None:
@@ -7637,7 +7784,11 @@ class FloatingMonitorApp:
         dy = event.y - self._drag_data["y"]
         x = self.root.winfo_x() + dx
         y = self.root.winfo_y() + dy
-        self.root.geometry(f"+{x}+{y}")
+        width = max(1, int(self.root.winfo_width()))
+        height = max(1, int(self.root.winfo_height()))
+        work_area = self._work_area_for_point(int(event.x_root), int(event.y_root))
+        x, y = constrain_window_position(x, y, width, work_area)
+        self.root.geometry(format_tk_geometry(width, height, x, y))
 
     def _on_motion(self, event: tk.Event) -> None:
         if self._list_scrollbar_drag_tab is not None or self._scrollbar_tab_at(
