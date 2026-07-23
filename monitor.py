@@ -57,6 +57,14 @@ LIVE_ACTIVE_STALE_SECONDS = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_STALE_SE
 LIVE_ACTIVE_TAIL_BYTES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_TAIL_BYTES", str(2 * 1024 * 1024)))
 LIVE_ACTIVE_MAX_FILES = int(os.environ.get("TOKEN_PULSE_LIVE_ACTIVE_MAX_FILES", "64"))
 LIVE_ACCOUNT_MATCH_SECONDS = float(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_MATCH_SECONDS", "300"))
+LIVE_ACCOUNT_TURN_MATCH_SECONDS = max(
+    0.1,
+    float(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_TURN_MATCH_SECONDS", "2.0")),
+)
+LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS = max(
+    0.0,
+    float(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS", "0.2")),
+)
 LIVE_ACCOUNT_MARKER_LIMIT = int(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_MARKER_LIMIT", "4096"))
 LIVE_USAGE_WATCH_INTERVAL_MS = max(
     50,
@@ -547,6 +555,66 @@ def local_provider_display_name(provider_name: str) -> str:
     return name
 
 
+_ACCOUNT_DISPLAY_ALIAS_SIGNATURE: tuple[int, int] | None = None
+_ACCOUNT_DISPLAY_ALIASES: dict[str, str] = {}
+_ACCOUNT_DISPLAY_ALIAS_CHECKED_AT = 0.0
+
+
+def _cockpit_display_identity_key(value: Any) -> str:
+    identity = str(value or "").strip().strip('"').strip("'")
+    identity = identity.replace("\\", "/").rsplit("/", 1)[-1]
+    if identity.casefold().endswith(".json"):
+        identity = identity[:-5]
+    return identity.strip().casefold()
+
+
+def local_account_display_aliases() -> dict[str, str]:
+    global _ACCOUNT_DISPLAY_ALIAS_SIGNATURE, _ACCOUNT_DISPLAY_ALIASES
+    global _ACCOUNT_DISPLAY_ALIAS_CHECKED_AT
+    checked_at = time.monotonic()
+    if checked_at - _ACCOUNT_DISPLAY_ALIAS_CHECKED_AT < 2.0:
+        return _ACCOUNT_DISPLAY_ALIASES
+    _ACCOUNT_DISPLAY_ALIAS_CHECKED_AT = checked_at
+    path = Path.home() / ".antigravity_cockpit" / "codex_accounts.json"
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        signature = None
+    if signature == _ACCOUNT_DISPLAY_ALIAS_SIGNATURE:
+        return _ACCOUNT_DISPLAY_ALIASES
+
+    aliases: dict[str, str] = {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    for account in accounts if isinstance(accounts, list) else []:
+        if not isinstance(account, dict):
+            continue
+        display = str(
+            account.get("email")
+            or account.get("name")
+            or account.get("api_provider_name")
+            or ""
+        ).strip()
+        if not display:
+            continue
+        for identity in (
+            account.get("id"),
+            account.get("api_provider_name"),
+            account.get("name"),
+        ):
+            key = _cockpit_display_identity_key(identity)
+            if key:
+                aliases[key] = display
+
+    _ACCOUNT_DISPLAY_ALIAS_SIGNATURE = signature
+    _ACCOUNT_DISPLAY_ALIASES = aliases
+    return aliases
+
+
 def ranking_account_display_name(account_name: str) -> str:
     name = (account_name or "-").strip() or "-"
     prefixes = (
@@ -565,6 +633,9 @@ def ranking_account_display_name(account_name: str) -> str:
                 break
         if not matched:
             break
+    mapped = local_account_display_aliases().get(_cockpit_display_identity_key(name))
+    if mapped:
+        name = mapped
     aliases = {
         "api-service-local": "API \u670d\u52a1",
         "claude local": "Claude",
@@ -626,7 +697,9 @@ _ACCOUNT_TYPE_CACHE: dict[str, str] = {}
 
 
 def _account_type_lookup_key(value: Any) -> str:
-    return ranking_account_display_name(str(value or "")).strip().casefold()
+    return _cockpit_display_identity_key(
+        ranking_account_display_name(str(value or ""))
+    )
 
 
 def _account_type_source_signature(paths: list[Path]) -> tuple[tuple[str, int], ...]:
@@ -2069,7 +2142,13 @@ def _load_live_cockpit_markers(
             SELECT timestamp, account_id, email, api_key_label, model_id,
                    total_tokens, input_tokens, cached_tokens, output_tokens
             FROM request_logs
-            WHERE timestamp >= ? AND total_tokens > 0
+            WHERE timestamp >= ?
+              AND (
+                  COALESCE(total_tokens, 0) > 0
+                  OR COALESCE(input_tokens, 0) > 0
+                  OR COALESCE(cached_tokens, 0) > 0
+                  OR COALESCE(output_tokens, 0) > 0
+              )
             ORDER BY timestamp DESC
             LIMIT ?
             """,
@@ -2090,63 +2169,136 @@ def _load_live_cockpit_markers(
             when = datetime.fromtimestamp(int(timestamp) / 1000.0, tz=timezone.utc)
         except (TypeError, ValueError, OSError):
             continue
+        input_token_count = max(0, int(input_value or 0))
+        cached_token_count = max(0, int(cached or 0))
+        output_token_count = max(0, int(output or 0))
+        reported_total = max(
+            max(0, int(total or 0)),
+            input_token_count + output_token_count,
+            cached_token_count + output_token_count,
+        )
+        if reported_total <= 0:
+            continue
         markers.append(
             {
                 "when": when,
                 "label": label,
                 "model": str(model or "").strip(),
-                "total_tokens": max(0, int(total or 0)),
-                "input_tokens": max(0, int(input_value or 0)),
-                "cached_tokens": max(0, int(cached or 0)),
-                "output_tokens": max(0, int(output or 0)),
+                "total_tokens": reported_total,
+                "input_tokens": input_token_count,
+                "cached_tokens": cached_token_count,
+                "output_tokens": output_token_count,
             }
         )
     return markers
+
+
+def _live_cockpit_match_score(
+    usage: dict[str, Any],
+    marker: dict[str, Any],
+) -> tuple[int, int, float] | None:
+    when = usage.get("when")
+    marker_when = marker.get("when")
+    if not isinstance(when, datetime) or not isinstance(marker_when, datetime):
+        return None
+    turn_started_at = usage.get("turn_started_at")
+    if isinstance(turn_started_at, datetime) and marker_when < turn_started_at:
+        return None
+    total_tokens = int(usage.get("total_tokens") or 0)
+    marker_total = int(marker.get("total_tokens") or 0)
+    if not any(
+        int(marker.get(key) or 0) > 0
+        for key in ("total_tokens", "input_tokens", "cached_tokens", "output_tokens")
+    ):
+        return None
+    time_delta = abs((marker_when - when).total_seconds())
+    if marker_total == total_tokens and time_delta <= LIVE_ACCOUNT_MATCH_SECONDS:
+        components_match = all(
+            int(marker.get(key) or 0) == int(usage.get(key) or 0)
+            for key in ("input_tokens", "cached_tokens", "output_tokens")
+        )
+        return (0 if components_match else 1, 0, time_delta)
+    fuzzy_delta = max(256, int(total_tokens * 0.005))
+    token_delta = abs(marker_total - total_tokens)
+    if time_delta <= 30 and token_delta <= fuzzy_delta:
+        return (2, token_delta, time_delta)
+    if time_delta <= LIVE_ACCOUNT_TURN_MATCH_SECONDS:
+        return (3, 0, time_delta)
+    return None
+
+
+def _match_live_cockpit_markers(
+    usages: list[dict[str, Any] | None],
+    markers: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    candidates_by_usage: dict[int, list[tuple[tuple[int, int, float], dict[str, Any]]]] = {}
+    candidates_by_marker: dict[int, list[tuple[tuple[int, int, float], int]]] = {}
+    for usage_index, usage in enumerate(usages):
+        if not usage:
+            continue
+        for marker in markers:
+            score = _live_cockpit_match_score(usage, marker)
+            if score is None:
+                continue
+            candidates_by_usage.setdefault(usage_index, []).append((score, marker))
+            candidates_by_marker.setdefault(id(marker), []).append((score, usage_index))
+
+    marker_winners: dict[int, int] = {}
+    for marker in markers:
+        candidates = candidates_by_marker.get(id(marker), [])
+        best_by_session: dict[str, tuple[tuple[int, int, float], int]] = {}
+        for score, usage_index in candidates:
+            usage = usages[usage_index] or {}
+            session_key = str(usage.get("session_id") or usage_index)
+            previous = best_by_session.get(session_key)
+            if previous is None or score < previous[0]:
+                best_by_session[session_key] = (score, usage_index)
+        ordered = sorted(best_by_session.values(), key=lambda item: item[0])
+        if not ordered:
+            continue
+        if (
+            len(ordered) > 1
+            and ordered[0][0][0] == 3
+            and ordered[1][0][0] == 3
+            and ordered[1][0][2] - ordered[0][0][2] < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
+        ):
+            continue
+        marker_winners[id(marker)] = ordered[0][1]
+
+    matches: dict[int, dict[str, Any]] = {}
+    for usage_index, candidates in candidates_by_usage.items():
+        eligible = sorted(
+            (
+                (score, marker)
+                for score, marker in candidates
+                if marker_winners.get(id(marker)) == usage_index
+            ),
+            key=lambda item: item[0],
+        )
+        if not eligible:
+            continue
+        best_score, best_marker = eligible[0]
+        competing_labels = [
+            score
+            for score, marker in eligible[1:]
+            if str(marker.get("label") or "") != str(best_marker.get("label") or "")
+        ]
+        if (
+            best_score[0] == 3
+            and competing_labels
+            and competing_labels[0][0] == 3
+            and competing_labels[0][2] - best_score[2] < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
+        ):
+            continue
+        matches[usage_index] = best_marker
+    return matches
 
 
 def _match_live_cockpit_marker(
     usage: dict[str, Any] | None,
     markers: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    if not usage:
-        return None
-    when = usage.get("when")
-    if not isinstance(when, datetime):
-        return None
-    total_tokens = int(usage.get("total_tokens") or 0)
-    exact = [
-        marker
-        for marker in markers
-        if int(marker.get("total_tokens") or 0) == total_tokens
-        and abs((marker["when"] - when).total_seconds()) <= LIVE_ACCOUNT_MATCH_SECONDS
-    ]
-    component_exact = [
-        marker
-        for marker in exact
-        if int(marker.get("input_tokens") or 0) == int(usage.get("input_tokens") or 0)
-        and int(marker.get("cached_tokens") or 0) == int(usage.get("cached_tokens") or 0)
-        and int(marker.get("output_tokens") or 0) == int(usage.get("output_tokens") or 0)
-    ]
-    candidates = component_exact or exact
-    if candidates:
-        return min(candidates, key=lambda marker: abs((marker["when"] - when).total_seconds()))
-
-    fuzzy_delta = max(256, int(total_tokens * 0.005))
-    fuzzy = [
-        marker
-        for marker in markers
-        if abs((marker["when"] - when).total_seconds()) <= 30
-        and abs(int(marker.get("total_tokens") or 0) - total_tokens) <= fuzzy_delta
-    ]
-    if not fuzzy:
-        return None
-    return min(
-        fuzzy,
-        key=lambda marker: (
-            abs(int(marker.get("total_tokens") or 0) - total_tokens),
-            abs((marker["when"] - when).total_seconds()),
-        ),
-    )
+    return _match_live_cockpit_markers([usage], markers).get(0)
 
 
 def _concrete_live_provider(value: Any) -> str:
@@ -2201,7 +2353,7 @@ def scan_live_codex_active_sessions(
         if api_service_route
         else []
     )
-    active_rows: list[dict[str, Any]] = []
+    parsed_rows: list[dict[str, Any]] = []
     session_pattern = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
     terminal_states = {"task_complete", "turn_aborted"}
     selected_candidates = candidates[: max(1, LIVE_ACTIVE_MAX_FILES)]
@@ -2267,10 +2419,37 @@ def scan_live_codex_active_sessions(
         started_dt = _parse_time(started_at)
         if started_dt is not None and latest_usage is not None and latest_usage["when"] < started_dt:
             latest_usage = None
-        matched_marker = _match_live_cockpit_marker(latest_usage, cockpit_markers)
+        if latest_usage is not None:
+            latest_usage = dict(latest_usage)
+            latest_usage["session_id"] = session_id
+            if started_dt is not None:
+                latest_usage["turn_started_at"] = started_dt
+        parsed_rows.append(
+            {
+                "session_id": session_id,
+                "cached": cached,
+                "modified": modified,
+                "lifecycle_at": lifecycle_at,
+                "started_at": started_at,
+                "latest_usage": latest_usage,
+            }
+        )
+
+    live_matches = _match_live_cockpit_markers(
+        [row.get("latest_usage") for row in parsed_rows],
+        cockpit_markers,
+    )
+    active_rows: list[dict[str, Any]] = []
+    for row_index, parsed_row in enumerate(parsed_rows):
+        session_id = str(parsed_row["session_id"])
+        cached = parsed_row["cached"]
+        modified = float(parsed_row["modified"])
+        lifecycle_at = str(parsed_row["lifecycle_at"] or "")
+        started_at = str(parsed_row["started_at"] or "")
+        matched_marker = live_matches.get(row_index)
         matched_label = str((matched_marker or {}).get("label") or "")
         cached_provider = _concrete_live_provider(cached.get("provider"))
-        if api_service_route and matched_label:
+        if api_service_route:
             provider = matched_label
         else:
             provider = cached_provider or current_label or matched_label
@@ -8491,6 +8670,7 @@ class FloatingMonitorApp:
             else []
         )
         latest_event = max(recent, key=lambda item: item["when"])
+        live_cockpit_matches = _match_live_cockpit_markers(recent, cockpit_markers)
         latest_provider = ""
         latest_model = ""
         for event_index, event in enumerate(recent):
@@ -8517,11 +8697,10 @@ class FloatingMonitorApp:
                 self._token_flow_samples.append((sample_clock - visual_offset, tokens))
             provider = _concrete_live_provider(event.get("provider"))
             model = str(event.get("model") or "")
-            matched_marker = _match_live_cockpit_marker(event, cockpit_markers)
+            matched_marker = live_cockpit_matches.get(event_index)
             provider_usage = event
             record_provider = bool(provider)
             if matched_marker is not None:
-                cockpit_markers.remove(matched_marker)
                 provider = str(matched_marker.get("label") or "")
                 model = str(matched_marker.get("model") or "")
                 provider_usage = matched_marker
