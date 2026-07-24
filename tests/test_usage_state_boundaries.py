@@ -5931,7 +5931,12 @@ class LiveActiveSessionScanTests(unittest.TestCase):
 
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
-        self.assertEqual(read_tail.call_count, 1)
+        session_tail_reads = [
+            call
+            for call in read_tail.call_args_list
+            if Path(call.args[0]).suffix.casefold() == ".jsonl"
+        ]
+        self.assertEqual(len(session_tail_reads), 1)
 
     def test_completed_tail_is_removed_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6008,6 +6013,120 @@ class LiveActiveSessionScanTests(unittest.TestCase):
                 500,
             ),
         )
+
+    def test_api_service_session_uses_route_hint_before_final_usage(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(seconds=2)
+        route_at = started_at + timedelta(milliseconds=350)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            self.write_live_rows(
+                sessions,
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-route"},
+                    },
+                ],
+            )
+            (root / "codex_accounts.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "id": "codex-route-account",
+                                "email": "route-hint@example.com",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "codex-api.log.test").write_text(
+                (
+                    f'{route_at.isoformat()} WARN msg="session-affinity: cache hit | '
+                    "session=test auth=codex-route-account.json provider=mixed "
+                    'model=gpt-route" request_id=request-route\n'
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    [],
+                    now=now,
+                    cockpit_db_path=root / "requests.sqlite",
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["provider"], "Codex local - route-hint@example.com")
+        self.assertFalse(rows[0]["provider_confirmed"])
+        self.assertTrue(rows[0]["provider_provisional"])
+        self.assertEqual(rows[0]["provider_confirmation_source"], "active_route_hint")
+        self.assertEqual(rows[0]["provider_route_request_id"], "request-route")
+
+    def test_live_route_hint_uses_reselected_account(self) -> None:
+        started_at = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+        events = [
+            {
+                "when": started_at + timedelta(milliseconds=100),
+                "request_id": "request-1",
+                "kind": "route",
+                "account_id": "k12-account",
+                "label": "Codex local - k12@example.com",
+                "model": "gpt-test",
+            },
+            {
+                "when": started_at + timedelta(milliseconds=300),
+                "request_id": "request-1",
+                "kind": "invalid",
+                "account_id": "k12-account",
+                "label": "Codex local - k12@example.com",
+                "model": "gpt-test",
+            },
+            {
+                "when": started_at + timedelta(milliseconds=500),
+                "request_id": "request-1",
+                "kind": "route",
+                "account_id": "plus-account",
+                "label": "Codex local - plus@example.com",
+                "model": "gpt-test",
+            },
+        ]
+
+        hints = monitor._match_live_cockpit_route_hints([started_at], events)
+
+        self.assertEqual(hints[0]["label"], "Codex local - plus@example.com")
+        self.assertEqual(hints[0]["account_id"], "plus-account")
+
+    def test_live_route_hint_does_not_cross_ambiguous_sessions(self) -> None:
+        started_at = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+        events = [
+            {
+                "when": started_at + timedelta(milliseconds=50),
+                "request_id": "ambiguous-request",
+                "kind": "route",
+                "account_id": "account-1",
+                "label": "Codex local - ambiguous@example.com",
+                "model": "gpt-test",
+            }
+        ]
+
+        hints = monitor._match_live_cockpit_route_hints(
+            [started_at, started_at + timedelta(milliseconds=100)],
+            events,
+        )
+
+        self.assertEqual(hints, {})
 
     def test_api_service_session_keeps_confirmed_provider_within_same_turn(self) -> None:
         now = datetime.now(timezone.utc)
@@ -7125,6 +7244,37 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         self.assertEqual(provider, "")
         self.assertEqual(model, "gpt-test")
+
+    def test_api_service_context_does_not_book_provisional_route_hint(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "route-session",
+                "provider": "Codex local - route-hint@example.com",
+                "provider_confirmed": False,
+                "provider_provisional": True,
+                "provider_confirmation_source": "active_route_hint",
+                "usage_event_id": "route-event",
+                "model": "gpt-route",
+            }
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            provider, model = app._live_event_request_context(
+                {
+                    "session_id": "route-session",
+                    "event_id": "route-event",
+                }
+            )
+
+        self.assertEqual(provider, "")
+        self.assertEqual(model, "gpt-route")
 
     def test_confirmed_active_event_repairs_pending_latest_request_label_only(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)

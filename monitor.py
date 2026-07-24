@@ -66,6 +66,18 @@ LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS = max(
     float(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS", "0.2")),
 )
 LIVE_ACCOUNT_MARKER_LIMIT = int(os.environ.get("TOKEN_PULSE_LIVE_ACCOUNT_MARKER_LIMIT", "4096"))
+LIVE_ROUTE_HINT_MATCH_SECONDS = max(
+    0.5,
+    float(os.environ.get("TOKEN_PULSE_LIVE_ROUTE_HINT_MATCH_SECONDS", "3.0")),
+)
+LIVE_ROUTE_HINT_RETENTION_SECONDS = max(
+    60.0,
+    float(os.environ.get("TOKEN_PULSE_LIVE_ROUTE_HINT_RETENTION_SECONDS", "7200")),
+)
+LIVE_ROUTE_HINT_TAIL_BYTES = max(
+    64 * 1024,
+    int(os.environ.get("TOKEN_PULSE_LIVE_ROUTE_HINT_TAIL_BYTES", str(256 * 1024))),
+)
 LIVE_USAGE_WATCH_INTERVAL_MS = max(
     50,
     int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_WATCH_INTERVAL_MS", "100")),
@@ -148,6 +160,32 @@ TOKEN_DELTA_BADGE_MERGE_SECONDS = 0.35
 COCKPIT_REQUEST_LOG_DB = Path(
     os.environ.get("TOKEN_PULSE_COCKPIT_REQUEST_LOG_DB")
     or Path.home() / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
+)
+LIVE_COCKPIT_AFFINITY_RE = re.compile(
+    r'^(?P<timestamp>\S+).*?msg="(?:k12-)?session-affinity:\s*'
+    r'(?P<action>[^|\"]+?)\s*\|\s*(?P<fields>[^\"]*)"\s+'
+    r'request_id=(?P<request_id>[^\s]+)'
+)
+LIVE_COCKPIT_LOG_FIELD_RE = re.compile(
+    r'(?P<key>[A-Za-z0-9_]+)=(?P<value>"[^"]*"|\S+)'
+)
+LIVE_COCKPIT_ROUTE_ACTIONS = {
+    "binding confirmed",
+    "spillover binding confirmed",
+    "confirmed binding hit",
+    "cache hit before new k12 routing",
+    "cache hit",
+    "cache miss, new binding",
+    "temporary spillover binding hit during k12 cooldown",
+    "recovery spillover retained after k12 hard release",
+}
+LIVE_COCKPIT_FAILED_ROUTE_FRAGMENTS = (
+    "released after failure",
+    "suspended for failover",
+    "auth unavailable",
+    "reselected",
+    "failure recovery",
+    "quarantined auth",
 )
 CLIENT_USAGE_EXPORT = Path(
     os.environ.get("CLIENT_USAGE_EXPORT")
@@ -2415,6 +2453,298 @@ def _cockpit_account_label(account_id: Any, email: Any, api_key_label: Any) -> s
     return f"Codex local - {identity}" if identity else ""
 
 
+def _normalize_live_cockpit_account_id(value: Any) -> str:
+    account_id = Path(str(value or "").strip().strip('"')).name
+    if account_id.casefold().endswith(".json"):
+        account_id = account_id[:-5]
+    return account_id.strip()
+
+
+def _load_live_cockpit_account_labels(
+    db_path: Path,
+    account_ids: set[str],
+) -> dict[str, str]:
+    wanted = {
+        _normalize_live_cockpit_account_id(account_id)
+        for account_id in account_ids
+        if _normalize_live_cockpit_account_id(account_id)
+    }
+    if not wanted:
+        return {}
+
+    labels: dict[str, str] = {}
+    manifest_path = db_path.parent / "codex_accounts.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8", errors="ignore"))
+        accounts = payload.get("accounts") if isinstance(payload, dict) else []
+        for account in accounts if isinstance(accounts, list) else []:
+            if not isinstance(account, dict):
+                continue
+            account_id = _normalize_live_cockpit_account_id(account.get("id"))
+            if account_id not in wanted:
+                continue
+            label = _cockpit_account_label(
+                account_id,
+                account.get("email"),
+                account.get("api_key_label"),
+            )
+            if label:
+                labels[account_id] = label
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    missing = sorted(wanted - labels.keys())
+    if not missing or not db_path.exists():
+        return labels
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(request_logs)").fetchall()
+        }
+        if not {"account_id", "email", "api_key_label"}.issubset(columns):
+            return labels
+        placeholders = ",".join("?" for _item in missing)
+        order_sql = "timestamp DESC" if "timestamp" in columns else "rowid DESC"
+        rows = connection.execute(
+            f"""
+            SELECT account_id, email, api_key_label
+            FROM request_logs
+            WHERE account_id IN ({placeholders})
+            ORDER BY {order_sql}
+            """,
+            missing,
+        ).fetchall()
+        for account_id_value, email, api_key_label in rows:
+            account_id = _normalize_live_cockpit_account_id(account_id_value)
+            if account_id in labels:
+                continue
+            label = _cockpit_account_label(account_id, email, api_key_label)
+            if label:
+                labels[account_id] = label
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return labels
+
+
+def _parse_live_cockpit_route_event(line: str) -> dict[str, Any] | None:
+    affinity_match = LIVE_COCKPIT_AFFINITY_RE.search(line)
+    if affinity_match is not None:
+        when = _parse_time(affinity_match.group("timestamp"))
+        request_id = affinity_match.group("request_id").strip().strip('"')
+        if when is None or not request_id:
+            return None
+        action = " ".join(affinity_match.group("action").casefold().split())
+        fields = {
+            item.group("key"): item.group("value").strip().strip('"')
+            for item in LIVE_COCKPIT_LOG_FIELD_RE.finditer(
+                affinity_match.group("fields")
+            )
+        }
+        account_id = _normalize_live_cockpit_account_id(fields.get("auth"))
+        if any(fragment in action for fragment in LIVE_COCKPIT_FAILED_ROUTE_FRAGMENTS):
+            kind = "invalid"
+        elif action in LIVE_COCKPIT_ROUTE_ACTIONS and account_id:
+            kind = "route"
+        else:
+            return None
+        return {
+            "when": when,
+            "request_id": request_id,
+            "kind": kind,
+            "account_id": account_id,
+            "model": str(fields.get("model") or "").strip(),
+            "source": "session-affinity",
+        }
+
+    json_start = line.find("{")
+    if json_start < 0:
+        return None
+    when = _parse_time(line[:json_start].strip().split(" ", 1)[0])
+    if when is None:
+        return None
+    try:
+        payload = json.loads(line[json_start:])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "").strip()
+    request_id = str(payload.get("requestId") or "").strip()
+    if not request_id:
+        return None
+    if event_type == "request_started":
+        return {
+            "when": when,
+            "request_id": request_id,
+            "kind": "started",
+            "account_id": "",
+            "model": "",
+            "source": "request-started",
+        }
+    if event_type != "auth_result":
+        return None
+    account_id = _normalize_live_cockpit_account_id(
+        payload.get("accountId") or payload.get("authId")
+    )
+    succeeded = payload.get("success") is True and payload.get("authAvailable") is not False
+    return {
+        "when": when,
+        "request_id": request_id,
+        "kind": "route" if succeeded and account_id else "invalid",
+        "account_id": account_id,
+        "model": str(payload.get("model") or "").strip(),
+        "source": "auth-result",
+    }
+
+
+def _load_live_cockpit_route_events(
+    db_path: Path,
+    now_utc: datetime,
+    cache: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    logs_dir = db_path.parent / "logs"
+    if not logs_dir.exists():
+        return []
+    file_states = cache.setdefault("files", {}) if cache is not None else {}
+    event_store = cache.setdefault("events", {}) if cache is not None else {}
+    cutoff = now_utc - timedelta(seconds=LIVE_ROUTE_HINT_RETENTION_SECONDS)
+    try:
+        paths = sorted(logs_dir.glob("codex-api.log*"))
+    except OSError:
+        return []
+    live_paths: set[str] = set()
+    for path in paths:
+        try:
+            stat = path.stat()
+            if stat.st_mtime < cutoff.timestamp() - 86400:
+                continue
+            state = (max(0, int(stat.st_size)), int(stat.st_mtime_ns))
+        except OSError:
+            continue
+        path_key = str(path)
+        live_paths.add(path_key)
+        if file_states.get(path_key) == state:
+            continue
+        file_states[path_key] = state
+        for line in _read_jsonl_tail(path, LIVE_ROUTE_HINT_TAIL_BYTES):
+            event = _parse_live_cockpit_route_event(line)
+            if event is None or event["when"] < cutoff:
+                continue
+            identity = (
+                event["when"].isoformat(),
+                event["request_id"],
+                event["kind"],
+                event["account_id"],
+                event["source"],
+            )
+            event_store[identity] = event
+    for path_key in list(file_states):
+        if path_key not in live_paths:
+            file_states.pop(path_key, None)
+    for identity, event in list(event_store.items()):
+        if not isinstance(event, dict) or event.get("when") < cutoff:
+            event_store.pop(identity, None)
+    events = sorted(
+        (dict(event) for event in event_store.values()),
+        key=lambda event: (event["when"], event["request_id"]),
+    )
+    account_ids = {
+        str(event.get("account_id") or "")
+        for event in events
+        if event.get("account_id")
+    }
+    labels = _load_live_cockpit_account_labels(db_path, account_ids)
+    for event in events:
+        event["label"] = labels.get(str(event.get("account_id") or ""), "")
+    return events
+
+
+def _match_live_cockpit_route_hints(
+    turn_started_at: list[datetime | None],
+    events: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    events_by_request: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        request_id = str(event.get("request_id") or "")
+        when = event.get("when")
+        if request_id and isinstance(when, datetime):
+            events_by_request.setdefault(request_id, []).append(event)
+
+    assigned_requests: dict[int, list[tuple[str, datetime]]] = {}
+    for request_id, request_events in events_by_request.items():
+        candidates: list[tuple[float, int, datetime]] = []
+        for index, started_at in enumerate(turn_started_at):
+            if started_at is None:
+                continue
+            nearest = min(
+                request_events,
+                key=lambda event: abs((event["when"] - started_at).total_seconds()),
+            )
+            delta = abs((nearest["when"] - started_at).total_seconds())
+            if delta <= LIVE_ROUTE_HINT_MATCH_SECONDS:
+                candidates.append((delta, index, nearest["when"]))
+        candidates.sort(key=lambda item: item[0])
+        if not candidates:
+            continue
+        if (
+            len(candidates) > 1
+            and candidates[1][0] - candidates[0][0]
+            < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
+        ):
+            continue
+        _delta, turn_index, anchor_at = candidates[0]
+        assigned_requests.setdefault(turn_index, []).append((request_id, anchor_at))
+
+    hints: dict[int, dict[str, Any]] = {}
+    for turn_index, assigned in assigned_requests.items():
+        started_at = turn_started_at[turn_index]
+        if started_at is None:
+            continue
+        request_states: list[dict[str, Any]] = []
+        for request_id, anchor_at in assigned:
+            current: dict[str, Any] | None = None
+            for event in events_by_request.get(request_id, []):
+                if event["when"] < started_at - timedelta(seconds=LIVE_ROUTE_HINT_MATCH_SECONDS):
+                    continue
+                if event["kind"] == "route":
+                    if event.get("label"):
+                        current = event
+                elif event["kind"] == "invalid" and (
+                    current is None
+                    or not event.get("account_id")
+                    or event.get("account_id") == current.get("account_id")
+                ):
+                    current = None
+            if current is not None:
+                state = dict(current)
+                state["anchor_at"] = anchor_at
+                request_states.append(state)
+        labels = {str(state.get("label") or "") for state in request_states}
+        labels.discard("")
+        if len(labels) != 1:
+            continue
+        label = labels.pop()
+        selected = max(
+            (state for state in request_states if state.get("label") == label),
+            key=lambda state: state["when"],
+        )
+        hints[turn_index] = {
+            "label": label,
+            "model": str(selected.get("model") or ""),
+            "request_id": str(selected.get("request_id") or ""),
+            "account_id": str(selected.get("account_id") or ""),
+            "when": selected.get("when"),
+            "source": "active_route_hint",
+        }
+    return hints
+
+
 def _load_live_cockpit_markers(
     db_path: Path,
     now_utc: datetime,
@@ -2673,6 +3003,7 @@ def scan_live_codex_active_sessions(
     now: datetime | None = None,
     cockpit_db_path: Path | None = None,
     tail_cache: dict[Path, tuple[tuple[int, int], dict[str, Any]]] | None = None,
+    route_hint_cache: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cached_by_id = {
@@ -2796,6 +3127,7 @@ def scan_live_codex_active_sessions(
                 "modified": modified,
                 "lifecycle_at": lifecycle_at,
                 "started_at": started_at,
+                "started_dt": started_dt,
                 "latest_usage": latest_usage,
             }
         )
@@ -2803,6 +3135,18 @@ def scan_live_codex_active_sessions(
     live_matches = _match_live_cockpit_markers(
         [row.get("latest_usage") for row in parsed_rows],
         cockpit_markers,
+    )
+    route_hints = (
+        _match_live_cockpit_route_hints(
+            [row.get("started_dt") for row in parsed_rows],
+            _load_live_cockpit_route_events(
+                cockpit_db_path or COCKPIT_REQUEST_LOG_DB,
+                now_utc,
+                route_hint_cache,
+            ),
+        )
+        if api_service_route
+        else {}
     )
     active_rows: list[dict[str, Any]] = []
     for row_index, parsed_row in enumerate(parsed_rows):
@@ -2812,8 +3156,11 @@ def scan_live_codex_active_sessions(
         modified = float(parsed_row["modified"])
         lifecycle_at = str(parsed_row["lifecycle_at"] or "")
         started_at = str(parsed_row["started_at"] or "")
+        started_dt = parsed_row.get("started_dt")
         matched_marker = live_matches.get(row_index)
         matched_label = str((matched_marker or {}).get("label") or "")
+        route_hint = route_hints.get(row_index) or {}
+        route_hint_label = str(route_hint.get("label") or "")
         cached_provider = _concrete_live_provider(cached.get("provider"))
         cached_turn_started = _parse_time(
             str(
@@ -2831,9 +3178,19 @@ def scan_live_codex_active_sessions(
             and cached_turn_started is not None
             and abs((started_dt - cached_turn_started).total_seconds()) <= 1
         )
+        same_turn_provisional_provider = bool(
+            api_service_route
+            and cached.get("provider_provisional") is True
+            and cached_provider
+            and started_dt is not None
+            and cached_turn_started is not None
+            and abs((started_dt - cached_turn_started).total_seconds()) <= 1
+        )
         if api_service_route:
             provider = matched_label or (
                 cached_provider if same_turn_confirmed_provider else ""
+            ) or route_hint_label or (
+                cached_provider if same_turn_provisional_provider else ""
             )
         else:
             provider = cached_provider or current_label or matched_label
@@ -2852,7 +3209,12 @@ def scan_live_codex_active_sessions(
             {
                 "session_id": session_id,
                 "provider": provider,
-                "model": cached.get("model") or (matched_marker or {}).get("model") or "-",
+                "model": (
+                    cached.get("model")
+                    or (matched_marker or {}).get("model")
+                    or route_hint.get("model")
+                    or "-"
+                ),
                 "latest_at": latest_at,
                 "started_at": started_at or cached.get("started_at") or lifecycle_at,
                 "turn_started_at": started_at,
@@ -2862,15 +3224,28 @@ def scan_live_codex_active_sessions(
                 "provider_confirmed": bool(
                     matched_label or same_turn_confirmed_provider
                 ),
+                "provider_provisional": bool(
+                    not (matched_label or same_turn_confirmed_provider)
+                    and (route_hint_label or same_turn_provisional_provider)
+                ),
                 "provider_confirmation_source": (
                     "final_usage_marker"
                     if matched_label
                     else (
                         "same_turn_final_anchor"
                         if same_turn_confirmed_provider
-                        else ""
+                        else (
+                            "active_route_hint"
+                            if route_hint_label
+                            else (
+                                "same_turn_route_hint"
+                                if same_turn_provisional_provider
+                                else ""
+                            )
+                        )
                     )
                 ),
+                "provider_route_request_id": str(route_hint.get("request_id") or ""),
             }
         )
         active_rows.append(live)
@@ -4647,6 +5022,7 @@ class FloatingMonitorApp:
             Path,
             tuple[tuple[int, int], dict[str, Any]],
         ] = {}
+        self._live_route_hint_cache: dict[str, Any] = {}
         self._live_usage_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="token-usage-watch",
@@ -8461,6 +8837,7 @@ class FloatingMonitorApp:
                     Path.home() / ".codex" / "sessions",
                     cached_sessions,
                     tail_cache=self._live_active_tail_cache,
+                    route_hint_cache=self._live_route_hint_cache,
                 )
             except Exception:
                 sessions = None
