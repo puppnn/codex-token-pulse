@@ -125,6 +125,11 @@ SUB2API_MATCH_BASE_URLS=http://127.0.0.1:8080,http://localhost:8080
 - `%USERPROFILE%\.codex\sessions`
 - `%USERPROFILE%\.claude\projects`
 
+Claude Code 可能把同一个 API 响应按 thinking、text、tool-use 内容块重复写入 JSONL。Token Pulse
+使用稳定的 `message.id` 合并这些记录，并保留 Token 最完整的 usage 快照；缺少 `message.id`
+时只使用行 UUID 去重，不按相同 Token 数进行模糊合并，避免误删真实请求。今日总量、小时趋势和
+历史日统计共用同一份去重事件。
+
 常用配置：
 
 ```env
@@ -159,6 +164,8 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 `TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS` 默认为 `30` 秒。活跃会话仍在写日志时，常规完整扫描会暂缓；日志安静达到该时间后再更新账号归属、模型和成本。额度周期变化或完整快照超过 `TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS`（默认 10 分钟）时仍会强制校正一次，悬浮窗上的手动刷新按钮也不受此限制。
 
 `TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS` 控制官方账号身份检查间隔，默认 `1000` 毫秒，最小 `500` 毫秒。监听只读取 `config.toml` 与当前路由对应的小型认证文件，切号记录保存在本地 `client_usage_auth_switch_events.jsonl`。
+
+当 API 服务的实时 Token 事件早于 Cockpit 最终账号记录到达时，Token Pulse 会把排查信息写入本地 `client_usage_attribution_diagnostics.jsonl`。日志会记录事件/会话 ID、时间、Token 数、附近最终 marker、待归因原因和后续解析结果；不会记录 prompt、response、message 或其他对话正文。文件达到 2 MB 后自动轮转到 `.1`，两者均默认忽略 Git 提交。待归因期间 Token 仍计入总量，但不会借用上一个账号；“最近请求”会暂时保留上一条已确认请求，最终账号证据到达后再更新。
 
 悬浮窗关闭期间，Codex/Claude 仍会独立写入本地日志。重新打开后，导出器会先完整重建
 当天统计，再依据历史文件中的最后成功观测时间补录已经结束的日期。默认最多回看 31 天，

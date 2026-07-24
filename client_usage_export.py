@@ -136,6 +136,7 @@ COCKPIT_OFFICIAL_QUOTA_ENABLED = os.environ.get(
 ).strip().lower() not in {"0", "false", "no", "off"}
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
+CLAUDE_USAGE_DEDUPE_SCHEMA = 2
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
 COCKPIT_AFFINITY_TURN_MATCH_SECONDS = max(
@@ -319,6 +320,27 @@ class UsageEvent:
         return max(0, self.input_tokens) + max(0, self.cached_tokens) + max(0, self.output_tokens)
 
 
+@dataclass
+class ClaudeUsageEvent:
+    event_id: str
+    when: datetime
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    pricing_tier: str = "standard"
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            max(0, self.input_tokens)
+            + max(0, self.output_tokens)
+            + max(0, self.cache_creation_tokens)
+            + max(0, self.cache_read_tokens)
+        )
+
+
 def live_usage_event_id(event: UsageEvent) -> str:
     when = event.when
     aware = when if when.tzinfo is not None else when.replace(tzinfo=LOCAL_TZ)
@@ -365,6 +387,7 @@ class AccountMarker:
     event_key: str = ""
     request_id: str = ""
     account_id: str = ""
+    latency_ms: int = 0
 
 
 @dataclass
@@ -4083,6 +4106,7 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
             for row in con.execute("PRAGMA table_info(request_logs)").fetchall()
         }
         request_id_sql = "request_id" if "request_id" in columns else "''"
+        latency_ms_sql = "latency_ms" if "latency_ms" in columns else "0"
         rows = con.execute(
             f"""
             SELECT
@@ -4096,7 +4120,8 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 cached_tokens,
                 output_tokens,
                 event_key,
-                {request_id_sql} AS request_id
+                {request_id_sql} AS request_id,
+                {latency_ms_sql} AS latency_ms
             FROM request_logs
             WHERE timestamp >= ? AND timestamp < ?
               AND {COCKPIT_RECORDED_USAGE_SQL}
@@ -4122,6 +4147,7 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
         output_tokens,
         event_key,
         request_id,
+        latency_ms,
     ) in rows:
         when = ms_to_local_datetime(timestamp)
         if when is None:
@@ -4157,6 +4183,7 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
                 event_key=str(event_key or "").strip(),
                 request_id=str(request_id or "").strip(),
                 account_id=normalize_cockpit_auth_id(account_id),
+                latency_ms=max(0, int(latency_ms or 0)),
             )
         )
     return markers
@@ -4452,97 +4479,214 @@ def attribute_codex_events_by_account(
     return attributed
 
 
-def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
-    bucket = UsageBucket()
-    for path in iter_recent_jsonl(root, start):
+def claude_usage_int(usage: dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(usage.get(key) or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def iter_recent_claude_jsonl(root: Path, start: datetime) -> list[Path]:
+    if not root.exists():
+        return []
+    threshold = start - timedelta(hours=2)
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        candidates = root.rglob("*.jsonl")
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+                stat = resolved.stat()
+            except OSError:
+                continue
+            parts = {part.lower() for part in resolved.parts}
+            if any(part.startswith("backup-") for part in parts) or ".tmp" in parts:
+                continue
+            if resolved in seen or datetime.fromtimestamp(stat.st_mtime) < threshold:
+                continue
+            seen.add(resolved)
+            paths.append(resolved)
+    except OSError:
+        return []
+    return sorted(paths, key=lambda path: str(path).lower())
+
+
+def claude_event_from_row(row: dict[str, Any], fallback_id: str) -> ClaudeUsageEvent | None:
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    when = parse_dt(row.get("timestamp"))
+    if when is None:
+        return None
+
+    input_tokens = claude_usage_int(usage, "input_tokens")
+    output_tokens = claude_usage_int(usage, "output_tokens")
+    cache_creation = claude_usage_int(usage, "cache_creation_input_tokens")
+    if cache_creation <= 0 and isinstance(usage.get("cache_creation"), dict):
+        cache_creation = sum(
+            claude_usage_int(usage["cache_creation"], key)
+            for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+        )
+    cache_read = claude_usage_int(usage, "cache_read_input_tokens")
+    total = input_tokens + output_tokens + cache_creation + cache_read
+    if total <= 0 or total > MAX_SINGLE_EVENT_TOKENS:
+        return None
+
+    message_id = str(message.get("id") or "").strip()
+    row_id = str(row.get("uuid") or "").strip()
+    session_id = str(row.get("sessionId") or "").strip()
+    if message_id:
+        event_id = f"message:{message_id}"
+    elif row_id:
+        event_id = f"row:{session_id}:{row_id}"
+    else:
+        event_id = f"line:{fallback_id}"
+    model = str(message.get("model") or row.get("model") or "claude").strip() or "claude"
+    pricing_tier = normalize_pricing_tier(
+        usage.get("service_tier") or usage.get("speed") or "standard"
+    )
+    return ClaudeUsageEvent(
+        event_id=event_id,
+        when=when,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+        pricing_tier=pricing_tier,
+    )
+
+
+def claude_event_snapshot_score(event: ClaudeUsageEvent) -> tuple[int, int, datetime]:
+    populated_components = sum(
+        value > 0
+        for value in (
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_creation_tokens,
+            event.cache_read_tokens,
+        )
+    )
+    return event.total_tokens, populated_components, event.when
+
+
+def scan_claude_events(root: Path, start: datetime, end: datetime) -> list[ClaudeUsageEvent]:
+    # Claude Code may persist one API response once per thinking/text/tool block.
+    grouped: dict[str, tuple[datetime, ClaudeUsageEvent]] = {}
+    for path in iter_recent_claude_jsonl(root, start):
         try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            handle = path.open("r", encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = parse_dt(row.get("timestamp"))
-            if ts is None or ts < start or ts >= end:
-                continue
-            message = row.get("message") or {}
-            if message.get("role") != "assistant":
-                continue
-            usage = message.get("usage") or {}
-            if not usage:
-                continue
-            input_tokens = int(usage.get("input_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or 0)
-            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-            cache_read = int(usage.get("cache_read_input_tokens") or 0)
-            total = input_tokens + output_tokens + cache_creation + cache_read
-            if total <= 0:
-                continue
-            model = str(message.get("model") or row.get("model") or "claude")
-            bucket.requests += 1
-            bucket.input_tokens += input_tokens
-            bucket.output_tokens += output_tokens
-            bucket.cache_creation_input_tokens += cache_creation
-            bucket.cache_read_input_tokens += cache_read
-            bucket.cost += estimate_cost(
-                model,
-                input_tokens,
-                cache_read,
-                output_tokens,
-                cache_creation_tokens=cache_creation,
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                message = row.get("message")
+                needs_fallback_id = (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and not str(message.get("id") or "").strip()
+                    and not str(row.get("uuid") or "").strip()
+                )
+                fallback_id = (
+                    hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest()
+                    if needs_fallback_id
+                    else ""
+                )
+                event = claude_event_from_row(row, fallback_id)
+                if event is None:
+                    continue
+                existing = grouped.get(event.event_id)
+                if existing is None:
+                    grouped[event.event_id] = (event.when, event)
+                    continue
+                first_when, best = existing
+                if claude_event_snapshot_score(event) > claude_event_snapshot_score(best):
+                    best = event
+                grouped[event.event_id] = (min(first_when, event.when), best)
+
+    events: list[ClaudeUsageEvent] = []
+    for first_when, best in grouped.values():
+        if first_when < start or first_when >= end:
+            continue
+        events.append(
+            ClaudeUsageEvent(
+                event_id=best.event_id,
+                when=first_when,
+                model=best.model,
+                input_tokens=best.input_tokens,
+                output_tokens=best.output_tokens,
+                cache_creation_tokens=best.cache_creation_tokens,
+                cache_read_tokens=best.cache_read_tokens,
+                pricing_tier=best.pricing_tier,
             )
-            bucket.add_model(model, total)
-            bucket.mark_latest(ts, model)
+        )
+    events.sort(key=lambda event: (event.when, event.event_id))
+    return events
+
+
+def add_claude_event_to_bucket(bucket: UsageBucket, event: ClaudeUsageEvent) -> None:
+    bucket.requests += 1
+    bucket.input_tokens += event.input_tokens
+    bucket.output_tokens += event.output_tokens
+    bucket.cache_creation_input_tokens += event.cache_creation_tokens
+    bucket.cache_read_input_tokens += event.cache_read_tokens
+    bucket.cost += estimate_cost(
+        event.model,
+        event.input_tokens,
+        event.cache_read_tokens,
+        event.output_tokens,
+        cache_creation_tokens=event.cache_creation_tokens,
+        pricing_tier=event.pricing_tier,
+    )
+    bucket.add_model(event.model, event.total_tokens)
+    bucket.mark_latest(event.when, event.model)
+
+
+def bucket_from_claude_events(events: list[ClaudeUsageEvent]) -> UsageBucket:
+    bucket = UsageBucket()
+    for event in events:
+        add_claude_event_to_bucket(bucket, event)
     return bucket
 
 
-def scan_claude_hourly(root: Path, start: datetime, end: datetime) -> list[dict[str, Any]]:
+def scan_claude(root: Path, start: datetime, end: datetime) -> UsageBucket:
+    return bucket_from_claude_events(scan_claude_events(root, start, end))
+
+
+def claude_hourly_from_events(events: list[ClaudeUsageEvent]) -> list[dict[str, Any]]:
     buckets = [
         {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
         for hour in range(24)
     ]
-    for path in iter_recent_jsonl(root, start):
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = parse_dt(row.get("timestamp"))
-            if ts is None or ts < start or ts >= end:
-                continue
-            message = row.get("message") or {}
-            if message.get("role") != "assistant":
-                continue
-            usage = message.get("usage") or {}
-            if not usage:
-                continue
-            input_tokens = int(usage.get("input_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or 0)
-            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-            cache_read = int(usage.get("cache_read_input_tokens") or 0)
-            total = input_tokens + output_tokens + cache_creation + cache_read
-            if total <= 0:
-                continue
-            model = str(message.get("model") or row.get("model") or "claude")
-            bucket = buckets[max(0, min(23, ts.hour))]
-            bucket["requests"] += 1
-            bucket["tokens"] += total
-            bucket["cost"] += estimate_cost(
-                model,
-                input_tokens,
-                cache_read,
-                output_tokens,
-                cache_creation_tokens=cache_creation,
-            )
+    for event in events:
+        bucket = buckets[max(0, min(23, event.when.hour))]
+        bucket["requests"] += 1
+        bucket["tokens"] += event.total_tokens
+        bucket["cost"] += estimate_cost(
+            event.model,
+            event.input_tokens,
+            event.cache_read_tokens,
+            event.output_tokens,
+            cache_creation_tokens=event.cache_creation_tokens,
+            pricing_tier=event.pricing_tier,
+        )
     for bucket in buckets:
         bucket["cost"] = round(float(bucket["cost"] or 0), 6)
     return buckets
+
+
+def scan_claude_hourly(root: Path, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    return claude_hourly_from_events(scan_claude_events(root, start, end))
 
 
 def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
@@ -4742,6 +4886,17 @@ def account_markers_by_total_tokens(markers: list[AccountMarker]) -> dict[int, l
     return indexed
 
 
+def account_marker_covers_event_time(
+    marker: AccountMarker,
+    event_time: datetime,
+) -> bool:
+    delta_seconds = (marker.when - event_time).total_seconds()
+    if abs(delta_seconds) <= API_SERVICE_ACTIVITY_MATCH_SECONDS:
+        return True
+    latency_seconds = max(0.0, float(marker.latency_ms or 0) / 1000.0)
+    return latency_seconds > 0 and 0 <= delta_seconds <= latency_seconds
+
+
 def concrete_api_service_account_marker(
     event: UsageEvent,
     markers: list[AccountMarker],
@@ -4769,7 +4924,7 @@ def concrete_api_service_account_marker(
     nearby = [
         marker
         for marker in exact_candidates
-        if abs((marker.when - event_time).total_seconds()) <= API_SERVICE_ACTIVITY_MATCH_SECONDS
+        if account_marker_covers_event_time(marker, event_time)
     ]
     if nearby:
         return min(nearby, key=lambda marker: abs((marker.when - event_time).total_seconds()))
@@ -4846,6 +5001,120 @@ def api_service_event_turn_start(event: UsageEvent) -> datetime | None:
     if turn_started_at is None and event.request_at is not None and event.request_at != event.when:
         turn_started_at = event.request_at
     return turn_started_at
+
+
+def account_marker_request_start(marker: AccountMarker) -> datetime | None:
+    latency_ms = max(0, int(marker.latency_ms or 0))
+    if latency_ms <= 0:
+        return None
+    return marker.when - timedelta(milliseconds=latency_ms)
+
+
+def cockpit_request_start_turn_anchors(
+    records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]],
+    account_markers: list[AccountMarker],
+    affinity_events: list[CockpitAffinityEvent],
+) -> dict[str, tuple[datetime, AccountMarker]]:
+    """Join a turn to a completed Cockpit request by its measured start time."""
+    if not records or not account_markers or not affinity_events:
+        return {}
+
+    turn_starts: dict[str, datetime] = {}
+    events_by_turn: dict[str, list[UsageEvent]] = {}
+    for _label, event, _session_id, turn_key, _marker in records:
+        turn_start = api_service_event_turn_start(event)
+        if not turn_key or turn_start is None:
+            continue
+        previous = turn_starts.get(turn_key)
+        if previous is None or turn_start < previous:
+            turn_starts[turn_key] = turn_start
+        events_by_turn.setdefault(turn_key, []).append(event)
+    if not turn_starts:
+        return {}
+
+    affinity_by_request: dict[str, list[CockpitAffinityEvent]] = {}
+    for item in affinity_events:
+        if not item.request_id or item.source.lower().startswith("prompt_cache_key"):
+            continue
+        affinity_by_request.setdefault(item.request_id, []).append(item)
+
+    ordered_turns = sorted(
+        (account_marker_epoch(turn_start), turn_key, turn_start)
+        for turn_key, turn_start in turn_starts.items()
+    )
+    turn_epochs = [item[0] for item in ordered_turns]
+    match_seconds = COCKPIT_AFFINITY_TURN_MATCH_SECONDS
+    ambiguity_seconds = COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS
+    candidates_by_turn: dict[str, list[tuple[float, AccountMarker]]] = {}
+
+    final_by_request: dict[str, AccountMarker] = {}
+    for marker in account_markers:
+        if (
+            marker.kind != "request"
+            or not marker.request_id
+            or not marker.model
+            or not usable_cockpit_account_label(marker.label)
+            or not account_marker_has_recorded_usage(marker)
+            or account_marker_request_start(marker) is None
+        ):
+            continue
+        previous = final_by_request.get(marker.request_id)
+        if previous is None or marker.when > previous.when:
+            final_by_request[marker.request_id] = marker
+
+    for request_id, marker in final_by_request.items():
+        request_start = account_marker_request_start(marker)
+        request_affinity = affinity_by_request.get(request_id, [])
+        if request_start is None or not request_affinity:
+            continue
+        center = account_marker_epoch(request_start)
+        left = bisect_left(turn_epochs, center - match_seconds)
+        right = bisect_right(turn_epochs, center + match_seconds)
+        turn_candidates: list[tuple[float, str, datetime]] = []
+        for epoch, turn_key, turn_start in ordered_turns[left:right]:
+            if not any(
+                abs((item.when - turn_start).total_seconds()) <= match_seconds
+                for item in request_affinity
+            ):
+                continue
+            events = events_by_turn.get(turn_key, [])
+            marker_model = codex_model_name(marker.model).lower()
+            if not any(codex_model_name(event.model).lower() == marker_model for event in events):
+                continue
+            if not any(account_marker_covers_event_time(marker, event.when) for event in events):
+                continue
+            turn_candidates.append((abs(epoch - center), turn_key, turn_start))
+
+        turn_candidates.sort(key=lambda item: (item[0], item[1]))
+        if not turn_candidates:
+            continue
+        if (
+            len(turn_candidates) > 1
+            and turn_candidates[1][0] - turn_candidates[0][0] < ambiguity_seconds
+        ):
+            continue
+        delta, turn_key, _turn_start = turn_candidates[0]
+        candidates_by_turn.setdefault(turn_key, []).append((delta, marker))
+
+    anchors: dict[str, tuple[datetime, AccountMarker]] = {}
+    for turn_key, candidates in candidates_by_turn.items():
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                -account_marker_epoch(item[1].when),
+                item[1].request_id,
+            )
+        )
+        best_delta, best_marker = candidates[0]
+        competing = [
+            delta
+            for delta, marker in candidates[1:]
+            if marker.label != best_marker.label
+        ]
+        if competing and competing[0] - best_delta < ambiguity_seconds:
+            continue
+        anchors[turn_key] = (turn_starts[turn_key], best_marker)
+    return anchors
 
 
 def cockpit_near_time_turn_anchors(
@@ -5678,6 +5947,16 @@ def resolve_api_service_event_accounts(
     for anchors in anchors_by_turn.values():
         anchors.sort(key=lambda item: item[0])
 
+    request_start_anchors = cockpit_request_start_turn_anchors(
+        records,
+        account_markers,
+        affinity_events or [],
+    )
+    for turn_key, anchor in request_start_anchors.items():
+        if anchors_by_turn.get(turn_key):
+            continue
+        anchors_by_turn[turn_key] = [anchor]
+
     if isinstance(marker_index, AccountMarkerTokenIndex):
         near_time_anchors = cockpit_near_time_turn_anchors(
             records,
@@ -5938,6 +6217,15 @@ def merge_missing_cockpit_account_events(
                 used_marker_ids.add(id(marker))
                 represented.add(cockpit_marker_identity(marker))
         records[record_index] = (label, event, session_id, turn_key, marker)
+
+    request_start_anchors = cockpit_request_start_turn_anchors(
+        records,
+        account_markers,
+        affinity_events or [],
+    )
+    for _turn_start, marker in request_start_anchors.values():
+        used_marker_ids.add(id(marker))
+        represented.add(cockpit_marker_identity(marker))
 
     if isinstance(marker_index, AccountMarkerTokenIndex):
         near_time_anchors = cockpit_near_time_turn_anchors(
@@ -6210,48 +6498,9 @@ def scan_claude_daily_buckets(
     end: datetime,
 ) -> dict[date, UsageBucket]:
     buckets: dict[date, UsageBucket] = {}
-    for path in iter_recent_jsonl(root, start):
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            when = parse_dt(row.get("timestamp"))
-            if when is None or when < start or when >= end:
-                continue
-            message = row.get("message") or {}
-            if message.get("role") != "assistant":
-                continue
-            usage = message.get("usage") or {}
-            if not usage:
-                continue
-            input_tokens = int(usage.get("input_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or 0)
-            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-            cache_read = int(usage.get("cache_read_input_tokens") or 0)
-            total_tokens = input_tokens + output_tokens + cache_creation + cache_read
-            if total_tokens <= 0:
-                continue
-            model = str(message.get("model") or row.get("model") or "claude")
-            bucket = buckets.setdefault(when.date(), UsageBucket())
-            bucket.requests += 1
-            bucket.input_tokens += input_tokens
-            bucket.output_tokens += output_tokens
-            bucket.cache_creation_input_tokens += cache_creation
-            bucket.cache_read_input_tokens += cache_read
-            bucket.cost += estimate_cost(
-                model,
-                input_tokens,
-                cache_read,
-                output_tokens,
-                cache_creation_tokens=cache_creation,
-            )
-            bucket.add_model(model, total_tokens)
-            bucket.mark_latest(when, model)
+    for event in scan_claude_events(root, start, end):
+        bucket = buckets.setdefault(event.when.date(), UsageBucket())
+        add_claude_event_to_bucket(bucket, event)
     return buckets
 
 
@@ -6368,6 +6617,7 @@ def build_historical_usage_rows(
         rows[key] = {
             "date": key,
             "source": "local-backfill",
+            "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "requests": int(total_row.get("requests") or 0),
             "tokens": int(total_row.get("tokens") or 0),
             "input_tokens": int(total_row.get("input_tokens") or 0),
@@ -6569,6 +6819,13 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     if str(existing.get("date") or "") != day.isoformat():
         return
     collapse_api_service_mirror_providers(existing)
+    try:
+        current_claude_schema = int(output.get("claude_usage_schema") or 0)
+        existing_claude_schema = int(existing.get("claude_usage_schema") or 0)
+    except (TypeError, ValueError):
+        current_claude_schema = 0
+        existing_claude_schema = 0
+    claude_schema_upgrade = current_claude_schema > existing_claude_schema
     current_api_aggregate = bool(output.get("api_service_aggregate"))
     current_api_account_routing = current_api_aggregate or bool(output.get("api_service_routed"))
 
@@ -6667,10 +6924,15 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
 
     existing_today = existing.get("today")
     current_today = output.get("today")
-    if not current_api_aggregate and isinstance(existing_today, dict) and isinstance(current_today, dict):
+    if (
+        not current_api_aggregate
+        and not claude_schema_upgrade
+        and isinstance(existing_today, dict)
+        and isinstance(current_today, dict)
+    ):
         merge_cumulative(current_today, existing_today)
     merge_latest_request()
-    if not current_api_aggregate:
+    if not current_api_aggregate and not claude_schema_upgrade:
         merge_hourly_today()
     if "account_30d_updated_at" not in output and existing.get("account_30d_updated_at"):
         output["account_30d_updated_at"] = existing["account_30d_updated_at"]
@@ -6689,6 +6951,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             continue
         name = str(previous.get("name") or "")
         if not name:
+            continue
+        if claude_schema_upgrade and name == "Claude local":
             continue
         current = current_by_name.get(name)
         if current_api_account_routing:
@@ -6735,6 +6999,14 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
     if not isinstance(row, dict) or not isinstance(today, dict):
         return
     row = dict(row)
+    try:
+        current_claude_schema = int(output.get("claude_usage_schema") or 0)
+        history_claude_schema = int(row.get("claude_usage_schema") or 0)
+    except (TypeError, ValueError):
+        current_claude_schema = 0
+        history_claude_schema = 0
+    if current_claude_schema > history_claude_schema:
+        return
     try:
         history_tokens = int(row.get("tokens") or 0)
         current_tokens = int(today.get("tokens") or 0)
@@ -7260,6 +7532,7 @@ def build_live_catchup_payload(
     if through <= since:
         return {
             "schema": 1,
+            "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "events": [],
@@ -7368,6 +7641,7 @@ def build_live_catchup_payload(
     rows.sort(key=lambda row: (str(row.get("when") or ""), str(row.get("event_id") or "")))
     return {
         "schema": 1,
+        "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "events": rows,
@@ -7533,7 +7807,8 @@ def main() -> int:
     )
 
     claude_root = home / ".claude" / "projects"
-    claude = scan_claude(claude_root, start, scan_end)
+    claude_events = scan_claude_events(claude_root, start, scan_end)
+    claude = bucket_from_claude_events(claude_events)
     hourly_codex_events = [
         event
         for events in attributed_events.values()
@@ -7541,7 +7816,7 @@ def main() -> int:
     ]
     hourly_today = merge_hourly_buckets(
         codex_hourly_from_events(hourly_codex_events),
-        scan_claude_hourly(claude_root, start, scan_end),
+        claude_hourly_from_events(claude_events),
     )
     mark_codex_failure_hours(
         hourly_today,
@@ -7673,6 +7948,7 @@ def main() -> int:
 
     output = {
         "schema": 1,
+        "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "source": "client-jsonl",
         "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "date": day.isoformat(),

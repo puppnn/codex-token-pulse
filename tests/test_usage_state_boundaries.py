@@ -173,6 +173,35 @@ class CodexAuthIdentityTests(unittest.TestCase):
                 "\u8d26\u53f7\u6c60",
             )
 
+    def test_recent_api_service_aggregate_is_marked_as_attributing(self) -> None:
+        now = datetime.now(timezone.utc)
+        with patch.object(monitor, "local_account_type_map", return_value={}):
+            self.assertEqual(
+                monitor.account_type_label(
+                    {
+                        "name": "Codex local - api-service-local",
+                        "is_api_service_aggregate": True,
+                        "latest_at": now.isoformat(),
+                    }
+                ),
+                "\u5f52\u56e0\u4e2d",
+            )
+            self.assertEqual(
+                monitor.account_type_label(
+                    {
+                        "name": "Codex local - api-service-local",
+                        "is_api_service_aggregate": True,
+                        "latest_at": (
+                            now
+                            - timedelta(
+                                seconds=monitor.ATTRIBUTION_IN_PROGRESS_SECONDS + 1
+                            )
+                        ).isoformat(),
+                    }
+                ),
+                "\u5f85\u5f52\u56e0",
+            )
+
     def test_account_type_history_survives_cockpit_account_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -957,6 +986,29 @@ class UsageHistoryIsolationTests(unittest.TestCase):
         saved = monitor.load_usage_history()["days"][self.day]
         self.assertEqual(state.today_tokens, 100_000)
         self.assertEqual(saved["tokens"], 1_000_000)
+
+    def test_claude_schema_upgrade_replaces_legacy_history_high_water(self) -> None:
+        self.seed_history("local")
+        state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=9,
+            today_tokens=900_000,
+            today_account_cost=9.0,
+            client_usage={
+                "date": self.day,
+                "claude_usage_schema": client_usage_export.CLAUDE_USAGE_DEDUPE_SCHEMA,
+                "providers": [],
+            },
+        )
+
+        monitor.update_usage_history(state)
+
+        saved = monitor.load_usage_history()["days"][self.day]
+        self.assertEqual(saved["tokens"], 900_000)
+        self.assertEqual(
+            saved["claude_usage_schema"],
+            client_usage_export.CLAUDE_USAGE_DEDUPE_SCHEMA,
+        )
 
 
 class AccountUsageSortTests(unittest.TestCase):
@@ -3165,13 +3217,14 @@ class LatestRequestFallbackTests(unittest.TestCase):
                     input_tokens INTEGER,
                     cached_tokens INTEGER,
                     output_tokens INTEGER,
-                    event_key TEXT
+                    event_key TEXT,
+                    latency_ms INTEGER
                 )
                 """
             )
             at = datetime(2026, 7, 12, 8, 0, 0)
             connection.executemany(
-                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         client_usage_export.local_epoch_ms(at),
@@ -3185,6 +3238,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
                         0,
                         0,
                         "failed",
+                        500,
                     ),
                     (
                         client_usage_export.local_epoch_ms(at + timedelta(seconds=1)),
@@ -3198,6 +3252,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
                         20,
                         3,
                         "completed",
+                        1_250,
                     ),
                     (
                         client_usage_export.local_epoch_ms(at + timedelta(seconds=2)),
@@ -3211,6 +3266,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
                         20,
                         1,
                         "cancelled-with-usage",
+                        2_500,
                     ),
                 ],
             )
@@ -3232,6 +3288,8 @@ class LatestRequestFallbackTests(unittest.TestCase):
         )
         self.assertEqual(markers[0].total_tokens, 123)
         self.assertEqual(markers[1].total_tokens, 321)
+        self.assertEqual(markers[0].latency_ms, 1_250)
+        self.assertEqual(markers[1].latency_ms, 2_500)
 
     def test_unique_token_match_outside_activity_window_is_not_reused(self) -> None:
         event = client_usage_export.UsageEvent(
@@ -3326,6 +3384,220 @@ class LatestRequestFallbackTests(unittest.TestCase):
         self.assertEqual(deferred_count, 0)
         self.assertEqual(settled_count, 1)
         self.assertEqual(settled[marker.label][0].total_tokens, marker.total_tokens)
+
+    def test_exact_token_match_uses_explicit_request_latency_interval(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 23, 18, 57, 43),
+            model="gpt-5.5",
+            input_tokens=76_752,
+            cached_tokens=10_624,
+            output_tokens=772,
+        )
+        marker = client_usage_export.AccountMarker(
+            when=event.when + timedelta(seconds=360),
+            label="Codex local - final@example.com",
+            total_tokens=event.total_tokens,
+            input_tokens=event.input_tokens,
+            cached_tokens=event.cached_tokens,
+            output_tokens=event.output_tokens,
+            latency_ms=360_500,
+        )
+
+        self.assertIs(
+            client_usage_export.concrete_api_service_account_marker(
+                event,
+                [marker],
+            ),
+            marker,
+        )
+
+    def test_request_start_latency_resolves_intermediate_turn_to_final_account(self) -> None:
+        turn_started_at = datetime(2026, 7, 23, 10, 4, 59, 40000)
+        intermediate = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 23, 10, 5, 30, 864000),
+            model="gpt-5.6-sol",
+            input_tokens=29_648,
+            cached_tokens=3_840,
+            output_tokens=1_479,
+            session_id="long-cockpit-session",
+            account_at=turn_started_at,
+        )
+        later = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 23, 10, 22, 46, 579000),
+            model="gpt-5.6-sol",
+            input_tokens=483,
+            cached_tokens=185_088,
+            output_tokens=73,
+            session_id=intermediate.session_id,
+            account_at=datetime(2026, 7, 23, 10, 6, 6, 327000),
+        )
+        target = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 23, 10, 23, 20, 511000),
+            label="Codex local - final-long@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=later.total_tokens,
+            input_tokens=185_571,
+            cached_tokens=later.cached_tokens,
+            output_tokens=later.output_tokens,
+            request_id="final-long-request",
+            account_id="final-long-account",
+            latency_ms=1_101_207,
+        )
+        overlapping = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 23, 10, 7, 2, 490000),
+            label="Codex local - older-overlap@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=192_171,
+            input_tokens=192_068,
+            cached_tokens=183_040,
+            output_tokens=103,
+            request_id="older-overlap-request",
+            account_id="older-overlap-account",
+            latency_ms=478_367,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=218),
+                request_id=overlapping.request_id,
+                account_id=overlapping.account_id,
+                label=overlapping.label,
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=273),
+                request_id=target.request_id,
+                account_id=target.account_id,
+                label=target.label,
+                action="cache hit",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [intermediate, later]},
+                [overlapping, target],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[target.label], [intermediate, later])
+        self.assertEqual(session_accounts[intermediate.session_id], target.label)
+        self.assertEqual(unresolved, 0)
+
+    def test_request_start_latency_filters_concurrent_request_by_model(self) -> None:
+        turn_started_at = datetime(2026, 7, 23, 13, 54, 34, 432000)
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 23, 13, 54, 50, 254000),
+            model="gpt-5.6-sol",
+            input_tokens=29_267,
+            cached_tokens=3_840,
+            output_tokens=524,
+            session_id="model-filter-session",
+            account_at=turn_started_at,
+        )
+        target = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 23, 14, 8, 42, 125000),
+            label="Codex local - sol-final@example.com",
+            model=event.model,
+            total_tokens=132_442,
+            input_tokens=132_366,
+            cached_tokens=131_840,
+            output_tokens=76,
+            request_id="sol-final-request",
+            account_id="sol-final-account",
+            latency_ms=847_432,
+        )
+        other_model = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 23, 14, 0, 0),
+            label="Codex local - other-model@example.com",
+            model="gpt-5.5",
+            total_tokens=110_717,
+            input_tokens=110_108,
+            cached_tokens=106_880,
+            output_tokens=609,
+            request_id="other-model-request",
+            account_id="other-model-account",
+            latency_ms=325_700,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at - timedelta(milliseconds=90),
+                request_id=other_model.request_id,
+                account_id=other_model.account_id,
+                label=other_model.label,
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=270),
+                request_id=target.request_id,
+                account_id=target.account_id,
+                label=target.label,
+                action="cache hit",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [other_model, target],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[target.label], [event])
+        self.assertEqual(session_accounts[event.session_id], target.label)
+        self.assertEqual(unresolved, 0)
+
+    def test_request_start_latency_keeps_concurrent_accounts_ambiguous(self) -> None:
+        turn_started_at = datetime(2026, 7, 23, 15, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=5),
+            model="gpt-5.6-sol",
+            input_tokens=10_000,
+            cached_tokens=2_000,
+            output_tokens=100,
+            session_id="ambiguous-request-start-session",
+            account_at=turn_started_at,
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=turn_started_at + timedelta(seconds=60),
+                label=f"Codex local - account-{index}@example.com",
+                model=event.model,
+                total_tokens=20_000 + index,
+                input_tokens=19_900 + index,
+                output_tokens=100,
+                request_id=f"ambiguous-request-{index}",
+                account_id=f"ambiguous-account-{index}",
+                latency_ms=59_700 - index * 100,
+            )
+            for index in range(2)
+        ]
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=50),
+                request_id=marker.request_id,
+                account_id=marker.account_id,
+                label=marker.label,
+                action="cache hit",
+            )
+            for marker in markers
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                markers,
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(
+            resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+            [event],
+        )
+        self.assertEqual(session_accounts, {})
+        self.assertEqual(unresolved, 1)
 
     def test_cockpit_union_does_not_duplicate_near_time_request_with_different_token_total(self) -> None:
         event = client_usage_export.UsageEvent(
@@ -3765,6 +4037,60 @@ class LocalExportHighWaterTests(unittest.TestCase):
         client_usage_export.restore_today_from_usage_history(current, self.day)
 
         self.assertEqual(current["today"]["tokens"], 1_100)
+
+
+    def test_claude_schema_upgrade_does_not_restore_legacy_duplicate_high_water(self) -> None:
+        previous = self.snapshot(self.day, 800_000)
+        previous["today"]["tokens"] = 1_000_000
+        previous["today"]["input_tokens"] = 1_000_000
+        previous["providers"].append(
+            {
+                "name": "Claude local",
+                "requests": 2,
+                "tokens": 200_000,
+                "input_tokens": 200_000,
+                "cached_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 0,
+                "cost": 2.0,
+            }
+        )
+        previous["dashboard"]["hourly_today"][0]["tokens"] = 1_000_000
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+        self.history_path.write_text(
+            json.dumps({"days": {self.day.isoformat(): previous["today"]}}),
+            encoding="utf-8",
+        )
+
+        current = self.snapshot(self.day, 800_000)
+        current["claude_usage_schema"] = client_usage_export.CLAUDE_USAGE_DEDUPE_SCHEMA
+        current["today"]["tokens"] = 880_000
+        current["today"]["input_tokens"] = 880_000
+        current["providers"].append(
+            {
+                "name": "Claude local",
+                "requests": 1,
+                "tokens": 80_000,
+                "input_tokens": 80_000,
+                "cached_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 0,
+                "cost": 0.8,
+            }
+        )
+        current["dashboard"]["hourly_today"][0]["tokens"] = 880_000
+
+        client_usage_export.same_day_output_high_water(current, self.output_path, self.day)
+        client_usage_export.restore_today_from_usage_history(current, self.day)
+
+        claude = next(
+            provider
+            for provider in current["providers"]
+            if provider["name"] == "Claude local"
+        )
+        self.assertEqual(current["today"]["tokens"], 880_000)
+        self.assertEqual(claude["tokens"], 80_000)
+        self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 880_000)
 
 
 class WindowSemanticsTests(unittest.TestCase):
@@ -5671,6 +5997,256 @@ class LiveActiveSessionScanTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["provider"], "Codex local - routed@example.com")
         self.assertEqual(rows[0]["model"], "gpt-test")
+        self.assertTrue(rows[0]["provider_confirmed"])
+        self.assertEqual(
+            rows[0]["usage_event_id"],
+            monitor._live_usage_event_id(
+                token_at,
+                self.SESSION_ID,
+                10_000,
+                8_000,
+                500,
+            ),
+        )
+
+    def test_api_service_session_keeps_confirmed_provider_within_same_turn(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(seconds=30)
+        first_token_at = now - timedelta(seconds=20)
+        latest_token_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            db_path = root / "requests.sqlite"
+            path = self.write_live_rows(
+                sessions,
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-1"},
+                    },
+                    {
+                        "timestamp": first_token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 10_000,
+                                    "cached_input_tokens": 8_000,
+                                    "output_tokens": 500,
+                                    "total_tokens": 10_500,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+            self.write_cockpit_marker(
+                db_path,
+                first_token_at + timedelta(milliseconds=150),
+                email="routed@example.com",
+                input_tokens=10_000,
+                cached_tokens=8_000,
+                output_tokens=500,
+            )
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                confirmed = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    [],
+                    now=now,
+                    cockpit_db_path=db_path,
+                )
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp": latest_token_at.isoformat(),
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {
+                                            "input_tokens": 20_000,
+                                            "cached_input_tokens": 18_000,
+                                            "output_tokens": 700,
+                                            "total_tokens": 20_700,
+                                        }
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                carried = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    confirmed,
+                    now=now,
+                    cockpit_db_path=db_path,
+                )
+
+        self.assertEqual(confirmed[0]["provider"], "Codex local - routed@example.com")
+        self.assertEqual(carried[0]["provider"], "Codex local - routed@example.com")
+        self.assertTrue(carried[0]["provider_confirmed"])
+        self.assertEqual(
+            carried[0]["provider_confirmation_source"],
+            "same_turn_final_anchor",
+        )
+        self.assertEqual(
+            carried[0]["usage_event_id"],
+            monitor._live_usage_event_id(
+                latest_token_at,
+                self.SESSION_ID,
+                20_000,
+                18_000,
+                700,
+            ),
+        )
+
+    def test_api_service_session_does_not_carry_provider_into_new_turn(self) -> None:
+        now = datetime.now(timezone.utc)
+        new_started_at = now - timedelta(seconds=2)
+        token_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            self.write_live_rows(
+                sessions,
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": new_started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-new"},
+                    },
+                    {
+                        "timestamp": token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 20_000,
+                                    "cached_input_tokens": 18_000,
+                                    "output_tokens": 700,
+                                    "total_tokens": 20_700,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+            cached = [
+                {
+                    "session_id": self.SESSION_ID,
+                    "provider": "Codex local - previous@example.com",
+                    "provider_confirmed": True,
+                    "turn_started_at": (now - timedelta(minutes=5)).isoformat(),
+                }
+            ]
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    cached,
+                    now=now,
+                    cockpit_db_path=root / "missing.sqlite",
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["provider"], "API 服务 · 正在确认账号")
+        self.assertFalse(rows[0]["provider_confirmed"])
+        self.assertEqual(rows[0]["provider_confirmation_source"], "")
+
+    def test_api_service_same_turn_carry_uses_each_sessions_own_usage(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(seconds=2)
+        other_session_id = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir(parents=True)
+            waiting_path = sessions / f"rollout-current-{self.SESSION_ID}.jsonl"
+            waiting_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                        {
+                            "timestamp": started_at.isoformat(),
+                            "type": "event_msg",
+                            "payload": {"type": "task_started", "turn_id": "turn-a"},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            active_path = sessions / f"rollout-other-{other_session_id}.jsonl"
+            active_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {"type": "session_meta", "payload": {"id": other_session_id}},
+                        {
+                            "timestamp": started_at.isoformat(),
+                            "type": "event_msg",
+                            "payload": {"type": "task_started", "turn_id": "turn-b"},
+                        },
+                        {
+                            "timestamp": (now - timedelta(seconds=1)).isoformat(),
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "last_token_usage": {
+                                        "input_tokens": 1_000,
+                                        "cached_input_tokens": 800,
+                                        "output_tokens": 50,
+                                        "total_tokens": 1_050,
+                                    }
+                                },
+                            },
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(active_path, (now.timestamp() - 1, now.timestamp() - 1))
+            os.utime(waiting_path, (now.timestamp(), now.timestamp()))
+            cached = [
+                {
+                    "session_id": self.SESSION_ID,
+                    "provider": "Codex local - confirmed@example.com",
+                    "provider_confirmed": True,
+                    "turn_started_at": started_at.isoformat(),
+                }
+            ]
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    cached,
+                    now=now,
+                    cockpit_db_path=Path(directory) / "missing.sqlite",
+                )
+
+        by_session = {row["session_id"]: row for row in rows}
+        waiting = by_session[self.SESSION_ID]
+        self.assertEqual(waiting["provider"], "API 服务 · 等待首个响应")
+        self.assertFalse(waiting["provider_confirmed"])
 
     def test_api_service_session_uses_near_time_marker_when_token_totals_differ(self) -> None:
         now = datetime.now(timezone.utc)
@@ -5791,6 +6367,65 @@ class LiveActiveSessionScanTests(unittest.TestCase):
         matches = monitor._match_live_cockpit_markers(usages, [marker])
 
         self.assertEqual(matches, {})
+
+    def test_live_exact_marker_uses_explicit_request_latency_interval(self) -> None:
+        event_when = datetime(2026, 7, 23, 10, 57, 43, tzinfo=timezone.utc)
+        usage = {
+            "when": event_when,
+            "session_id": "long-response-session",
+            "total_tokens": 77_524,
+            "input_tokens": 76_752,
+            "cached_tokens": 10_624,
+            "output_tokens": 772,
+        }
+        marker = {
+            "when": event_when + timedelta(seconds=360),
+            "label": "Codex local - final@example.com",
+            "total_tokens": 77_524,
+            "input_tokens": 76_752,
+            "cached_tokens": 10_624,
+            "output_tokens": 772,
+            "latency_ms": 360_500,
+        }
+
+        self.assertIs(
+            monitor._match_live_cockpit_marker(usage, [marker]),
+            marker,
+        )
+
+    def test_cockpit_usage_revision_ignores_zero_usage_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "requests.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                CREATE TABLE request_logs (
+                    timestamp INTEGER,
+                    account_id TEXT,
+                    email TEXT,
+                    api_key_label TEXT,
+                    total_tokens INTEGER,
+                    input_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    output_tokens INTEGER
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (1_000, "account-1", "final@example.com", "", 100, 90, 50, 10),
+            )
+            connection.commit()
+            first = monitor._latest_cockpit_usage_revision(database)
+            connection.execute(
+                "INSERT INTO request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (2_000, "failed-k12", "k12@example.com", "", 0, 0, 0, 0),
+            )
+            connection.commit()
+            second = monitor._latest_cockpit_usage_revision(database)
+            connection.close()
+
+        self.assertEqual(second, first)
 
     def test_api_service_session_does_not_match_token_before_current_turn(self) -> None:
         now = datetime.now(timezone.utc)
@@ -6121,6 +6756,16 @@ class ManualRefreshTests(unittest.TestCase):
 
 
 class LiveUsageOverlayTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._append_attribution_diagnostic = monitor.append_attribution_diagnostic
+        diagnostic_patch = patch.object(
+            monitor,
+            "append_attribution_diagnostic",
+            return_value=True,
+        )
+        diagnostic_patch.start()
+        self.addCleanup(diagnostic_patch.stop)
+
     @staticmethod
     def state(tokens: int = 100, requests: int = 2, *, fresh: bool = False) -> monitor.MonitorState:
         hour = datetime.now(monitor.CN_TZ).hour
@@ -6347,6 +6992,487 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertEqual(provider["cached_input_tokens"], 520)
         self.assertEqual(provider["output_tokens"], 110)
         self.assertEqual(app.state.latest_account_name, "Codex local - routed@example.com")
+
+    def test_unconfirmed_api_service_turn_does_not_reuse_old_account_context(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "current-session",
+                "provider": "API \u670d\u52a1 \u00b7 \u7b49\u5f85\u9996\u4e2a\u54cd\u5e94",
+                "model": "gpt-test",
+            }
+        ]
+        app.state.active_accounts = [
+            {
+                "name": "Codex local - old-k12@example.com",
+                "provider": "Codex local - old-k12@example.com",
+                "model": "gpt-old",
+            }
+        ]
+        app.state.latest_account_name = "Codex local - old-k12@example.com"
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            provider, model = app._live_event_request_context(
+                {"session_id": "current-session"}
+            )
+
+        self.assertEqual(provider, "")
+        self.assertEqual(model, "gpt-test")
+
+    def test_unconfirmed_live_api_event_is_marked_pending_not_old_account(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        app.state.latest_account_name = "Codex local - old-k12@example.com"
+        app._live_usage_overlay = None
+        event = self.event()
+        event["session_id"] = "current-session"
+
+        with (
+            patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ),
+            patch.object(monitor, "_load_live_cockpit_markers", return_value=[]),
+        ):
+            app._record_live_usage_events([event], animate=False)
+
+        self.assertTrue(event["attribution_pending"])
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - api-service-local",
+        )
+
+    def test_pending_live_api_event_preserves_confirmed_recent_request(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        confirmed_at = datetime.now(monitor.CN_TZ) - timedelta(minutes=2)
+        app.state.latest_account_name = "Codex local - confirmed@example.com"
+        app.state.latest_request = {
+            "kind": "success",
+            "model": "gpt-confirmed",
+            "created_at": confirmed_at.isoformat(timespec="seconds"),
+        }
+        app._live_usage_overlay = None
+        app._live_usage_event_records = {}
+        event = self.event()
+        event.update({"event_id": "pending-event", "session_id": "session-new"})
+
+        with (
+            patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ),
+            patch.object(monitor, "_load_live_cockpit_markers", return_value=[]),
+            patch.object(monitor, "append_attribution_diagnostic") as diagnostic,
+        ):
+            app._record_live_usage_events([event], animate=False)
+
+        self.assertTrue(event["attribution_pending"])
+        self.assertEqual(app._pending_latest_event_id, "pending-event")
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - confirmed@example.com",
+        )
+        self.assertEqual(app.state.latest_request["model"], "gpt-confirmed")
+        self.assertEqual(app.state.latest_request["created_at"], confirmed_at.isoformat(timespec="seconds"))
+        self.assertNotIn(
+            "Codex local - confirmed@example.com",
+            app._live_usage_overlay.get("providers", {}),
+        )
+        diagnostic.assert_called_once()
+        self.assertEqual(diagnostic.call_args.args[0], "pending")
+        self.assertTrue(diagnostic.call_args.kwargs["display_preserved"])
+        self.assertEqual(
+            diagnostic.call_args.kwargs["reason"],
+            "no_final_usage_marker",
+        )
+
+    def test_api_service_context_does_not_reuse_previous_live_event_account(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "shared-session",
+                "provider": "Codex local - previous@example.com",
+                "provider_confirmed": True,
+                "usage_event_id": "previous-event",
+                "model": "gpt-test",
+            }
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            provider, model = app._live_event_request_context(
+                {
+                    "session_id": "shared-session",
+                    "event_id": "new-event",
+                }
+            )
+
+        self.assertEqual(provider, "")
+        self.assertEqual(model, "gpt-test")
+
+    def test_confirmed_active_event_repairs_pending_latest_request_label_only(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        app.state.latest_request = {
+            "event_id": "event-1",
+            "session_id": "session-1",
+            "model": "gpt-test",
+        }
+        pending_event = {
+            "event_id": "event-1",
+            "session_id": "session-1",
+            "attribution_pending": True,
+        }
+        app._live_usage_event_records = {"event-1": pending_event}
+        app._live_usage_overlay = {"providers": {}}
+
+        changed = app._promote_pending_latest_account_from_sessions(
+            [
+                {
+                    "session_id": "session-1",
+                    "usage_event_id": "event-1",
+                    "provider": "Codex local - final@example.com",
+                    "provider_confirmed": True,
+                }
+            ]
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(app.state.latest_account_name, "Codex local - final@example.com")
+        self.assertTrue(pending_event["attribution_pending"])
+        self.assertEqual(app._live_usage_overlay["providers"], {})
+
+    def test_confirmed_active_event_repairs_suppressed_pending_request(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        previous_at = datetime.now(monitor.CN_TZ) - timedelta(minutes=2)
+        app.state.latest_account_name = "Codex local - previous@example.com"
+        app.state.latest_request = {
+            "kind": "success",
+            "model": "gpt-previous",
+            "created_at": previous_at.isoformat(timespec="seconds"),
+        }
+        event_when = datetime.now(timezone.utc)
+        pending_event = {
+            "event_id": "event-new",
+            "session_id": "session-new",
+            "model": "gpt-new",
+            "when": event_when,
+            "attribution_pending": True,
+        }
+        app._pending_latest_event_id = "event-new"
+        app._live_usage_event_records = {"event-new": pending_event}
+
+        sessions = [
+            {
+                "session_id": "session-new",
+                "usage_event_id": "event-new",
+                "provider": "Codex local - final@example.com",
+                "provider_confirmed": True,
+            }
+        ]
+        with patch.object(monitor, "append_attribution_diagnostic") as diagnostic:
+            changed = app._promote_pending_latest_account_from_sessions(sessions)
+            repeated = app._promote_pending_latest_account_from_sessions(sessions)
+
+        self.assertTrue(changed)
+        self.assertFalse(repeated)
+        self.assertEqual(app._pending_latest_event_id, "")
+        self.assertEqual(app.state.latest_account_name, "Codex local - final@example.com")
+        self.assertEqual(app.state.latest_request["event_id"], "event-new")
+        self.assertEqual(app.state.latest_request["model"], "gpt-new")
+        diagnostic.assert_called_once()
+        self.assertEqual(diagnostic.call_args.args[0], "display_resolved")
+
+    def test_pending_latest_request_is_not_repaired_from_ambiguous_accounts(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        app.state.latest_request = {
+            "event_id": "event-1",
+            "session_id": "session-1",
+        }
+        app._live_usage_event_records = {
+            "event-1": {"attribution_pending": True}
+        }
+        sessions = [
+            {
+                "session_id": "session-1",
+                "usage_event_id": "event-1",
+                "provider": f"Codex local - {name}@example.com",
+                "provider_confirmed": True,
+            }
+            for name in ("first", "second")
+        ]
+
+        self.assertFalse(
+            app._promote_pending_latest_account_from_sessions(sessions)
+        )
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - api-service-local",
+        )
+
+    def test_delayed_cockpit_marker_reconciles_pending_event_after_next_turn_started(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        app.state.latest_request = {
+            "event_id": "event-1",
+            "session_id": "session-1",
+            "model": "gpt-old",
+        }
+        event = self.event()
+        event.update(
+            {
+                "event_id": "event-1",
+                "session_id": "session-1",
+                "attribution_pending": True,
+                "cost": 0.5,
+            }
+        )
+        app._live_usage_event_records = {"event-1": event}
+        app._live_usage_overlay = {"providers": {}}
+        app._apply_live_usage_overlay = MagicMock()
+        marker = {
+            "when": event["when"] + timedelta(seconds=1),
+            "label": "Codex local - final@example.com",
+            "model": "gpt-final",
+            "total_tokens": event["total_tokens"],
+            "input_tokens": event["input_tokens"],
+            "cached_tokens": event["cached_tokens"],
+            "output_tokens": event["output_tokens"],
+        }
+
+        changed = app._reconcile_pending_live_events_with_markers([marker])
+
+        self.assertTrue(changed)
+        self.assertNotIn("attribution_pending", event)
+        self.assertEqual(event["provider"], "Codex local - final@example.com")
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - final@example.com",
+        )
+        self.assertEqual(
+            app._live_usage_overlay["providers"]["Codex local - final@example.com"]["tokens"],
+            event["total_tokens"],
+        )
+        app._apply_live_usage_overlay.assert_called_once_with(app.state)
+
+    def test_authoritative_refresh_recovers_pending_recent_request_display(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        event_when = datetime.now(timezone.utc)
+        pending_event = {
+            "event_id": "event-1",
+            "session_id": "session-1",
+            "when": event_when,
+            "total_tokens": 50,
+            "attribution_pending": True,
+        }
+        app._pending_latest_event_id = "event-1"
+        app._live_usage_event_records = {"event-1": pending_event}
+        app._last_attribution_diagnostic_signature = None
+        authoritative = self.state(fresh=True)
+        authoritative.latest_account_name = "Codex local - final@example.com"
+        authoritative.client_usage["latest_request"] = {
+            "provider": "Codex local - final@example.com",
+            "model": "gpt-final",
+            "created_at": event_when.astimezone(monitor.CN_TZ).isoformat(
+                timespec="seconds"
+            ),
+        }
+
+        with patch.object(monitor, "append_attribution_diagnostic") as diagnostic:
+            app._diagnose_authoritative_attribution_refresh(
+                authoritative,
+                event_when + timedelta(seconds=1),
+            )
+
+        self.assertEqual(app._pending_latest_event_id, "")
+        self.assertTrue(pending_event["attribution_pending"])
+        diagnostic.assert_called_once()
+        self.assertEqual(diagnostic.call_args.args[0], "authoritative_refresh")
+        self.assertEqual(
+            diagnostic.call_args.kwargs["status"],
+            "confirmed_by_authoritative_refresh",
+        )
+
+    def test_refresh_does_not_replace_confirmed_card_with_pending_api_service(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        confirmed_at = datetime.now(monitor.CN_TZ) - timedelta(minutes=2)
+        app.state.latest_account_name = "Codex local - confirmed@example.com"
+        app.state.latest_request = {
+            "kind": "success",
+            "model": "gpt-confirmed",
+            "created_at": confirmed_at.isoformat(timespec="seconds"),
+        }
+        pending_event = {
+            "event_id": "event-pending",
+            "when": datetime.now(timezone.utc),
+            "attribution_pending": True,
+        }
+        app._pending_latest_event_id = "event-pending"
+        app._live_usage_event_records = {"event-pending": pending_event}
+        refreshed = self.state(fresh=True)
+        refreshed.latest_account_name = "LOCAL - Codex local - api-service-local"
+        refreshed.latest_request = {
+            "kind": "success",
+            "model": "gpt-pending",
+            "created_at": pending_event["when"].isoformat(timespec="seconds"),
+        }
+        refreshed.client_usage["latest_request"] = {
+            "provider": "Codex local - api-service-local",
+            "model": "gpt-pending",
+            "created_at": pending_event["when"].isoformat(timespec="seconds"),
+        }
+
+        self.assertTrue(
+            app._preserve_confirmed_latest_request_during_pending(refreshed)
+        )
+        self.assertEqual(
+            refreshed.latest_account_name,
+            "Codex local - confirmed@example.com",
+        )
+        self.assertEqual(refreshed.latest_request["model"], "gpt-confirmed")
+
+    def test_attribution_diagnostic_rotates_and_filters_conversation_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "attribution.jsonl"
+            path.write_text("old diagnostic\n", encoding="utf-8")
+            event = {
+                "event_id": "event-safe",
+                "session_id": "session-safe",
+                "total_tokens": 123,
+                "content": "must not be written",
+            }
+            with (
+                patch.object(monitor, "ATTRIBUTION_DIAGNOSTICS_PATH", path),
+                patch.object(monitor, "ATTRIBUTION_DIAGNOSTICS_MAX_BYTES", 1),
+            ):
+                self.assertTrue(
+                    self._append_attribution_diagnostic(
+                        "pending",
+                        event,
+                        message="secret",
+                        nested={"prompt": "secret", "reason": "safe"},
+                    )
+                )
+
+            archive = path.with_name(f"{path.name}.1")
+            self.assertTrue(archive.exists())
+            record = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(record["event_id"], "event-safe")
+            self.assertEqual(record["total_tokens"], 123)
+            self.assertNotIn("content", record)
+            self.assertNotIn("message", record)
+            self.assertNotIn("prompt", record["nested"])
+            self.assertEqual(record["nested"]["reason"], "safe")
+
+    def test_delayed_marker_propagates_only_inside_the_current_turn(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        app._live_usage_overlay = {"providers": {}}
+        app._apply_live_usage_overlay = MagicMock()
+        base = datetime.now(timezone.utc)
+
+        def event(event_id: str, offset: int, total: int) -> dict:
+            return {
+                "event_id": event_id,
+                "session_id": "session-1",
+                "when": base + timedelta(seconds=offset),
+                "total_tokens": total,
+                "input_tokens": total - 10,
+                "cached_tokens": 0,
+                "output_tokens": 10,
+                "cost": 0.1,
+                "attribution_pending": True,
+            }
+
+        previous_turn = event("previous", -10, 101)
+        first_current = event("first", 1, 111)
+        anchored = event("anchored", 5, 222)
+        later_current = event("later", 8, 333)
+        app._live_usage_event_records = {
+            item["event_id"]: item
+            for item in (previous_turn, first_current, anchored, later_current)
+        }
+        app.state.latest_request = {
+            "event_id": "later",
+            "session_id": "session-1",
+        }
+        marker = {
+            "when": base + timedelta(seconds=6),
+            "label": "Codex local - final@example.com",
+            "model": "gpt-final",
+            "total_tokens": 222,
+            "input_tokens": 212,
+            "cached_tokens": 0,
+            "output_tokens": 10,
+        }
+
+        app._reconcile_pending_live_events_with_markers(
+            [marker],
+            [
+                {
+                    "session_id": "session-1",
+                    "started_at": base.isoformat(),
+                }
+            ],
+        )
+
+        self.assertIn("attribution_pending", previous_turn)
+        for current in (first_current, anchored, later_current):
+            self.assertNotIn("attribution_pending", current)
+            self.assertEqual(current["provider"], "Codex local - final@example.com")
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - final@example.com",
+        )
+
+    def test_new_cockpit_usage_revision_requests_pending_attribution_refresh(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_event_records = {}
+        app._attribution_refresh_requested = False
+        app._last_cockpit_usage_revision = None
+        app._attributed_cockpit_usage_revision = None
+        app._attribution_refresh_inflight_revision = None
+        baseline = (100, 1_000, "account-1")
+        final = (101, 2_000, "account-2")
+
+        self.assertFalse(app._observe_cockpit_usage_revision(baseline))
+        self.assertEqual(app._attributed_cockpit_usage_revision, baseline)
+        app.state.client_usage["providers"] = [
+            {
+                "name": "Codex local - api-service-local",
+                "tokens": 77_524,
+                "requests": 1,
+                "is_api_service_aggregate": True,
+            }
+        ]
+
+        self.assertTrue(app._observe_cockpit_usage_revision(final))
+        self.assertTrue(app._attribution_refresh_requested)
 
     def test_live_trace_starts_new_events_at_detection_time(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -6636,7 +7762,12 @@ class LiveUsageOverlayTests(unittest.TestCase):
         event = self.event()
         event["session_id"] = "session-1"
 
-        app._record_live_usage_events([event])
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - current@example.com",
+        ):
+            app._record_live_usage_events([event])
 
         self.assertEqual(app.state.latest_account_name, "Codex local - current@example.com")
         self.assertEqual(app.state.latest_request["model"], "gpt-current")
@@ -6933,6 +8064,62 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         app._refresh_quota_async.assert_called_once_with()
         app.refresh_async.assert_not_called()
+        app.root.after.assert_called_once()
+
+    def test_pending_attribution_refresh_waits_while_codex_is_busy(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.usage_source = "local"
+        app.state.client_usage["updated_at"] = datetime.now(timezone.utc).isoformat()
+        app.closed = False
+        app.root = MagicMock()
+        app._refresh_lock = threading.Lock()
+        app._quota_refresh_lock = threading.Lock()
+        app._full_refresh_requested = False
+        app._last_forced_full_refresh_at = monitor.time.monotonic()
+        app._attribution_refresh_requested = True
+        app._last_attribution_refresh_at = float("-inf")
+        app._last_cockpit_usage_revision = (101, 2_000, "account-2")
+        app._attribution_refresh_inflight_revision = None
+        app._live_usage_overlay = None
+        app._handle_day_rollover = MagicMock()
+        app._refresh_quota_async = MagicMock(return_value=False)
+        app._codex_logs_busy = MagicMock(return_value=True)
+        app.refresh_async = MagicMock(return_value=True)
+
+        app._schedule_auto_refresh()
+
+        app.refresh_async.assert_not_called()
+        self.assertTrue(app._attribution_refresh_requested)
+        app.root.after.assert_called_once()
+
+    def test_pending_attribution_refresh_runs_immediately_after_idle(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.usage_source = "local"
+        app.state.client_usage["updated_at"] = datetime.now(timezone.utc).isoformat()
+        app.closed = False
+        app.root = MagicMock()
+        app._refresh_lock = threading.Lock()
+        app._quota_refresh_lock = threading.Lock()
+        app._full_refresh_requested = False
+        app._last_forced_full_refresh_at = monitor.time.monotonic()
+        app._attribution_refresh_requested = True
+        app._last_attribution_refresh_at = float("-inf")
+        revision = (101, 2_000, "account-2")
+        app._last_cockpit_usage_revision = revision
+        app._attribution_refresh_inflight_revision = None
+        app._live_usage_overlay = None
+        app._handle_day_rollover = MagicMock()
+        app._refresh_quota_async = MagicMock(return_value=False)
+        app._codex_logs_busy = MagicMock(return_value=False)
+        app.refresh_async = MagicMock(return_value=True)
+
+        app._schedule_auto_refresh()
+
+        app.refresh_async.assert_called_once_with(force=True)
+        app._refresh_quota_async.assert_not_called()
+        self.assertEqual(app._attribution_refresh_inflight_revision, revision)
         app.root.after.assert_called_once()
 
     def test_token_flow_level_scales_with_recent_token_volume_and_decays(self) -> None:
@@ -8161,6 +9348,172 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
 
         self.assertEqual(buckets[date(2026, 7, 10)].total_tokens, 120)
         self.assertEqual(buckets[date(2026, 7, 11)].total_tokens, 230)
+
+
+class ClaudeUsageEventTests(unittest.TestCase):
+    @staticmethod
+    def _row(
+        timestamp: str,
+        message_id: str,
+        row_id: str,
+        usage: dict[str, object],
+        model: str = "claude-test",
+    ) -> dict[str, object]:
+        message: dict[str, object] = {
+            "role": "assistant",
+            "model": model,
+            "usage": usage,
+        }
+        if message_id:
+            message["id"] = message_id
+        return {
+            "type": "assistant",
+            "timestamp": timestamp,
+            "sessionId": "session-1",
+            "uuid": row_id,
+            "message": message,
+        }
+
+    @staticmethod
+    def _write(path: Path, rows: list[dict[str, object]]) -> None:
+        path.write_text(
+            "\n".join(json.dumps(row) for row in rows),
+            encoding="utf-8",
+        )
+
+    def test_same_claude_message_is_counted_once_across_content_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usage = {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 40,
+            }
+            self._write(
+                root / "session.jsonl",
+                [
+                    self._row("2026-07-23T10:00:00+08:00", "msg-1", "row-1", usage),
+                    self._row("2026-07-23T10:00:01+08:00", "msg-1", "row-2", usage),
+                    self._row("2026-07-23T10:00:04+08:00", "msg-1", "row-3", usage),
+                ],
+            )
+            start = datetime(2026, 7, 23)
+            end = datetime(2026, 7, 24)
+            events = client_usage_export.scan_claude_events(root, start, end)
+            bucket = client_usage_export.bucket_from_claude_events(events)
+            hourly = client_usage_export.claude_hourly_from_events(events)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].when, datetime(2026, 7, 23, 10, 0, 0))
+        self.assertEqual(bucket.requests, 1)
+        self.assertEqual(bucket.total_tokens, 190)
+        self.assertEqual(bucket.input_tokens, 100)
+        self.assertEqual(bucket.output_tokens, 20)
+        self.assertEqual(bucket.cache_creation_input_tokens, 30)
+        self.assertEqual(bucket.cache_read_input_tokens, 40)
+        self.assertEqual(hourly[10]["requests"], 1)
+        self.assertEqual(hourly[10]["tokens"], 190)
+
+    def test_updated_snapshot_wins_without_merging_distinct_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(
+                root / "session.jsonl",
+                [
+                    self._row(
+                        "2026-07-23T11:00:00+08:00",
+                        "msg-growing",
+                        "row-1",
+                        {"input_tokens": 100, "output_tokens": 10},
+                    ),
+                    self._row(
+                        "2026-07-23T11:00:02+08:00",
+                        "msg-growing",
+                        "row-2",
+                        {"input_tokens": 200, "output_tokens": 20},
+                    ),
+                    self._row(
+                        "2026-07-23T11:00:02+08:00",
+                        "msg-distinct",
+                        "row-3",
+                        {"input_tokens": 200, "output_tokens": 20},
+                    ),
+                ],
+            )
+            events = client_usage_export.scan_claude_events(
+                root,
+                datetime(2026, 7, 23),
+                datetime(2026, 7, 24),
+            )
+            bucket = client_usage_export.bucket_from_claude_events(events)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(bucket.requests, 2)
+        self.assertEqual(bucket.total_tokens, 440)
+        self.assertEqual(events[0].when, datetime(2026, 7, 23, 11, 0, 0))
+
+    def test_claude_message_id_deduplicates_across_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = {"input_tokens": 300, "output_tokens": 30}
+            self._write(
+                root / "first.jsonl",
+                [self._row("2026-07-23T12:00:00+08:00", "msg-shared", "row-1", shared)],
+            )
+            self._write(
+                root / "second.jsonl",
+                [self._row("2026-07-23T12:00:03+08:00", "msg-shared", "row-2", shared)],
+            )
+            bucket = client_usage_export.scan_claude(
+                root,
+                datetime(2026, 7, 23),
+                datetime(2026, 7, 24),
+            )
+
+        self.assertEqual(bucket.requests, 1)
+        self.assertEqual(bucket.total_tokens, 330)
+
+    def test_missing_message_ids_are_not_fuzzily_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usage = {"input_tokens": 80, "output_tokens": 20}
+            self._write(
+                root / "session.jsonl",
+                [
+                    self._row("2026-07-23T13:00:00+08:00", "", "row-1", usage),
+                    self._row("2026-07-23T13:00:00+08:00", "", "row-2", usage),
+                ],
+            )
+            bucket = client_usage_export.scan_claude(
+                root,
+                datetime(2026, 7, 23),
+                datetime(2026, 7, 24),
+            )
+
+        self.assertEqual(bucket.requests, 2)
+        self.assertEqual(bucket.total_tokens, 200)
+
+    def test_duplicate_across_midnight_stays_on_first_observed_day(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usage = {"input_tokens": 500, "output_tokens": 50}
+            self._write(
+                root / "session.jsonl",
+                [
+                    self._row("2026-07-23T23:59:59+08:00", "msg-midnight", "row-1", usage),
+                    self._row("2026-07-24T00:00:01+08:00", "msg-midnight", "row-2", usage),
+                ],
+            )
+            buckets = client_usage_export.scan_claude_daily_buckets(
+                root,
+                datetime(2026, 7, 23),
+                datetime(2026, 7, 25),
+            )
+
+        self.assertEqual(buckets[date(2026, 7, 23)].requests, 1)
+        self.assertEqual(buckets[date(2026, 7, 23)].total_tokens, 550)
+        self.assertNotIn(date(2026, 7, 24), buckets)
 
 
 class ClientUsageSyncStatusTests(unittest.TestCase):

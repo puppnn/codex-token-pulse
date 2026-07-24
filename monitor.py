@@ -130,6 +130,14 @@ FULL_USAGE_REFRESH_RETRY_SECONDS = max(
     30,
     int(os.environ.get("TOKEN_PULSE_FULL_USAGE_RETRY_SECONDS", "60")),
 )
+ATTRIBUTION_REFRESH_RETRY_SECONDS = max(
+    10,
+    int(os.environ.get("TOKEN_PULSE_ATTRIBUTION_REFRESH_RETRY_SECONDS", "30")),
+)
+ATTRIBUTION_IN_PROGRESS_SECONDS = max(
+    60,
+    int(os.environ.get("TOKEN_PULSE_ATTRIBUTION_IN_PROGRESS_SECONDS", "900")),
+)
 TOKEN_FLOW_ANIMATION_INTERVAL_MS = 16
 TOKEN_FLOW_FULL_REDRAW_INTERVAL_MS = 90
 TOKEN_FLOW_TRACE_TRAVEL_SECONDS = 10.0
@@ -177,6 +185,19 @@ LIVE_USAGE_CHECKPOINT_JSON = Path(
     os.environ.get("TOKEN_PULSE_LIVE_USAGE_CHECKPOINT_JSON")
     or APP_DIR / "client_usage_live_checkpoint.json"
 )
+ATTRIBUTION_DIAGNOSTICS_PATH = Path(
+    os.environ.get("TOKEN_PULSE_ATTRIBUTION_DIAGNOSTICS")
+    or APP_DIR / "client_usage_attribution_diagnostics.jsonl"
+)
+ATTRIBUTION_DIAGNOSTICS_MAX_BYTES = max(
+    256 * 1024,
+    int(
+        os.environ.get(
+            "TOKEN_PULSE_ATTRIBUTION_DIAGNOSTICS_MAX_BYTES",
+            str(2 * 1024 * 1024),
+        )
+    ),
+)
 LIVE_USAGE_CHECKPOINT_SCHEMA = 2
 LIVE_USAGE_CHECKPOINT_WRITE_SECONDS = max(
     0.25,
@@ -205,6 +226,18 @@ AUTH_SWITCH_EVENTS_PATH = Path(
     os.environ.get("CLIENT_USAGE_AUTH_SWITCH_EVENTS")
     or APP_DIR / "client_usage_auth_switch_events.jsonl"
 )
+_ATTRIBUTION_DIAGNOSTICS_LOCK = threading.Lock()
+_ATTRIBUTION_DIAGNOSTIC_PRIVATE_KEYS = {
+    "body",
+    "content",
+    "input",
+    "message",
+    "messages",
+    "output",
+    "prompt",
+    "response",
+    "text",
+}
 CN_TZ = timezone(timedelta(hours=8), "CST")
 DISPLAY_TIMEZONE = "Asia/Shanghai"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
@@ -615,6 +648,136 @@ def append_codex_auth_switch_event(
     return True
 
 
+def _attribution_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=CN_TZ)
+        return aware.astimezone(CN_TZ).isoformat(timespec="milliseconds")
+    if isinstance(value, dict):
+        return {
+            str(key): _attribution_diagnostic_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_attribution_diagnostic_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _sanitize_attribution_diagnostic(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_attribution_diagnostic(item)
+            for key, item in value.items()
+            if str(key).strip().casefold()
+            not in _ATTRIBUTION_DIAGNOSTIC_PRIVATE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_attribution_diagnostic(item) for item in value]
+    return value
+
+
+def live_attribution_marker_summary(
+    event: dict[str, Any],
+    markers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    event_when = event.get("when")
+    event_tokens = max(0, int(event.get("total_tokens") or 0))
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    same_token_markers = 0
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        marker_when = marker.get("when")
+        if not isinstance(event_when, datetime) or not isinstance(marker_when, datetime):
+            continue
+        delta = (marker_when - event_when).total_seconds()
+        candidates.append((delta, marker))
+        if event_tokens > 0 and int(marker.get("total_tokens") or 0) == event_tokens:
+            same_token_markers += 1
+    closest = min(candidates, key=lambda item: abs(item[0])) if candidates else None
+    result: dict[str, Any] = {
+        "marker_count": len(markers),
+        "same_token_marker_count": same_token_markers,
+    }
+    if closest is not None:
+        delta, marker = closest
+        result.update(
+            {
+                "closest_marker_delta_seconds": round(delta, 3),
+                "closest_marker_label": str(marker.get("label") or ""),
+                "closest_marker_tokens": max(0, int(marker.get("total_tokens") or 0)),
+                "closest_marker_when": marker.get("when"),
+            }
+        )
+    return result
+
+
+def append_attribution_diagnostic(
+    phase: str,
+    event: dict[str, Any] | None = None,
+    **details: Any,
+) -> bool:
+    record: dict[str, Any] = {
+        "observed_at": datetime.now(timezone.utc).astimezone(CN_TZ),
+        "phase": str(phase or "unknown"),
+    }
+    if isinstance(event, dict):
+        for key in (
+            "event_id",
+            "session_id",
+            "model",
+            "total_tokens",
+            "input_tokens",
+            "cached_tokens",
+            "output_tokens",
+            "when",
+            "account_at",
+            "request_at",
+            "turn_started_at",
+            "provider",
+            "attribution_pending_since",
+        ):
+            if key in event:
+                record[key] = event[key]
+    record.update(_sanitize_attribution_diagnostic(details))
+    line = json.dumps(
+        _attribution_diagnostic_value(record),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        with _ATTRIBUTION_DIAGNOSTICS_LOCK:
+            ATTRIBUTION_DIAGNOSTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                rotate = (
+                    ATTRIBUTION_DIAGNOSTICS_PATH.exists()
+                    and ATTRIBUTION_DIAGNOSTICS_PATH.stat().st_size
+                    >= ATTRIBUTION_DIAGNOSTICS_MAX_BYTES
+                )
+            except OSError:
+                rotate = False
+            if rotate:
+                archive = ATTRIBUTION_DIAGNOSTICS_PATH.with_name(
+                    f"{ATTRIBUTION_DIAGNOSTICS_PATH.name}.1"
+                )
+                try:
+                    archive.unlink(missing_ok=True)
+                    ATTRIBUTION_DIAGNOSTICS_PATH.replace(archive)
+                except OSError:
+                    pass
+            with ATTRIBUTION_DIAGNOSTICS_PATH.open(
+                "a",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                handle.write(line)
+                handle.write("\n")
+    except OSError:
+        return False
+    return True
+
+
 def detect_codex_base_urls() -> list[str]:
     urls: list[str] = []
     for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL", "CODEX_BASE_URL"):
@@ -1011,6 +1174,17 @@ def account_type_label(account: dict[str, Any] | None = None, name: Any = "") ->
     if row.get("is_pool_aggregate"):
         return "\u8d26\u53f7\u6c60"
     if row.get("is_api_service_aggregate") or display_name == "api \u670d\u52a1":
+        latest_at = str(
+            row.get("latest_at")
+            or row.get("latest_request_at")
+            or row.get("created_at")
+            or ""
+        )
+        if is_recent_activity(
+            latest_at,
+            window_seconds=ATTRIBUTION_IN_PROGRESS_SECONDS,
+        ):
+            return "\u5f52\u56e0\u4e2d"
         return "\u5f85\u5f52\u56e0"
     if "api-key" in display_name or "api key" in display_name:
         return "API KEY"
@@ -1458,9 +1632,19 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     existing_tokens = int(existing.get("tokens") or 0)
     existing_requests = int(existing.get("requests") or 0)
     source_date = ""
+    claude_usage_schema = 0
     if isinstance(state.client_usage, dict):
         source_date = str(state.client_usage.get("date") or "").strip()
+        try:
+            claude_usage_schema = int(state.client_usage.get("claude_usage_schema") or 0)
+        except (TypeError, ValueError):
+            claude_usage_schema = 0
     existing_source_date = str(existing.get("source_date") or "").strip()
+    try:
+        existing_claude_usage_schema = int(existing.get("claude_usage_schema") or 0)
+    except (TypeError, ValueError):
+        existing_claude_usage_schema = 0
+    claude_schema_upgrade = claude_usage_schema > existing_claude_usage_schema
     mix = token_mix_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
     details = detailed_usage_from_state(state)
     preserve_existing_details = False
@@ -1469,7 +1653,11 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     # markers. Account switches can briefly make attribution smaller than the
     # previous snapshot, so keep a high-water total for the current day.
     use_local_high_water = state.usage_source in {"local", "client", "local-codex"}
-    if use_local_high_water and existing_source_date in {"", source_date, key}:
+    if (
+        use_local_high_water
+        and not claude_schema_upgrade
+        and existing_source_date in {"", source_date, key}
+    ):
         if existing_tokens > new_tokens and existing_tokens >= max(1, int(new_tokens * 1.05)):
             new_tokens = existing_tokens
             new_requests = max(new_requests, existing_requests)
@@ -1501,7 +1689,9 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
         "updated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
         "source_date": source_date,
     }
-    if isinstance(existing.get("source_gap"), dict):
+    if claude_usage_schema > 0:
+        updated_row["claude_usage_schema"] = claude_usage_schema
+    if not claude_schema_upgrade and isinstance(existing.get("source_gap"), dict):
         updated_row["source_gap"] = existing["source_gap"]
     days[key] = updated_row
     try:
@@ -2236,10 +2426,16 @@ def _load_live_cockpit_markers(
     try:
         uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(request_logs)").fetchall()
+        }
+        latency_ms_sql = "latency_ms" if "latency_ms" in columns else "0"
         rows = connection.execute(
-            """
+            f"""
             SELECT timestamp, account_id, email, api_key_label, model_id,
-                   total_tokens, input_tokens, cached_tokens, output_tokens
+                   total_tokens, input_tokens, cached_tokens, output_tokens,
+                   {latency_ms_sql} AS latency_ms
             FROM request_logs
             WHERE timestamp >= ?
               AND (
@@ -2260,7 +2456,18 @@ def _load_live_cockpit_markers(
             connection.close()
 
     markers: list[dict[str, Any]] = []
-    for timestamp, account_id, email, api_key_label, model, total, input_value, cached, output in rows:
+    for (
+        timestamp,
+        account_id,
+        email,
+        api_key_label,
+        model,
+        total,
+        input_value,
+        cached,
+        output,
+        latency_ms,
+    ) in rows:
         label = _cockpit_account_label(account_id, email, api_key_label)
         if not label:
             continue
@@ -2287,9 +2494,56 @@ def _load_live_cockpit_markers(
                 "input_tokens": input_token_count,
                 "cached_tokens": cached_token_count,
                 "output_tokens": output_token_count,
+                "latency_ms": max(0, int(latency_ms or 0)),
             }
         )
     return markers
+
+
+def _latest_cockpit_usage_revision(db_path: Path) -> tuple[Any, ...] | None:
+    if not db_path.exists():
+        return None
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        row = connection.execute(
+            """
+            SELECT rowid, timestamp, account_id, email, api_key_label,
+                   total_tokens, input_tokens, cached_tokens, output_tokens
+            FROM request_logs
+            WHERE (
+                COALESCE(total_tokens, 0) > 0
+                OR COALESCE(input_tokens, 0) > 0
+                OR COALESCE(cached_tokens, 0) > 0
+                OR COALESCE(output_tokens, 0) > 0
+            )
+            ORDER BY rowid DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        return None
+    return tuple("" if value is None else value for value in row)
+
+
+def _live_marker_covers_usage_time(
+    usage_when: datetime,
+    marker: dict[str, Any],
+) -> bool:
+    marker_when = marker.get("when")
+    if not isinstance(marker_when, datetime):
+        return False
+    delta_seconds = (marker_when - usage_when).total_seconds()
+    if abs(delta_seconds) <= LIVE_ACCOUNT_MATCH_SECONDS:
+        return True
+    latency_seconds = max(0.0, float(marker.get("latency_ms") or 0) / 1000.0)
+    return latency_seconds > 0 and 0 <= delta_seconds <= latency_seconds
 
 
 def _live_cockpit_match_score(
@@ -2311,7 +2565,7 @@ def _live_cockpit_match_score(
     ):
         return None
     time_delta = abs((marker_when - when).total_seconds())
-    if marker_total == total_tokens and time_delta <= LIVE_ACCOUNT_MATCH_SECONDS:
+    if marker_total == total_tokens and _live_marker_covers_usage_time(when, marker):
         components_match = all(
             int(marker.get(key) or 0) == int(usage.get(key) or 0)
             for key in ("input_tokens", "cached_tokens", "output_tokens")
@@ -2402,7 +2656,12 @@ def _match_live_cockpit_marker(
 
 def _concrete_live_provider(value: Any) -> str:
     label = str(value or "").strip()
-    if not label or label == "正在识别账号" or label.startswith("API 服务 ·"):
+    if (
+        not label
+        or label == "正在识别账号"
+        or label.startswith("API 服务 ·")
+        or is_local_api_service_provider_name(label)
+    ):
         return ""
     return label
 
@@ -2521,6 +2780,13 @@ def scan_live_codex_active_sessions(
         if latest_usage is not None:
             latest_usage = dict(latest_usage)
             latest_usage["session_id"] = session_id
+            latest_usage["event_id"] = _live_usage_event_id(
+                latest_usage["when"],
+                session_id,
+                int(latest_usage.get("input_tokens") or 0),
+                int(latest_usage.get("cached_tokens") or 0),
+                int(latest_usage.get("output_tokens") or 0),
+            )
             if started_dt is not None:
                 latest_usage["turn_started_at"] = started_dt
         parsed_rows.append(
@@ -2542,18 +2808,44 @@ def scan_live_codex_active_sessions(
     for row_index, parsed_row in enumerate(parsed_rows):
         session_id = str(parsed_row["session_id"])
         cached = parsed_row["cached"]
+        current_latest_usage = parsed_row.get("latest_usage")
         modified = float(parsed_row["modified"])
         lifecycle_at = str(parsed_row["lifecycle_at"] or "")
         started_at = str(parsed_row["started_at"] or "")
         matched_marker = live_matches.get(row_index)
         matched_label = str((matched_marker or {}).get("label") or "")
         cached_provider = _concrete_live_provider(cached.get("provider"))
+        cached_turn_started = _parse_time(
+            str(
+                cached.get("turn_started_at")
+                or cached.get("started_at")
+                or ""
+            )
+        )
+        same_turn_confirmed_provider = bool(
+            api_service_route
+            and current_latest_usage is not None
+            and cached.get("provider_confirmed") is True
+            and cached_provider
+            and started_dt is not None
+            and cached_turn_started is not None
+            and abs((started_dt - cached_turn_started).total_seconds()) <= 1
+        )
         if api_service_route:
-            provider = matched_label
+            provider = matched_label or (
+                cached_provider if same_turn_confirmed_provider else ""
+            )
         else:
             provider = cached_provider or current_label or matched_label
         if not provider:
-            provider = "API 服务 · 等待首个响应" if api_service_route else "正在识别账号"
+            if api_service_route:
+                provider = (
+                    "API 服务 · 正在确认账号"
+                    if current_latest_usage is not None
+                    else "API 服务 · 等待首个响应"
+                )
+            else:
+                provider = "正在识别账号"
         latest_at = datetime.fromtimestamp(modified, tz=timezone.utc).isoformat(timespec="seconds")
         live = dict(cached)
         live.update(
@@ -2563,8 +2855,22 @@ def scan_live_codex_active_sessions(
                 "model": cached.get("model") or (matched_marker or {}).get("model") or "-",
                 "latest_at": latest_at,
                 "started_at": started_at or cached.get("started_at") or lifecycle_at,
+                "turn_started_at": started_at,
                 "active": True,
                 "activity_source": "live-session-tail",
+                "usage_event_id": str((current_latest_usage or {}).get("event_id") or ""),
+                "provider_confirmed": bool(
+                    matched_label or same_turn_confirmed_provider
+                ),
+                "provider_confirmation_source": (
+                    "final_usage_marker"
+                    if matched_label
+                    else (
+                        "same_turn_final_anchor"
+                        if same_turn_confirmed_provider
+                        else ""
+                    )
+                ),
             }
         )
         active_rows.append(live)
@@ -4328,6 +4634,11 @@ class FloatingMonitorApp:
         self._last_quota_refresh_at = 0.0
         self._full_refresh_requested = False
         self._last_forced_full_refresh_at = float("-inf")
+        self._attribution_refresh_requested = False
+        self._last_attribution_refresh_at = float("-inf")
+        self._last_cockpit_usage_revision: tuple[Any, ...] | None = None
+        self._attributed_cockpit_usage_revision: tuple[Any, ...] | None = None
+        self._attribution_refresh_inflight_revision: tuple[Any, ...] | None = None
         self._live_active_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="active-session-watch",
@@ -4358,6 +4669,8 @@ class FloatingMonitorApp:
         self._live_usage_overlay: dict[str, Any] | None = None
         self._live_usage_seen_ids: dict[str, None] = {}
         self._live_usage_event_records: dict[str, dict[str, Any]] = {}
+        self._pending_latest_event_id = ""
+        self._last_attribution_diagnostic_signature: tuple[Any, ...] | None = None
         self._live_usage_rate_samples: list[tuple[float, int]] = []
         self._live_usage_verification_pending = False
         self._live_usage_verification_latest_when: datetime | None = None
@@ -8051,6 +8364,75 @@ class FloatingMonitorApp:
     def _on_visibility(self, _event: tk.Event) -> None:
         self._ensure_topmost()
 
+    def _has_pending_api_service_attribution(self) -> bool:
+        records = getattr(self, "_live_usage_event_records", {})
+        if isinstance(records, dict) and any(
+            isinstance(event, dict) and bool(event.get("attribution_pending"))
+            for event in records.values()
+        ):
+            return True
+        if self.state is None:
+            return False
+        candidate_rows: list[dict[str, Any]] = []
+        client_usage = (
+            self.state.client_usage
+            if isinstance(self.state.client_usage, dict)
+            else {}
+        )
+        providers = client_usage.get("providers")
+        if isinstance(providers, list):
+            candidate_rows.extend(
+                row for row in providers if isinstance(row, dict)
+            )
+        if isinstance(self.state.top_accounts, list):
+            candidate_rows.extend(
+                row for row in self.state.top_accounts if isinstance(row, dict)
+            )
+        for row in candidate_rows:
+            if row.get("is_pool_aggregate"):
+                continue
+            name = str(row.get("name") or "")
+            if not (
+                row.get("is_api_service_aggregate")
+                or is_local_api_service_provider_name(name)
+            ):
+                continue
+            for key in ("requests", "tokens", "cost"):
+                try:
+                    if float(row.get(key) or 0) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return is_local_api_service_provider_name(self.state.latest_account_name)
+
+    def _observe_cockpit_usage_revision(
+        self,
+        revision: tuple[Any, ...] | None,
+    ) -> bool:
+        if revision is None:
+            return False
+        previous = getattr(self, "_last_cockpit_usage_revision", None)
+        self._last_cockpit_usage_revision = revision
+        pending = self._has_pending_api_service_attribution()
+        attributed = getattr(
+            self,
+            "_attributed_cockpit_usage_revision",
+            None,
+        )
+        if previous is None and attributed is None and not pending:
+            self._attributed_cockpit_usage_revision = revision
+            return False
+        if pending and revision != attributed:
+            self._attribution_refresh_requested = True
+            return True
+        if (
+            not pending
+            and not bool(getattr(self, "_attribution_refresh_requested", False))
+            and getattr(self, "_attribution_refresh_inflight_revision", None) is None
+        ):
+            self._attributed_cockpit_usage_revision = revision
+        return False
+
     def _refresh_live_active_async(self) -> bool:
         if not self._live_active_lock.acquire(blocking=False):
             return False
@@ -8061,8 +8443,19 @@ class FloatingMonitorApp:
                 cached_sessions = [
                     dict(row) for row in raw_sessions if isinstance(row, dict)
                 ]
+        current_label = _current_codex_account_label()
+        client_usage = (
+            self.state.client_usage
+            if self.state is not None and isinstance(self.state.client_usage, dict)
+            else {}
+        )
+        api_service_routed = is_local_api_service_provider_name(current_label) or bool(
+            client_usage.get("api_service_routed")
+        )
 
         def _worker() -> None:
+            revision: tuple[Any, ...] | None = None
+            cockpit_markers: list[dict[str, Any]] = []
             try:
                 sessions = scan_live_codex_active_sessions(
                     Path.home() / ".codex" / "sessions",
@@ -8071,8 +8464,23 @@ class FloatingMonitorApp:
                 )
             except Exception:
                 sessions = None
+            if api_service_routed:
+                revision = _latest_cockpit_usage_revision(
+                    COCKPIT_REQUEST_LOG_DB
+                )
+                cockpit_markers = _load_live_cockpit_markers(
+                    COCKPIT_REQUEST_LOG_DB,
+                    datetime.now(timezone.utc),
+                )
             try:
-                self.root.after(0, lambda: self._apply_live_active_sessions(sessions))
+                self.root.after(
+                    0,
+                    lambda: self._apply_live_active_sessions(
+                        sessions,
+                        revision,
+                        cockpit_markers,
+                    ),
+                )
             except tk.TclError:
                 self._live_active_lock.release()
 
@@ -8086,22 +8494,246 @@ class FloatingMonitorApp:
     def _apply_live_active_sessions(
         self,
         sessions: list[dict[str, Any]] | None,
+        cockpit_revision: tuple[Any, ...] | None = None,
+        cockpit_markers: list[dict[str, Any]] | None = None,
     ) -> None:
         try:
+            self._observe_cockpit_usage_revision(cockpit_revision)
             if (
-                sessions is None
-                or self.state is None
+                self.state is None
                 or self.state.usage_source != "local"
                 or not isinstance(self.state.client_usage, dict)
             ):
+                return
+            marker_changed = self._reconcile_pending_live_events_with_markers(
+                cockpit_markers or [],
+                sessions,
+            )
+            if sessions is None:
+                if marker_changed:
+                    self._draw()
                 return
             self.state.client_usage["active_sessions"] = sessions
             self.state.active_accounts = local_active_accounts_from_client_usage(
                 self.state.client_usage
             )
+            self._promote_pending_latest_account_from_sessions(sessions)
             self._draw()
         finally:
             self._live_active_lock.release()
+
+    def _promote_pending_latest_account_from_sessions(
+        self,
+        sessions: list[dict[str, Any]],
+    ) -> bool:
+        """Use exact final Cockpit evidence to repair only the live request label."""
+        if self.state is None or not isinstance(self.state.latest_request, dict):
+            return False
+        latest_event_id = str(getattr(self, "_pending_latest_event_id", "") or "")
+        if not latest_event_id:
+            latest_event_id = str(self.state.latest_request.get("event_id") or "")
+        if not latest_event_id:
+            return False
+        records = getattr(self, "_live_usage_event_records", {})
+        latest_event = records.get(latest_event_id) if isinstance(records, dict) else None
+        if not isinstance(latest_event, dict) or not latest_event.get("attribution_pending"):
+            return False
+        latest_session_id = str(latest_event.get("session_id") or "")
+        if not latest_session_id:
+            latest_session_id = str(self.state.latest_request.get("session_id") or "")
+        if not latest_session_id:
+            return False
+
+        providers = {
+            provider
+            for session in sessions
+            if isinstance(session, dict)
+            and session.get("provider_confirmed") is True
+            and str(session.get("session_id") or "") == latest_session_id
+            and str(session.get("usage_event_id") or "") == latest_event_id
+            and (provider := _concrete_live_provider(session.get("provider")))
+        }
+        if len(providers) != 1:
+            return False
+        provider = providers.pop()
+        if _concrete_live_provider(
+            latest_event.get("attribution_display_resolved_provider")
+        ) == provider:
+            return False
+        self.state.latest_account_name = provider
+        event_when = latest_event.get("when")
+        if isinstance(event_when, datetime):
+            self.state.latest_request = {
+                "kind": "success",
+                "model": str(latest_event.get("model") or "-"),
+                "created_at": event_when.astimezone(CN_TZ).isoformat(
+                    timespec="seconds"
+                ),
+                "source": "CLIENT",
+                "event_id": latest_event_id,
+                "session_id": latest_session_id,
+            }
+        self._pending_latest_event_id = ""
+        latest_event["attribution_display_resolved_provider"] = provider
+        append_attribution_diagnostic(
+            "display_resolved",
+            latest_event,
+            provider=provider,
+            resolution_source="confirmed_active_session",
+        )
+        return True
+
+    def _reconcile_pending_live_events_with_markers(
+        self,
+        markers: list[dict[str, Any]],
+        sessions: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Apply final Cockpit markers and propagate them only within one turn."""
+        if self.state is None or not markers:
+            return False
+        records = getattr(self, "_live_usage_event_records", {})
+        if not isinstance(records, dict):
+            return False
+        pending_items = [
+            (event_id, event)
+            for event_id, event in records.items()
+            if isinstance(event, dict) and event.get("attribution_pending")
+        ]
+        if not pending_items:
+            return False
+        turn_starts: dict[str, datetime] = {}
+        for session in sessions or []:
+            if not isinstance(session, dict):
+                continue
+            session_id = str(session.get("session_id") or "")
+            start_key = (
+                "turn_started_at"
+                if "turn_started_at" in session
+                else "started_at"
+            )
+            started_at = _parse_time(str(session.get(start_key) or ""))
+            if session_id and started_at is not None:
+                turn_starts[session_id] = started_at
+        for _event_id, event in pending_items:
+            session_id = str(event.get("session_id") or "")
+            turn_started_at = turn_starts.get(session_id)
+            event_when = event.get("when")
+            if (
+                turn_started_at is not None
+                and isinstance(event_when, datetime)
+                and event_when >= turn_started_at
+            ):
+                event["turn_started_at"] = turn_started_at
+        matches = _match_live_cockpit_markers(
+            [event for _event_id, event in pending_items],
+            markers,
+        )
+        anchors_by_turn: dict[tuple[str, datetime], list[tuple[datetime, str]]] = {}
+        for index, marker in matches.items():
+            provider = _concrete_live_provider(marker.get("label"))
+            if not provider:
+                continue
+            event = pending_items[index][1]
+            session_id = str(event.get("session_id") or "")
+            turn_started_at = event.get("turn_started_at")
+            marker_when = marker.get("when")
+            if (
+                not session_id
+                or not isinstance(turn_started_at, datetime)
+                or not isinstance(marker_when, datetime)
+                or marker_when < turn_started_at
+            ):
+                continue
+            anchors_by_turn.setdefault(
+                (session_id, turn_started_at),
+                [],
+            ).append((marker_when, provider))
+        for anchors in anchors_by_turn.values():
+            anchors.sort(key=lambda item: item[0])
+        changed = False
+        latest_event_id = str(getattr(self, "_pending_latest_event_id", "") or "")
+        if not latest_event_id and isinstance(self.state.latest_request, dict):
+            latest_event_id = str(self.state.latest_request.get("event_id") or "")
+        for index, (event_id, event) in enumerate(pending_items):
+            marker = matches.get(index)
+            provider = _concrete_live_provider(marker.get("label")) if marker else ""
+            provider_usage: dict[str, Any] = event
+            if not provider:
+                session_id = str(event.get("session_id") or "")
+                turn_started_at = event.get("turn_started_at")
+                event_when = event.get("when")
+                anchors = (
+                    anchors_by_turn.get((session_id, turn_started_at), [])
+                    if isinstance(turn_started_at, datetime)
+                    else []
+                )
+                if isinstance(event_when, datetime) and anchors:
+                    prior = [anchor for anchor in anchors if anchor[0] <= event_when]
+                    provider = (prior[-1] if prior else anchors[0])[1]
+            if not provider:
+                continue
+            model = str(
+                marker.get("model") if marker else event.get("model") or ""
+            )
+            if marker:
+                provider_usage = dict(marker)
+            event["provider"] = provider
+            if model:
+                event["model"] = model
+            pending_since = event.get("attribution_pending_since")
+            resolved_at = datetime.now(timezone.utc)
+            latency_ms = None
+            if isinstance(pending_since, datetime):
+                latency_ms = max(
+                    0,
+                    int(
+                        (resolved_at - pending_since.astimezone(timezone.utc))
+                        .total_seconds()
+                        * 1000
+                    ),
+                )
+            append_attribution_diagnostic(
+                "resolved",
+                event,
+                provider=provider,
+                resolution_source=(
+                    "final_usage_marker" if marker else "same_turn_final_anchor"
+                ),
+                marker_when=marker.get("when") if marker else None,
+                resolution_latency_ms=latency_ms,
+            )
+            event.pop("attribution_pending", None)
+            event.pop("attribution_pending_since", None)
+            live_overlay = self._live_usage_overlay
+            if (
+                isinstance(live_overlay, dict)
+                and not event.get("live_provider_overlay_recorded")
+            ):
+                provider_usage["cost"] = max(0.0, float(event.get("cost") or 0.0))
+                self._record_live_provider_overlay(
+                    live_overlay,
+                    provider,
+                    provider_usage,
+                    event["when"],
+                )
+                event["live_provider_overlay_recorded"] = True
+            if event_id == latest_event_id:
+                self.state.latest_account_name = provider
+                self.state.latest_request = {
+                    "kind": "success",
+                    "model": model or str(event.get("model") or "-"),
+                    "created_at": event["when"]
+                    .astimezone(CN_TZ)
+                    .isoformat(timespec="seconds"),
+                    "source": "CLIENT",
+                    "event_id": event_id,
+                    "session_id": str(event.get("session_id") or ""),
+                }
+                self._pending_latest_event_id = ""
+            changed = True
+        if changed:
+            self._apply_live_usage_overlay(self.state)
+        return changed
 
     def _schedule_live_active_refresh(self) -> None:
         if self.closed:
@@ -8576,17 +9208,35 @@ class FloatingMonitorApp:
 
     def _live_event_request_context(self, event: dict[str, Any]) -> tuple[str, str]:
         session_id = str(event.get("session_id") or "")
+        event_id = str(event.get("event_id") or "")
         provider = ""
         model = str(event.get("model") or "")
-        client_usage = self.state.client_usage if self.state and isinstance(self.state.client_usage, dict) else {}
+        client_usage = (
+            self.state.client_usage
+            if self.state and isinstance(self.state.client_usage, dict)
+            else {}
+        )
+        current_label = _current_codex_account_label()
+        api_service_current = (
+            is_local_api_service_provider_name(current_label)
+            if current_label
+            else bool(client_usage.get("api_service_routed"))
+        )
         sessions = client_usage.get("active_sessions")
         for session in sessions if isinstance(sessions, list) else []:
             if not isinstance(session, dict) or str(session.get("session_id") or "") != session_id:
                 continue
-            provider = _concrete_live_provider(session.get("provider"))
+            if not api_service_current:
+                provider = _concrete_live_provider(session.get("provider"))
+            elif (
+                event_id
+                and session.get("provider_confirmed") is True
+                and str(session.get("usage_event_id") or "") == event_id
+            ):
+                provider = _concrete_live_provider(session.get("provider"))
             model = model or str(session.get("model") or "")
             break
-        if not provider and self.state:
+        if not provider and self.state and not api_service_current:
             for account in self.state.active_accounts or []:
                 if not isinstance(account, dict):
                     continue
@@ -8597,12 +9247,12 @@ class FloatingMonitorApp:
                     provider = candidate
                     model = model or str(account.get("model") or "")
                     break
-        if not provider:
-            current_provider = _concrete_live_provider(_current_codex_account_label())
-            if current_provider and not is_local_api_service_provider_name(current_provider):
+        if not provider and not api_service_current:
+            current_provider = _concrete_live_provider(current_label)
+            if current_provider:
                 provider = current_provider
         existing = self.state.latest_request if self.state and isinstance(self.state.latest_request, dict) else {}
-        if not provider and self.state:
+        if not provider and self.state and not api_service_current:
             provider = str(self.state.latest_account_name or "")
         model = model or str(existing.get("model") or "-")
         return provider, model
@@ -8814,13 +9464,34 @@ class FloatingMonitorApp:
             max(0.0, float(self.state.today_account_cost or 0.0))
             / max(1, int(self.state.today_tokens or 0))
         )
-        api_service_current = bool(client_usage.get("api_service_routed"))
+        current_label = _current_codex_account_label()
+        api_service_current = (
+            is_local_api_service_provider_name(current_label)
+            if current_label
+            else bool(client_usage.get("api_service_routed"))
+        )
         cockpit_markers = (
             _load_live_cockpit_markers(COCKPIT_REQUEST_LOG_DB, now_utc)
             if api_service_current
             else []
         )
         latest_event = max(recent, key=lambda item: item["when"])
+        existing_latest_request = (
+            dict(self.state.latest_request)
+            if isinstance(self.state.latest_request, dict)
+            else {}
+        )
+        existing_latest_provider = _concrete_live_provider(
+            self.state.latest_account_name
+        )
+        preserve_confirmed_latest = bool(
+            existing_latest_provider
+            and existing_latest_request.get("kind") == "success"
+            and (
+                existing_latest_request.get("created_at")
+                or existing_latest_request.get("latest_at")
+            )
+        )
         live_cockpit_matches = _match_live_cockpit_markers(recent, cockpit_markers)
         latest_provider = ""
         latest_model = ""
@@ -8863,12 +9534,53 @@ class FloatingMonitorApp:
                 model = context_model
             if not provider:
                 provider = context_provider
-                if api_service_current:
-                    # Cockpit may write its routing marker a moment after the
-                    # Codex token event. Keep the total optimistic, but never
-                    # guess which pool account should receive it.
-                    provider = ""
                 record_provider = bool(provider)
+            was_pending = bool(event.get("attribution_pending"))
+            if api_service_current and not provider:
+                event["attribution_pending"] = True
+                event.setdefault("attribution_pending_since", now_utc)
+                if not was_pending:
+                    session_candidates = []
+                    active_sessions = client_usage.get("active_sessions")
+                    for session in active_sessions if isinstance(active_sessions, list) else []:
+                        if (
+                            isinstance(session, dict)
+                            and str(session.get("session_id") or "")
+                            == str(event.get("session_id") or "")
+                        ):
+                            session_candidates.append(
+                                {
+                                    "provider": str(session.get("provider") or ""),
+                                    "provider_confirmed": session.get("provider_confirmed"),
+                                    "provider_confirmation_source": str(
+                                        session.get("provider_confirmation_source") or ""
+                                    ),
+                                    "usage_event_id": str(session.get("usage_event_id") or ""),
+                                    "active": session.get("active"),
+                                }
+                            )
+                    pending_reason = (
+                        "no_final_usage_marker"
+                        if not cockpit_markers
+                        else "no_matching_final_usage_marker"
+                    )
+                    append_attribution_diagnostic(
+                        "pending",
+                        event,
+                        reason=pending_reason,
+                        current_account_label=current_label,
+                        api_service_current=True,
+                        display_preserved=bool(
+                            event is latest_event and preserve_confirmed_latest
+                        ),
+                        active_session_candidates=session_candidates,
+                        marker_summary=live_attribution_marker_summary(
+                            event,
+                            cockpit_markers,
+                        ),
+                    )
+            else:
+                event.pop("attribution_pending", None)
             if event_cost <= 0:
                 event_cost = estimate_live_usage_cost(
                     provider_usage,
@@ -8901,14 +9613,25 @@ class FloatingMonitorApp:
             if not latest_provider and not api_service_current:
                 latest_provider = _provider
         latest_when = latest_event["when"].astimezone(CN_TZ).isoformat(timespec="seconds")
-        self.state.latest_request = {
-            "kind": "success",
-            "model": latest_model or "-",
-            "created_at": latest_when,
-            "source": "CLIENT",
-        }
-        if latest_provider:
-            self.state.latest_account_name = latest_provider
+        latest_event_id = str(latest_event.get("event_id") or "")
+        latest_pending = bool(latest_event.get("attribution_pending"))
+        if latest_pending:
+            self._pending_latest_event_id = latest_event_id
+        elif getattr(self, "_pending_latest_event_id", "") == latest_event_id:
+            self._pending_latest_event_id = ""
+        if not (latest_pending and preserve_confirmed_latest):
+            self.state.latest_request = {
+                "kind": "success",
+                "model": latest_model or "-",
+                "created_at": latest_when,
+                "source": "CLIENT",
+                "event_id": latest_event_id,
+                "session_id": str(latest_event.get("session_id") or ""),
+            }
+            if latest_provider:
+                self.state.latest_account_name = latest_provider
+            elif api_service_current:
+                self.state.latest_account_name = "Codex local - api-service-local"
         if animate and hasattr(self, "root"):
             self._ensure_pulse_animation()
         self._apply_live_usage_overlay(self.state)
@@ -8996,6 +9719,51 @@ class FloatingMonitorApp:
             state.today_account_cost,
         )
         state.updated_at = time.time()
+
+    def _apply_live_latest_request_overlay(self, state: MonitorState) -> None:
+        records = getattr(self, "_live_usage_event_records", {})
+        if not isinstance(records, dict) or not isinstance(state.latest_request, dict):
+            return
+        candidates = [
+            event
+            for event in records.values()
+            if isinstance(event, dict)
+            and _concrete_live_provider(event.get("provider"))
+            and isinstance(event.get("when"), datetime)
+        ]
+        if not candidates:
+            return
+        latest_event = max(candidates, key=lambda event: event["when"])
+        existing_at = _parse_time(
+            str(
+                state.latest_request.get("created_at")
+                or state.latest_request.get("latest_at")
+                or ""
+            )
+        )
+        if (
+            existing_at is not None
+            and latest_event["when"] < existing_at - timedelta(seconds=1)
+        ):
+            return
+        provider = _concrete_live_provider(latest_event.get("provider"))
+        if not provider:
+            return
+        state.latest_account_name = provider
+        state.latest_request.update(
+            {
+                "model": str(
+                    latest_event.get("model")
+                    or state.latest_request.get("model")
+                    or "-"
+                ),
+                "created_at": latest_event["when"]
+                .astimezone(CN_TZ)
+                .isoformat(timespec="seconds"),
+                "event_id": str(latest_event.get("event_id") or ""),
+                "session_id": str(latest_event.get("session_id") or ""),
+            }
+        )
 
     def _authoritative_state_covers_live_overlay(self, state: MonitorState) -> bool:
         overlay = self._live_usage_overlay
@@ -9119,8 +9887,178 @@ class FloatingMonitorApp:
         t.start()
         return True
 
+    def _diagnose_authoritative_attribution_refresh(
+        self,
+        result: MonitorState,
+        scan_through: datetime | None,
+    ) -> None:
+        """Record how a fresh export converges the newest pending live event."""
+        pending_event_id = str(
+            getattr(self, "_pending_latest_event_id", "") or ""
+        )
+        if not pending_event_id:
+            return
+        records = getattr(self, "_live_usage_event_records", {})
+        pending_event = (
+            records.get(pending_event_id) if isinstance(records, dict) else None
+        )
+        if not isinstance(pending_event, dict):
+            self._pending_latest_event_id = ""
+            return
+        if not pending_event.get("attribution_pending"):
+            self._pending_latest_event_id = ""
+            return
+
+        client_usage = (
+            result.client_usage if isinstance(result.client_usage, dict) else {}
+        )
+        authoritative_latest = (
+            client_usage.get("latest_request")
+            if isinstance(client_usage.get("latest_request"), dict)
+            else {}
+        )
+        authoritative_provider = _concrete_live_provider(
+            authoritative_latest.get("provider")
+        )
+        if not authoritative_provider:
+            authoritative_provider = _concrete_live_provider(
+                result.latest_account_name
+            )
+        authoritative_at = _parse_time(
+            str(
+                authoritative_latest.get("created_at")
+                or authoritative_latest.get("latest_at")
+                or (result.latest_request or {}).get("created_at")
+                or (result.latest_request or {}).get("latest_at")
+                or ""
+            )
+        )
+        event_when = pending_event.get("when")
+        scan_covers_event = bool(
+            isinstance(event_when, datetime)
+            and isinstance(scan_through, datetime)
+            and scan_through >= event_when
+        )
+        confirmed_request_covers_event = bool(
+            scan_covers_event
+            and authoritative_provider
+            and isinstance(authoritative_at, datetime)
+            and authoritative_at >= event_when - timedelta(seconds=1)
+        )
+        if confirmed_request_covers_event:
+            status = (
+                "confirmed_by_authoritative_refresh"
+                if authoritative_at <= event_when + timedelta(seconds=1)
+                else "superseded_by_confirmed_request"
+            )
+        elif scan_covers_event:
+            status = "covered_without_final_account"
+        else:
+            status = "authoritative_scan_behind"
+
+        signature = (
+            pending_event_id,
+            status,
+            authoritative_provider,
+            (
+                authoritative_at.isoformat(timespec="seconds")
+                if isinstance(authoritative_at, datetime)
+                else ""
+            ),
+        )
+        if signature != getattr(
+            self,
+            "_last_attribution_diagnostic_signature",
+            None,
+        ):
+            append_attribution_diagnostic(
+                "authoritative_refresh",
+                pending_event,
+                status=status,
+                authoritative_provider=authoritative_provider,
+                authoritative_latest_at=authoritative_at,
+                scan_through=scan_through,
+                scan_covers_event=scan_covers_event,
+            )
+            self._last_attribution_diagnostic_signature = signature
+        if confirmed_request_covers_event:
+            # The exporter now owns the recent-request card. Keep the event
+            # pending for exact provider accounting until a marker arrives.
+            self._pending_latest_event_id = ""
+
+    def _preserve_confirmed_latest_request_during_pending(
+        self,
+        result: MonitorState,
+    ) -> bool:
+        """Keep the last confirmed card when a refresh still lacks final evidence."""
+        pending_event_id = str(
+            getattr(self, "_pending_latest_event_id", "") or ""
+        )
+        if not pending_event_id or self.state is None:
+            return False
+        records = getattr(self, "_live_usage_event_records", {})
+        pending_event = (
+            records.get(pending_event_id) if isinstance(records, dict) else None
+        )
+        if not isinstance(pending_event, dict) or not pending_event.get(
+            "attribution_pending"
+        ):
+            return False
+
+        previous_request = (
+            self.state.latest_request
+            if isinstance(self.state.latest_request, dict)
+            else {}
+        )
+        previous_provider = _concrete_live_provider(
+            self.state.latest_account_name
+        )
+        if (
+            not previous_provider
+            or previous_request.get("kind") != "success"
+            or not (
+                previous_request.get("created_at")
+                or previous_request.get("latest_at")
+            )
+        ):
+            return False
+
+        client_usage = (
+            result.client_usage if isinstance(result.client_usage, dict) else {}
+        )
+        refreshed_latest = (
+            client_usage.get("latest_request")
+            if isinstance(client_usage.get("latest_request"), dict)
+            else {}
+        )
+        refreshed_raw_provider = str(refreshed_latest.get("provider") or "")
+        refreshed_provider = _concrete_live_provider(
+            refreshed_raw_provider or result.latest_account_name
+        )
+        if refreshed_provider:
+            return False
+        if refreshed_raw_provider and not is_local_api_service_provider_name(
+            refreshed_raw_provider
+        ):
+            return False
+
+        result.latest_request = dict(previous_request)
+        result.latest_account_name = str(self.state.latest_account_name or "")
+        return True
+
     def _apply_state(self, result: MonitorState | None, error: str | None = None) -> None:
         refresh_pending = self._refresh_pending
+        attribution_inflight = getattr(
+            self,
+            "_attribution_refresh_inflight_revision",
+            None,
+        )
+        fresh_result = bool(
+            result is not None
+            and isinstance(result.usage_sync, dict)
+            and result.usage_sync.get("fresh")
+        )
+        scan_through: datetime | None = None
         self._refresh_pending = False
         self._loading = False
         try:
@@ -9133,27 +10071,56 @@ class FloatingMonitorApp:
                 result.cost_history = update_usage_history(result)
             except Exception:
                 result.cost_history = summarize_usage_history(load_usage_history())
-            if bool((result.usage_sync or {}).get("fresh")):
+            if fresh_result:
                 client_usage = result.client_usage if isinstance(result.client_usage, dict) else {}
                 scan_status = (
                     client_usage.get("scan_status")
                     if isinstance(client_usage.get("scan_status"), dict)
                     else {}
                 )
-                self._complete_live_usage_verification(
-                    _parse_time(str(scan_status.get("through") or ""))
+                scan_through = _parse_time(str(scan_status.get("through") or ""))
+                self._complete_live_usage_verification(scan_through)
+                self._diagnose_authoritative_attribution_refresh(
+                    result,
+                    scan_through,
                 )
+                if attribution_inflight is not None and scan_through is not None:
+                    records = getattr(self, "_live_usage_event_records", {})
+                    for event in records.values() if isinstance(records, dict) else []:
+                        event_when = event.get("when") if isinstance(event, dict) else None
+                        if (
+                            isinstance(event_when, datetime)
+                            and event_when <= scan_through
+                            and _concrete_live_provider(event.get("provider"))
+                        ):
+                            event.pop("attribution_pending", None)
+            self._preserve_confirmed_latest_request_during_pending(result)
             if self._authoritative_state_covers_live_overlay(result):
                 self._live_usage_overlay = None
                 self._clear_live_usage_checkpoint()
             else:
                 self._apply_live_usage_overlay(result)
+            self._apply_live_latest_request_overlay(result)
             self.state = result
             if result.usage_source == "local":
                 self._last_quota_refresh_at = time.monotonic()
                 self._last_forced_full_refresh_at = time.monotonic()
-                if bool((result.usage_sync or {}).get("fresh")):
+                if fresh_result:
                     self._full_refresh_requested = False
+            if fresh_result and attribution_inflight is not None:
+                self._attributed_cockpit_usage_revision = attribution_inflight
+                self._attribution_refresh_inflight_revision = None
+                current_revision = getattr(
+                    self,
+                    "_last_cockpit_usage_revision",
+                    None,
+                )
+                self._attribution_refresh_requested = bool(
+                    self._has_pending_api_service_attribution()
+                    and current_revision != attribution_inflight
+                )
+        if not fresh_result and attribution_inflight is not None:
+            self._attribution_refresh_inflight_revision = None
         self._draw()
         if refresh_pending and not self.closed:
             self.refresh_async(force=True)
@@ -9334,6 +10301,26 @@ class FloatingMonitorApp:
         last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
         return time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
 
+    def _attribution_refresh_due(self, logs_busy: bool | None = None) -> bool:
+        state = getattr(self, "state", None)
+        if (
+            state is None
+            or not isinstance(state.client_usage, dict)
+            or not bool(getattr(self, "_attribution_refresh_requested", False))
+        ):
+            return False
+        if logs_busy is None:
+            logs_busy = self._codex_logs_busy()
+        if logs_busy:
+            return False
+        last_attempt = float(
+            getattr(self, "_last_attribution_refresh_at", float("-inf"))
+        )
+        return (
+            time.monotonic() - last_attempt
+            >= ATTRIBUTION_REFRESH_RETRY_SECONDS
+        )
+
     def _codex_logs_busy(self) -> bool:
         watcher = getattr(self, "_live_usage_watcher", None)
         if (
@@ -9364,15 +10351,30 @@ class FloatingMonitorApp:
             or self._quota_refresh_lock.locked()
             or bool(catchup_lock is not None and catchup_lock.locked())
         )
-        quota_started = False if refresh_in_progress else self._refresh_quota_async()
+        logs_busy = self._codex_logs_busy()
+        attribution_started = False
+        if not refresh_in_progress and self._attribution_refresh_due(logs_busy):
+            revision = getattr(self, "_last_cockpit_usage_revision", None)
+            self._attribution_refresh_inflight_revision = revision
+            if self.refresh_async(force=True):
+                attribution_started = True
+                now = time.monotonic()
+                self._last_attribution_refresh_at = now
+                self._last_forced_full_refresh_at = now
+            else:
+                self._attribution_refresh_inflight_revision = None
+        quota_started = (
+            False
+            if refresh_in_progress or attribution_started
+            else self._refresh_quota_async()
+        )
         if not refresh_in_progress and not quota_started:
             full_refresh_due = self._full_usage_refresh_due()
-            logs_busy = self._codex_logs_busy()
             last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
             reconcile_live_overlay = bool(getattr(self, "_live_usage_overlay", None)) and not logs_busy and (
                 time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
             )
-            if full_refresh_due or reconcile_live_overlay:
+            if not attribution_started and (full_refresh_due or reconcile_live_overlay):
                 if self.refresh_async():
                     self._last_forced_full_refresh_at = time.monotonic()
         self.root.after(REFRESH_SECONDS * 1000, self._schedule_auto_refresh)
