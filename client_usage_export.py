@@ -1421,8 +1421,6 @@ def price_profile_from_rates(
     }
 
 
-def local_model_price_details(model: str) -> dict[str, float]:
-    return price_profile_from_rates(model_price(model))
 
 
 def resolve_model_price_details(
@@ -1585,8 +1583,6 @@ def codex_internal_service_tier(text: str) -> str:
     return normalize_pricing_tier(match.group("tier"))
 
 
-def codex_internal_service_tier_speed(text: str) -> str:
-    return codex_service_tier_to_speed(codex_internal_service_tier(text))
 
 
 def codex_log_request_key(text: str, response: dict[str, Any] | None = None) -> str:
@@ -1725,40 +1721,6 @@ def usage_int(usage: dict[str, Any], key: str) -> int:
         return 0
 
 
-def add_codex_usage(
-    bucket: UsageBucket,
-    model: str,
-    input_tokens: int,
-    cached_tokens: int,
-    output_tokens: int,
-    when: datetime | None = None,
-    cost_multiplier: float = 1.0,
-) -> None:
-    uncached_input = max(0, input_tokens - max(0, cached_tokens))
-    cached_input = max(0, cached_tokens)
-    output = max(0, output_tokens)
-    total = uncached_input + cached_input + output
-    if total <= 0 or total > MAX_SINGLE_EVENT_TOKENS:
-        return
-    bucket.requests += 1
-    bucket.input_tokens += uncached_input
-    bucket.cached_input_tokens += cached_input
-    bucket.output_tokens += output
-    multiplier = max(1.0, cost_multiplier)
-    pricing_tier = "priority" if multiplier > 1 else "standard"
-    cost, price_resolved = estimate_cost_with_resolution(
-        model,
-        uncached_input,
-        cached_input,
-        output,
-        pricing_tier=pricing_tier,
-        when=when,
-    )
-    bucket.cost += cost
-    if not price_resolved:
-        bucket.add_unpriced_model(model, total)
-    bucket.add_model(model, total)
-    bucket.mark_latest(when, model, "fast" if multiplier > 1 else "", multiplier)
 
 
 def make_codex_event(
@@ -2006,35 +1968,8 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
     )
 
 
-def codex_session_header(lines: list[str]) -> tuple[str, str]:
-    for line in lines[:20]:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("type") != "session_meta":
-            continue
-        payload = row.get("payload") or {}
-        return (
-            str(payload.get("id") or payload.get("session_id") or "").strip(),
-            str(payload.get("forked_from_id") or "").strip(),
-        )
-    return "", ""
 
 
-def codex_fork_replay_cutoff(lines: list[str]) -> datetime | None:
-    _session_id, parent_id = codex_session_header(lines)
-    if not parent_id:
-        return None
-    for line in lines[:20]:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("type") == "session_meta":
-            started = parse_dt(row.get("timestamp"))
-            return started + timedelta(seconds=2) if started is not None else None
-    return None
 
 
 CODEX_TOKEN_USAGE_FIELDS = (
@@ -3929,8 +3864,6 @@ def bucket_from_codex_events(events: list[UsageEvent]) -> UsageBucket:
     return bucket
 
 
-def scan_codex(root: Path, start: datetime, end: datetime) -> UsageBucket:
-    return bucket_from_codex_events(scan_codex_events(root, start, end))
 
 
 def local_epoch_ms(value: datetime) -> int:
@@ -4250,36 +4183,6 @@ def opencodex_current_account_snapshot(home: Path) -> OpenCodexAccountSnapshot |
     )
 
 
-def load_opencodex_account_timeline(
-    path: Path | None = None,
-) -> list[OpenCodexAccountSnapshot]:
-    timeline_path = path or OPENCODEX_ACCOUNT_TIMELINE_PATH
-    data = load_json_object(timeline_path)
-    records = data.get("records")
-    if not isinstance(records, list):
-        return []
-    snapshots: list[OpenCodexAccountSnapshot] = []
-    for item in records:
-        if not isinstance(item, dict):
-            continue
-        when = parse_dt(item.get("at"))
-        label = usable_cockpit_account_label(item.get("label"))
-        if when is None or not label or is_api_service_mirror_label(label):
-            continue
-        snapshots.append(
-            OpenCodexAccountSnapshot(
-                when=when,
-                label=label,
-                plan_type=str(item.get("plan_type") or "").strip().lower(),
-            )
-        )
-    snapshots.sort(key=lambda item: item.when)
-    compact: list[OpenCodexAccountSnapshot] = []
-    for snapshot in snapshots:
-        if compact and compact[-1].label == snapshot.label:
-            continue
-        compact.append(snapshot)
-    return compact
 
 
 def record_current_opencodex_account_snapshot(home: Path, now: datetime) -> None:
@@ -5178,26 +5081,6 @@ def apply_opencodex_account_hints(
     return matched
 
 
-def account_label_for_event(
-    event: UsageEvent,
-    markers: list[AccountMarker],
-    current_label: str = "",
-    now: datetime | None = None,
-) -> str:
-    markers = sorted(markers, key=lambda marker: marker.when)
-    switch_markers = [marker for marker in markers if marker.kind == "switch"]
-    switch_times = [marker.when for marker in switch_markers]
-    request_markers = [marker for marker in markers if marker.kind != "switch"]
-    request_times = [marker.when for marker in request_markers]
-    label = account_label_at_time(event, switch_markers, switch_times, request_markers, request_times)
-    if (
-        label == UNASSIGNED_CODEX_LABEL
-        and current_label
-        and now is not None
-        and 0 <= (now - usage_event_account_time(event)).total_seconds() <= CODEX_CURRENT_ACCOUNT_RECENT_SECONDS
-    ):
-        label = current_label
-    return label
 
 
 _ATTRIBUTION_LEDGER_DOCUMENT_CACHE: tuple[tuple[Any, ...], dict[str, Any]] | None = None
@@ -8341,15 +8224,6 @@ def merge_codex_account_fallback_events(
             add_bucket(codex_accounts.setdefault(label, UsageBucket()), filtered)
 
 
-def latest_marker_by_label(markers: list[AccountMarker]) -> dict[str, datetime]:
-    latest: dict[str, datetime] = {}
-    for marker in markers:
-        if marker.kind != "request":
-            continue
-        previous = latest.get(marker.label)
-        if previous is None or marker.when > previous:
-            latest[marker.label] = marker.when
-    return latest
 
 
 def account_label_at_time(
@@ -8764,8 +8638,6 @@ def claude_hourly_from_events(events: list[ClaudeUsageEvent]) -> list[dict[str, 
     return buckets
 
 
-def scan_claude_hourly(root: Path, start: datetime, end: datetime) -> list[dict[str, Any]]:
-    return claude_hourly_from_events(scan_claude_events(root, start, end))
 
 
 def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
@@ -9365,173 +9237,6 @@ def account_marker_request_start(marker: AccountMarker) -> datetime | None:
     return marker.when - timedelta(milliseconds=latency_ms)
 
 
-def _collapse_cockpit_request_usage_events_legacy(
-    events: list[UsageEvent],
-    account_markers: list[AccountMarker],
-    affinity_events: list[CockpitAffinityEvent],
-) -> list[UsageEvent]:
-    """Collapse Cockpit's live token snapshots to one usage event per request.
-
-    Newer Codex clients can emit a token_count row after every tool result while
-    keeping the same Cockpit request_id. Those rows are cumulative snapshots of
-    one request, not separately billable requests. Cockpit affinity lines sit
-    within a few milliseconds of each snapshot, so request_id is a stronger
-    boundary than a Codex turn (which can contain either one or many requests).
-
-    Completed requests use Cockpit's final usage row. For an in-flight request,
-    only its latest snapshot is retained so the UI remains live without adding
-    every earlier snapshot again. Events with no unambiguous Cockpit affinity
-    evidence are left untouched for official-direct and non-Cockpit users.
-    """
-    if not events or not affinity_events:
-        return events
-
-    timed_events = sorted(
-        (
-            account_marker_epoch(event.when),
-            api_service_event_turn_key(event),
-            event,
-        )
-        for event in events
-    )
-    event_epochs = [item[0] for item in timed_events]
-    stable_items = [
-        item
-        for item in affinity_events
-        if item.request_id
-        and item.action in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
-        and usable_cockpit_account_label(item.label)
-        and normalize_cockpit_auth_id(item.account_id)
-    ]
-    if not stable_items:
-        return events
-
-    request_ids_by_event: dict[int, set[str]] = {}
-    match_seconds = COCKPIT_AFFINITY_EVENT_MATCH_SECONDS
-    ambiguity_seconds = COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS
-    for item in stable_items:
-        center = account_marker_epoch(item.when)
-        left = bisect_left(event_epochs, center - match_seconds)
-        right = bisect_right(event_epochs, center + match_seconds)
-        closest_by_turn: dict[str, tuple[float, UsageEvent]] = {}
-        for event_epoch, turn_key, event in timed_events[left:right]:
-            effective_turn = turn_key or f"event:{id(event)}"
-            delta = abs(event_epoch - center)
-            previous = closest_by_turn.get(effective_turn)
-            if previous is None or delta < previous[0]:
-                closest_by_turn[effective_turn] = (delta, event)
-        claims = sorted(
-            (delta, turn_key, event)
-            for turn_key, (delta, event) in closest_by_turn.items()
-        )
-        if not claims:
-            continue
-        if len(claims) > 1 and claims[1][0] - claims[0][0] < ambiguity_seconds:
-            continue
-        owner = claims[0][2]
-        request_ids_by_event.setdefault(id(owner), set()).add(item.request_id)
-
-    request_id_by_event = {
-        event_id: next(iter(request_ids))
-        for event_id, request_ids in request_ids_by_event.items()
-        if len(request_ids) == 1
-    }
-    events_by_request: dict[str, list[UsageEvent]] = {}
-    for event in events:
-        request_id = request_id_by_event.get(id(event), "")
-        if request_id:
-            events_by_request.setdefault(request_id, []).append(event)
-    if not events_by_request:
-        return events
-
-    final_by_request: dict[str, AccountMarker] = {}
-    for marker in account_markers:
-        if marker.kind != "request" or not marker.request_id:
-            continue
-        previous = final_by_request.get(marker.request_id)
-        if previous is None or marker.when > previous.when:
-            final_by_request[marker.request_id] = marker
-
-    consumed_event_ids: set[int] = set()
-    replacements: list[UsageEvent] = []
-    for request_id, request_events in events_by_request.items():
-        ordered = sorted(request_events, key=lambda event: event.when)
-        marker = final_by_request.get(request_id)
-        if marker is None:
-            if len(ordered) == 1:
-                continue
-            latest = ordered[-1]
-            replacements.append(
-                replace(
-                    latest,
-                    request_key=request_id,
-                    route=latest.route or "cockpit-live",
-                )
-            )
-            consumed_event_ids.update(id(event) for event in ordered)
-            continue
-
-        turn_keys = {
-            turn_key
-            for event in ordered
-            if (turn_key := api_service_event_turn_key(event))
-        }
-        exact_candidates = [
-            event
-            for event in events
-            if id(event) not in consumed_event_ids
-            and event.total_tokens == marker.total_tokens
-            and account_marker_covers_event_time(marker, event.when)
-            and (
-                not turn_keys
-                or api_service_event_turn_key(event) in turn_keys
-            )
-        ]
-        source_from_exact = bool(exact_candidates)
-        source = (
-            min(
-                exact_candidates,
-                key=lambda event: abs((marker.when - event.when).total_seconds()),
-            )
-            if exact_candidates
-            else ordered[-1]
-        )
-        cached_tokens = min(
-            max(0, marker.cached_tokens),
-            max(0, marker.total_tokens),
-        )
-        output_tokens = min(
-            max(0, marker.output_tokens),
-            max(0, marker.total_tokens - cached_tokens),
-        )
-        reported_input = max(0, marker.input_tokens)
-        if reported_input <= 0:
-            reported_input = max(0, marker.total_tokens - output_tokens)
-        reported_input = max(reported_input, cached_tokens)
-        replacements.append(
-            replace(
-                source,
-                when=source.when if source_from_exact else marker.when,
-                model=marker.model or source.model,
-                input_tokens=max(0, reported_input - cached_tokens),
-                cached_tokens=cached_tokens,
-                output_tokens=output_tokens,
-                request_key=request_id,
-                route="cockpit-request",
-                request_at=account_marker_request_start(marker) or source.request_at,
-            )
-        )
-        consumed_event_ids.update(id(event) for event in ordered)
-        consumed_event_ids.update(id(event) for event in exact_candidates)
-
-    reconciled = [
-        event
-        for event in events
-        if id(event) not in consumed_event_ids
-    ]
-    reconciled.extend(replacements)
-    reconciled.sort(key=lambda event: event.when)
-    return reconciled
 
 
 def reconcile_cockpit_request_usage_events(
@@ -13635,73 +13340,27 @@ def build_live_catchup_payload(
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Export local Claude/Codex client token usage for Sub2API monitor.")
-    parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
-    parser.add_argument("--date", default="")
-    parser.add_argument("--include-30d", action="store_true")
-    parser.add_argument("--backfill-history-details", action="store_true")
-    parser.add_argument("--offline-backfill", action="store_true")
-    parser.add_argument("--offline-backfill-run-id", default="")
-    parser.add_argument("--quota-only", action="store_true")
-    parser.add_argument("--live-since", default="")
-    parser.add_argument("--live-through", default="")
-    args = parser.parse_args()
-
-    now = datetime.now()
-    out = Path(args.output)
-    home = Path(os.path.expanduser("~"))
-    if args.offline_backfill:
-        result = run_offline_backfill_worker(
-            home,
-            home / ".codex" / "sessions",
-            now,
-            args.offline_backfill_run_id,
-        )
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        return 0 if result.get("state") != "error" else 1
-    if args.live_since:
-        since = parse_dt(args.live_since)
-        through = parse_dt(args.live_through) if args.live_through else now
-        if since is None or through is None:
-            parser.error("--live-since/--live-through must be valid ISO timestamps")
-        payload = build_live_catchup_payload(
-            home,
-            home / ".codex" / "sessions",
-            out,
-            since,
-            through,
-        )
-        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        return 0
-    if args.quota_only:
-        print(
-            json.dumps(
-                {
-                    "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-                    "accounts": cockpit_codex_quota_by_label(
-                        home,
-                        force_active_official_refresh=True,
-                    ),
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 0
+def export_usage_report(
+    output_path: Path,
+    home: Path,
+    now: datetime,
+    day: date,
+    *,
+    include_30d: bool = False,
+    queue_offline_history: bool = True,
+    backfill_history_details: bool = False,
+) -> dict[str, Any]:
+    out = output_path
     cached_30d_valid = False
     cached_30d_updated_at = ""
     cached_30d_windows: dict[str, dict[str, Any]] = {}
-    if args.include_30d:
+    if include_30d:
         (
             cached_30d_valid,
             cached_30d_updated_at,
             cached_30d_windows,
         ) = load_cached_account_30d_windows(out, now)
-    refresh_30d = args.include_30d and not cached_30d_valid
-    if args.date:
-        day = datetime.fromisoformat(args.date).date()
-    else:
-        day = now.date()
+    refresh_30d = include_30d and not cached_30d_valid
     start = datetime.combine(day, datetime.min.time())
     end = start + timedelta(days=1)
     scan_end = min(now, end) if day == now.date() else end
@@ -13836,7 +13495,7 @@ def main() -> int:
         now,
         activity_events=codex_events,
     )
-    if args.include_30d and cached_30d_valid:
+    if include_30d and cached_30d_valid:
         expected_30d_accounts = {
             name
             for name, _bucket in codex_provider_buckets
@@ -13894,7 +13553,7 @@ def main() -> int:
                 provider[key] = value
         if "@" in name:
             provider.update(window_stats_by_account.get(name, {}))
-            if args.include_30d and name in cached_30d_windows:
+            if include_30d and name in cached_30d_windows:
                 provider["window_30d"] = cached_30d_windows[name]
         codex_providers.append(provider)
     providers = codex_providers + [
@@ -14018,7 +13677,7 @@ def main() -> int:
         },
     }
     offline_queue_enabled = (
-        not args.date
+        queue_offline_history
         and day == now.date()
         and OFFLINE_HISTORY_BACKFILL_MAX_DAYS > 0
     )
@@ -14041,7 +13700,7 @@ def main() -> int:
                 "updated_days",
             }
         }
-    if args.include_30d:
+    if include_30d:
         output["account_30d_updated_at"] = (
             now.isoformat(timespec="seconds")
             if refresh_30d
@@ -14074,7 +13733,7 @@ def main() -> int:
                 }
             }
             write_json_atomic(out, output)
-    if args.backfill_history_details:
+    if backfill_history_details:
         backfill_usage_history_details(home, codex_sessions_root)
     logger.info(
         "export run finished in %.1fs: codex_events=%d grok_events=%d providers=%d ledger_entries=%d verdicts=%d",
@@ -14084,6 +13743,72 @@ def main() -> int:
         len(providers),
         len(attribution_ledger),
         len(attribution_verdicts),
+    )
+    return output
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Export local Claude/Codex client token usage for Sub2API monitor.")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument("--date", default="")
+    parser.add_argument("--include-30d", action="store_true")
+    parser.add_argument("--backfill-history-details", action="store_true")
+    parser.add_argument("--offline-backfill", action="store_true")
+    parser.add_argument("--offline-backfill-run-id", default="")
+    parser.add_argument("--quota-only", action="store_true")
+    parser.add_argument("--live-since", default="")
+    parser.add_argument("--live-through", default="")
+    args = parser.parse_args()
+
+    now = datetime.now()
+    out = Path(args.output)
+    home = Path(os.path.expanduser("~"))
+    if args.offline_backfill:
+        result = run_offline_backfill_worker(
+            home,
+            home / ".codex" / "sessions",
+            now,
+            args.offline_backfill_run_id,
+        )
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0 if result.get("state") != "error" else 1
+    if args.live_since:
+        since = parse_dt(args.live_since)
+        through = parse_dt(args.live_through) if args.live_through else now
+        if since is None or through is None:
+            parser.error("--live-since/--live-through must be valid ISO timestamps")
+        payload = build_live_catchup_payload(
+            home,
+            home / ".codex" / "sessions",
+            out,
+            since,
+            through,
+        )
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if args.quota_only:
+        print(
+            json.dumps(
+                {
+                    "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                    "accounts": cockpit_codex_quota_by_label(
+                        home,
+                        force_active_official_refresh=True,
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    day = datetime.fromisoformat(args.date).date() if args.date else now.date()
+    output = export_usage_report(
+        out,
+        home,
+        now,
+        day,
+        include_30d=args.include_30d,
+        queue_offline_history=not bool(args.date),
+        backfill_history_details=args.backfill_history_details,
     )
     print(json.dumps(output["today"], ensure_ascii=False))
     return 0

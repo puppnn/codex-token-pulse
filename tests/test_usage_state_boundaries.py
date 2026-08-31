@@ -5656,65 +5656,7 @@ class WindowSemanticsTests(unittest.TestCase):
             "cockpit-backup",
         )
 
-    def test_unlimited_5h_window_is_not_counted_as_quota_pressure(self) -> None:
-        app = object.__new__(monitor.FloatingMonitorApp)
-        app.state = monitor.MonitorState(
-            top_accounts=[
-                {
-                    "name": "Codex local - plus@example.com",
-                    "tokens": 500,
-                    "requests": 2,
-                    "active_now": True,
-                    "window_5h": {
-                        "tokens": 500,
-                        "requests": 2,
-                        "cost": 0.5,
-                        "quota_available": False,
-                        "quota_unlimited": True,
-                    },
-                }
-            ]
-        )
 
-        rows = app._budget_rows()
-
-        self.assertEqual(len(rows), 1)
-        self.assertFalse(rows[0]["has_quota"])
-        self.assertTrue(rows[0]["windows"][0]["quota_unlimited"])
-        self.assertFalse(rows[0]["windows"][0]["pressure_active"])
-
-    def test_budget_omits_confirmed_absent_pro_5h_window(self) -> None:
-        app = object.__new__(monitor.FloatingMonitorApp)
-        app.state = monitor.MonitorState(
-            top_accounts=[
-                {
-                    "name": "Codex local - pro@example.com",
-                    "tokens": 900,
-                    "requests": 3,
-                    "window_5h": {
-                        "tokens": 900,
-                        "requests": 3,
-                        "cost": 0.9,
-                        "quota_available": False,
-                        "quota_absent_confirmed": True,
-                    },
-                    "window_7d": {
-                        "tokens": 900,
-                        "requests": 3,
-                        "cost": 0.9,
-                        "quota_available": True,
-                        "remaining_percent": 87.0,
-                        "utilization": 13.0,
-                    },
-                }
-            ]
-        )
-
-        rows = app._budget_rows()
-
-        self.assertEqual(len(rows), 1)
-        self.assertEqual([window["label"] for window in rows[0]["windows"]], ["7d"])
-        self.assertTrue(rows[0]["has_quota"])
 
     def write_quota_account(
         self,
@@ -7022,7 +6964,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_home_auth"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "hyenas-ingot.1a@example.com"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / "auth.json").write_text(
                 json.dumps(
@@ -7112,7 +7054,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_c272c75c9bc64b31011c82626e40d006"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "hyenas-ingot.1a@example.com"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / ".cockpit_codex_auth.json").write_text(
                 json.dumps(
@@ -10933,19 +10875,24 @@ class LiveUsageOverlayTests(unittest.TestCase):
         app._live_usage_verification_pending_tokens = 0
         first_total = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS // 2
         final_batch = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS - first_total
+        first_events = self.events_with_total(first_total)
+        final_events = self.events_with_total(final_batch)
+        for event in final_events:
+            event["event_id"] = f"final-{event['event_id']}"
 
-        self.assertTrue(
-            app._record_live_usage_events(
-                self.events_with_total(first_total),
-                animate=False,
+        with patch.object(monitor, "_current_codex_account_label", return_value=""):
+            self.assertTrue(
+                app._record_live_usage_events(
+                    first_events,
+                    animate=False,
+                )
             )
-        )
-        self.assertFalse(
-            app._record_live_usage_events(
-                self.events_with_total(final_batch),
-                animate=False,
+            self.assertFalse(
+                app._record_live_usage_events(
+                    final_events,
+                    animate=False,
+                )
             )
-        )
 
         self.assertEqual(app.state.today_tokens, 100 + first_total)
         self.assertTrue(app._live_usage_verification_pending)
@@ -18075,6 +18022,56 @@ class ListScrollbarTests(unittest.TestCase):
         app._set_list_scroll_from_thumb("stats", 20)
 
         self.assertEqual(app._scroll_offsets["stats"], 0)
+
+
+class PageRenderingSeamTests(unittest.TestCase):
+    def test_current_tab_uses_its_page_renderer(self) -> None:
+        for tab, expected, skipped in (
+            ("accounts", "_draw_accounts_page", "_draw_usage_stats_page"),
+            ("stats", "_draw_usage_stats_page", "_draw_accounts_page"),
+        ):
+            with self.subTest(tab=tab):
+                app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+                app._main_tab = tab
+                app._draw_accounts_page = MagicMock()
+                app._draw_usage_stats_page = MagicMock()
+
+                app._draw_current_page(1, 2, 3, 4)
+
+                getattr(app, expected).assert_called_once_with(1, 2, 3, 4)
+                getattr(app, skipped).assert_not_called()
+
+
+class UsageExportInterfaceTests(unittest.TestCase):
+    def test_main_delegates_standard_export_to_report_interface(self) -> None:
+        report = {"today": {"tokens": 0}}
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "client_usage_export.py",
+                    "--output",
+                    "report.json",
+                    "--date",
+                    "2026-08-30",
+                ],
+            ),
+            patch.object(
+                client_usage_export,
+                "export_usage_report",
+                return_value=report,
+            ) as exporter,
+            patch("builtins.print"),
+        ):
+            exit_code = client_usage_export.main()
+
+        self.assertEqual(exit_code, 0)
+        args, kwargs = exporter.call_args
+        self.assertEqual(args[0], Path("report.json"))
+        self.assertEqual(args[3], date(2026, 8, 30))
+        self.assertFalse(kwargs["include_30d"])
+        self.assertFalse(kwargs["queue_offline_history"])
+        self.assertFalse(kwargs["backfill_history_details"])
 
 
 if __name__ == "__main__":
