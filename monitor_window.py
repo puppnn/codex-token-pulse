@@ -9,6 +9,7 @@ import os
 import logging
 import sys
 import tkinter as tk
+from contextlib import contextmanager
 
 
 class CompositedCanvas(tk.Canvas):
@@ -17,11 +18,30 @@ class CompositedCanvas(tk.Canvas):
     _paint_callback = None
     _mirror = None
     _mirror_ids = None
+    _frame_depth = 0
+    _paint_revision = 0
+    _frame_dirty = False
+
+    @contextmanager
+    def frame_update(self):
+        self._frame_depth += 1
+        try:
+            yield
+        finally:
+            self._frame_depth -= 1
+            if not self._frame_depth and self._frame_dirty:
+                self._frame_dirty = False
+                if self._paint_callback is not None:
+                    self._paint_callback()
 
     def _targets(self, args):
         return tuple(self._mirror_ids.get(int(arg), arg) if str(arg).isdigit() else arg for arg in args)
 
     def _changed(self):
+        self._paint_revision += 1
+        if self._frame_depth:
+            self._frame_dirty = True
+            return
         if self._paint_callback is not None:
             self._paint_callback()
 
@@ -105,6 +125,7 @@ class DesktopCompositor:
         self.root, self.canvas, self.on_failure = root, canvas, on_failure
         self.active, self._painting, self._pending = False, False, None
         self._dc = self._bitmap = self._old_bitmap = self._bits = None
+        self._capture_dc = self._capture_bitmap = self._capture_old = self._capture_bits = None
         self._size = None
         self._region_size = None
         self.frame = None
@@ -266,6 +287,11 @@ class DesktopCompositor:
         self._optics_pending = None
         if not self.active or self._optics is None:
             return
+        # Native PrintWindow/update callbacks can re-enter Tk while the hidden
+        # Canvas is on a black/white matte or the visible scene is incomplete.
+        if self._painting or self.canvas._frame_depth:
+            self._optics_pending = self.root.after(16, self._poll_refraction)
+            return
         try:
             if self._optics.error:
                 raise OSError(self._optics.error)
@@ -298,6 +324,16 @@ class DesktopCompositor:
             raise c.WinError(c.get_last_error())
         self._old_bitmap = self.g.SelectObject(self._dc, self._bitmap)
         self._bits, self._size = bits, (width, height)
+        self._capture_dc = self.g.CreateCompatibleDC(None)
+        capture_bits = c.c_void_p()
+        self._capture_bitmap = self.g.CreateDIBSection(
+            self._capture_dc, c.byref(info), 0, c.byref(capture_bits), None, 0)
+        if not self._capture_dc or not self._capture_bitmap:
+            error = c.get_last_error()
+            self._release_buffer()
+            raise c.WinError(error)
+        self._capture_old = self.g.SelectObject(self._capture_dc, self._capture_bitmap)
+        self._capture_bits = capture_bits
 
     def _capture_canvas(self, color, erase_occluders=False):
         from PIL import Image
@@ -311,13 +347,13 @@ class DesktopCompositor:
                 canvas.itemconfigure(item, fill=color, outline=color)
             canvas.configure(bg=color)
             canvas.update_idletasks()
-            self.c.memset(self._bits, 0, self._size[0] * self._size[1] * 4)
-            if not self.u.PrintWindow(self._render_root.winfo_id(), self._dc, 2):
+            self.c.memset(self._capture_bits, 0, self._size[0] * self._size[1] * 4)
+            if not self.u.PrintWindow(self._render_root.winfo_id(), self._capture_dc, 2):
                 raise self.c.WinError(self.c.get_last_error())
         finally:
             for item, (fill, outline) in occluders.items():
                 canvas.itemconfigure(item, fill=fill, outline=outline)
-        raw = self.c.string_at(self._bits, self._size[0] * self._size[1] * 4)
+        raw = self.c.string_at(self._capture_bits, self._size[0] * self._size[1] * 4)
         return Image.frombytes('RGB', self._size, raw, 'raw', 'BGRX')
 
     def _capture_layers(self):
@@ -339,7 +375,7 @@ class DesktopCompositor:
         return layers
 
     def request_frame(self):
-        if self.active and not self._painting and self._pending is None:
+        if self.active and not self._painting and not self.canvas._frame_depth and self._pending is None:
             self._pending = self.root.after_idle(self.present)
 
     def _clip_corners(self):
@@ -368,9 +404,10 @@ class DesktopCompositor:
         if self._pending is not None:
             self.root.after_cancel(self._pending)
             self._pending = None
-        if not self.active or self._painting:
+        if not self.active or self._painting or self.canvas._frame_depth:
             return
         self._painting = True
+        revision = self.canvas._paint_revision
         try:
             width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
             if min(width, height) < 2:
@@ -381,11 +418,15 @@ class DesktopCompositor:
                 return
             if self.refraction:
                 base, foreground = self._capture_layers()
+                if revision != self.canvas._paint_revision:
+                    return
                 self.frame = composite_premultiplied(base, foreground)
                 self._overlay = (base.tobytes(), foreground.tobytes())
                 self._submit_refraction()
                 return
             black, white = self._capture_canvas('#000000'), self._capture_canvas('#FFFFFF')
+            if revision != self.canvas._paint_revision:
+                return
             self.frame = recover_alpha(black, white)
             raw = self.frame.tobytes('raw', 'BGRA')
             self._blit(raw)
@@ -395,6 +436,8 @@ class DesktopCompositor:
             self.on_failure(self.error)
         finally:
             self._painting = False
+            if revision != self.canvas._paint_revision:
+                self.request_frame()
 
     def _blit(self, raw):
         from contextlib import nullcontext
@@ -419,6 +462,13 @@ class DesktopCompositor:
         self.frames += 1
 
     def _release_buffer(self):
+        if self._capture_old:
+            self.g.SelectObject(self._capture_dc, self._capture_old)
+        if self._capture_bitmap:
+            self.g.DeleteObject(self._capture_bitmap)
+        if self._capture_dc:
+            self.g.DeleteDC(self._capture_dc)
+        self._capture_dc = self._capture_bitmap = self._capture_old = self._capture_bits = None
         if self._old_bitmap:
             self.g.SelectObject(self._dc, self._old_bitmap)
         if self._bitmap:

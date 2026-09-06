@@ -12,6 +12,7 @@ import logging
 import time
 import tkinter.font as tkfont
 from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from monitor_materials import CanvasMaterials
@@ -189,16 +190,18 @@ class WorkspaceUI:
             self.desktop.lenses[name] = (x, y, width, height, radius, pressure)
             self.c.delete('liquid_' + name)
             return
-        if self.material_name != 'liquid':
+        if self.material_name != 'liquid' or self.glass is None:
             tag = 'liquid_' + name
             self.c.delete(tag)
             # Flat materials have no fabricated lens displacement.
             self.box(x, y, x + width, y + height, self.PANEL, radius, self.LINE, tags=(tag,))
             if name == 'demo':
                 self.text(x + width / 2, y + height / 2, 'Aa', 'value', self.SECONDARY, 'center', tags=(tag,))
+            # Replacing a Canvas item puts it on top. Animated dock updates
+            # must stay beneath the selection, icons, and labels.
+            if name == 'dock' and self.c.find_withtag('nav_selection'):
+                self.c.tag_lower(tag, 'nav_selection')
             return
-        if self.glass is None:
-            return self.box(x, y, x + width, y + height, self.PANEL, radius, self.LINE)
         light = round(self._light * 6) / 6
         pressure = round(pressure * 6) / 6
         key = (self.theme_name, self.a.WIDTH, self.a.HEIGHT, round(x), round(y), round(width), round(height), radius, light, pressure, source_key, self.blur_radius, self.refraction_strength)
@@ -222,6 +225,8 @@ class WorkspaceUI:
             self.c.coords(tag, x - 12 - pressure * 2, y - 12 + pressure)
         else:
             self.c.create_image(x - 12 - pressure * 2, y - 12 + pressure, image=image, anchor="nw", tags=(tag,))
+        if name == 'dock' and self.c.find_withtag('nav_selection'):
+            self.c.tag_lower(tag, 'nav_selection')
 
     def finish(self):
         self.navigation()
@@ -1245,6 +1250,10 @@ class WorkspaceUI:
             self._animation_id = self.a.root.after(16, self._animate)
 
     def _animate(self):
+        with getattr(self.c, 'frame_update', nullcontext)():
+            self._animate_frame()
+
+    def _animate_frame(self):
         self._animation_id = None
         if self.a.closed:
             return

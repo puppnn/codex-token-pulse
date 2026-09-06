@@ -9253,7 +9253,8 @@ class FloatingMonitorApp:
         if self.closed:
             return
         if getattr(self, "_workspace_ui", None) is not None:
-            self._draw_orbit()
+            with self.canvas.frame_update():
+                self._draw_orbit()
             return
         c = self.canvas
         c.delete("all")

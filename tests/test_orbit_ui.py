@@ -113,6 +113,88 @@ class OrbitStateTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == 'nt', 'Windows UI smoke test')
 class OrbitWindowTests(unittest.TestCase):
+    @unittest.skipIf(monitor.Image is None, 'Pillow is optional')
+    def test_flat_dock_pixels_do_not_flash_during_hover_animation(self):
+        with tempfile.TemporaryDirectory() as directory, preview_context(directory), \
+             patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '1',
+                                     'TOKEN_MONITOR_REFRACTION': '0', 'TOKEN_MONITOR_REDUCE_MOTION': '0'}), \
+             patch.object(WorkspaceUI, '_prefers_reduced_motion', return_value=False), \
+             patch.object(monitor, 'load_usage_history', return_value={'days': {}}):
+            app = PreviewApp()
+            try:
+                app.state = preview_state()
+                app._filter_account_display_rows = lambda rows: rows
+                ui = app._workspace_ui
+                ui.material_name = 'alpha'
+                app._draw()
+                app.root.update()
+                native = app._desktop_compositor
+                if native is None or not native.active:
+                    self.skipTest('Native desktop composition unavailable')
+                native.present()
+                box = (24, app.HEIGHT - 74, app.WIDTH - 24, app.HEIGHT - 24)
+                before = native.snapshot_rgb(ui.BG).crop(box).tobytes()
+                with patch.object(ui, '_request_animation'):
+                    for direction in (1., -1., 1.):
+                        ui._light_target = direction
+                        ui._last_glass_frame = 0.
+                        ui._animate()
+                        native.present()
+                        after = native.snapshot_rgb(ui.BG).crop(box).tobytes()
+                        self.assertEqual(before, after, 'Hover background redraw obscures navigation')
+            finally:
+                app.close_app()
+
+    def test_nav_background_stays_below_buttons_during_light_animation(self):
+        for material, pillow in (('alpha', True), ('opaque', True), ('liquid', True), ('liquid', False)):
+            with self.subTest(material=material, pillow=pillow), \
+                 tempfile.TemporaryDirectory() as directory, preview_context(directory), \
+                 patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '0',
+                                         'TOKEN_MONITOR_REDUCE_MOTION': '0'}), \
+                 patch.object(monitor, 'Image', monitor.Image if pillow else None), \
+                 patch.object(WorkspaceUI, '_prefers_reduced_motion', return_value=False), \
+                 patch.object(monitor, 'load_usage_history', return_value={'days': {}}):
+                app = PreviewApp()
+                try:
+                    app.state = preview_state()
+                    app._filter_account_display_rows = lambda rows: rows
+                    ui = app._workspace_ui
+                    ui.material_name = material
+                    app._draw()
+                    foreground = app.canvas.find_withtag('nav_foreground')
+                    initial_count = len(app.canvas.find_all())
+                    for tick in range(4):
+                        ui._light_target = 1. if tick % 2 == 0 else -1.
+                        ui._last_glass_frame = 0.
+                        if ui._animation_id is not None:
+                            app.root.after_cancel(ui._animation_id)
+                        ui._animate()
+                        stack = list(app.canvas.find_all())
+                        background = app.canvas.find_withtag('liquid_dock')
+                        self.assertTrue(background)
+                        self.assertLess(max(stack.index(item) for item in background),
+                                        min(stack.index(item) for item in foreground))
+                        selection = app.canvas.find_withtag('nav_selection')
+                        self.assertLess(max(stack.index(item) for item in background),
+                                        min(stack.index(item) for item in selection))
+                        self.assertEqual(len(stack), initial_count)
+                    for page in ('main_stats', 'main_library', 'main_accounts'):
+                        ui.handle_button(page)
+                        if ui._animation_id is not None:
+                            app.root.after_cancel(ui._animation_id)
+                        ui._last_glass_frame = 0.
+                        ui._animate()
+                        stack = list(app.canvas.find_all())
+                        background = app.canvas.find_withtag('liquid_dock')
+                        foreground = app.canvas.find_withtag('nav_foreground')
+                        selection = app.canvas.find_withtag('nav_selection')
+                        self.assertLess(max(stack.index(item) for item in background),
+                                        min(stack.index(item) for item in selection))
+                        self.assertLess(max(stack.index(item) for item in selection),
+                                        min(stack.index(item) for item in foreground))
+                finally:
+                    app.close_app()
+
     def test_real_event_handler_updates_orbit_flow_and_both_delta_badges(self):
         with tempfile.TemporaryDirectory() as directory, preview_context(directory), \
              patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '0',
