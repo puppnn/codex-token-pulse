@@ -4,6 +4,7 @@ release/
 __pycache__/
 *.py[cod]
 .env
+monitor_appearance.json
 client_usage_config.json
 client_usage_speed_history.json
 client_usage_today.json

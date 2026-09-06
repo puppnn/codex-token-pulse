@@ -1,35 +1,31 @@
 # Token Floating Monitor
 
-一个轻量级 Windows Token 悬浮窗，用 Python/Tk 写成，不需要额外 Python 依赖。它可以在桌面上显示当前活跃账号、并发、今日请求量、Token、成本、账号额度窗口，以及更细的用量统计面板。
+一个 Windows Token 悬浮窗，用 Python/Tk 写成。默认使用 Orbit 竖向界面，可选启用桌面液态玻璃材质；基础界面无需额外 Python 依赖。它可以显示活跃账号、并发、请求量、Token、成本、账号额度窗口和用量统计。
 
 > 截图使用脱敏演示数据生成，仅用于展示界面结构和功能。
 
 ## 界面预览
 
-### 账号
+Orbit 提供 `实时 / 统计 / 账号` 三个入口。环形时间线表示今日每小时的真实用量，中央显示最近 10 秒 Token；账号页保留 `今日 / 5h / 7d / 30d / 周期` 视图，周期入口仅在有对应额度时出现。
 
-显示当前活跃账号、最近请求、今日统计、Token 趋势和账号用量排行。支持 `今日 / 5h / 7d / 30d` 切换。
+![Orbit 实时、统计与账号页面](assets/screenshots/orbit-liquid-glass.png)
 
-![账号页](assets/screenshots/accounts.png)
+截图使用虚构账号及合成背景。冰川银为默认配色，外观页可选择六种配色，以及「曲面折射 / 半透明 / 纯色」三种材质。曲面折射支持实时调节「背景柔焦」和「折射强度」，默认 40% / 100% 保留轻柔焦和清晰高光；文字不受模糊影响。三种材质的预览都能演示按压回弹，可关闭交互动效。详见 [材质说明与兼容设置](docs/liquid-glass.md)。
 
-### 用量统计
-
-提供 `今日 / 7d / 30d / 全部` 视图，包含 Token 构成、缓存命中率、活跃分布、常用模型和账号累计成本。
-
-![用量统计页](assets/screenshots/usage-stats.png)
+原有界面可通过 `TOKEN_MONITOR_UI=classic` 使用。
 
 ## 主要功能
 
 - 桌面悬浮窗：支持置顶、拖动、缩放、刷新和关闭。
-- 两个中文页签：`账号`、`用量统计`。
+- Orbit 导航：`实时`、`统计`、`账号`；支持键盘 Tab、Enter 和外观页 Escape 返回。
 - 活跃账号与并发：显示当前正在使用的账号，以及总并发/账号并发。
 - 实时用量刷新：Windows 下优先使用系统目录变更通知定位发生变化的 Codex 会话日志，并由冷热双层轮询消费事件；空闲后自动降频，每 30 秒全目录扫描补漏。发现新的 `token_count` 后先即时更新界面，再由完整导出结果校正。
 - 增量日志缓存：通过 `state_5.sqlite` 的 `rollout_path` 定位原有 sessions 范围内的候选文件；只缓存统计所需的 session 元数据、模型上下文、生命周期和 Token 事件，不保存对话正文。文件追加时从上次偏移继续，半条 JSON 等待写完整，文件截断或重写时自动重建。
-- Token 流量脉冲：账号页将每个新增 `token_count` 绘制为从左向右移动的心电图脉冲，Token 越多波峰越高，约 10 秒走完整条轨迹；用量统计页使用单列分段流量柱，柱身保持亮色，仅柱顶约 8 像素渐变并以约 60 FPS 连续升降。两处均展示最近 10 秒 Token 流量。
+- Token 时间线：Orbit 显示今日每小时用量及最近 10 秒 Token。经典界面保留心电图式脉冲与分段流量柱。
 - 账号排行：按今日、5h额度、7d额度、30d查看账号用量与额度状态；“额度”命名用于和用量统计中的滚动时间范围区分。
 - 额度窗口：展示 5h、7d、cycle 的剩余百分比、已用比例、重置时间、无额度和 stale 状态。
 - 用量统计：展示请求数、Token、成本、input/cache/output 构成、缓存命中率、常用模型和账号累计成本。
-- 活跃分布：支持今日、7d、30d、全部，不同强度颜色表示用量高低；今日视图按 00:00 至当前的小时分布展示，Codex 报错后未在同一小时恢复运行的小时显示为红色，恢复后的小时保留正常用量颜色。鼠标悬停可查看具体值和错误摘要；窄窗口的全部视图聚焦最近 30 天。
+- 活跃分布：Orbit 的环形刻度表示今日小时用量，统计页提供按小时或按日的用量趋势；鼠标悬停可查看具体值。经典界面保留原有活跃分布视图。
 - 本地历史：记录每日请求、Token 和成本快照，用于趋势和历史统计。
 - 去重逻辑：保留 Codex fork replay 去重和 Sub2API mirror 扣除；Cockpit API 服务模式以去重后的
   原始请求为权威总量，`api-service-local` / `codex_local_access_runtime` 仅合并为一个展示项，不再重复扣除。
@@ -40,7 +36,13 @@
 - Python 3.10+
 - Tkinter，Windows 官方 Python 通常自带
 
-项目不需要安装额外 Python 包。
+基础 Canvas 界面无需额外 Python 包。启用抗锯齿玻璃绘制和 GPU 曲面折射：
+
+```powershell
+python -m pip install -r requirements-glass.txt
+```
+
+原生桌面材质需要 Windows 10 1809+ / Windows 11；曲面折射还需要 OpenGL 3.3。依赖或图形能力不可用时自动回退，仍可查看用量。安装包构建会包含这些可选依赖与 shader 资源。
 
 ## Windows 安装版
 
@@ -209,11 +211,15 @@ Kimi K3、DeepSeek V4 Pro/Flash 会使用 OpenCode Go 官方价格作为精确�
 - `.env`、本地配置、当天统计缓存、历史统计缓存和归因 ledger 默认都在 `.gitignore` 中，不会提交到 Git。
 - 本地模式只读取你电脑上的日志文件，不会主动上传到第三方。
 - Sub2API 模式只请求你配置的 `SUB2API_BASE_URL`。
+- 启用曲面折射时会读取窗口背后的图像，在本机内存中模糊、折射和合成；这些图像不会写入用量历史或上传。设置 `TOKEN_MONITOR_DESKTOP_GLASS=0` 可关闭桌面材质及采集。
 - 仓库中的截图使用脱敏演示数据，不包含真实账号或真实用量。
 
 ## 文件说明
 
-- `monitor.py`：悬浮窗 UI、Sub2API 读取、本地统计整合和页面绘制。
+- `monitor.py`：窗口、刷新调度、Sub2API 读取和本地统计整合。
+- `monitor_ui.py`：Orbit 布局、交互和状态展示。
+- `monitor_materials.py`、`monitor_glass.py`：抗锯齿图元与配色、玻璃绘制。
+- `monitor_window.py`、`monitor_refraction.py`、`monitor_capture.py`：Windows 窗口合成、GPU 材质与背景采集。
 - `client_usage_export.py`：本地客户端 JSONL 用量扫描器。
 - `start-monitor.ps1`：自动模式启动脚本。
 - `start-local-codex.ps1`：本地日志模式启动脚本。

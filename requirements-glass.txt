@@ -1,0 +1,4 @@
+# Optional GPU desktop material; the app retains its existing fallback without it.
+Pillow>=10.1,<13
+moderngl==5.12.0
+mss==10.2.0

@@ -9,12 +9,20 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        material: [basic, glass]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install optional glass dependencies
+        if: matrix.material == 'glass'
+        run: python -m pip install -r requirements-glass.txt
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py"

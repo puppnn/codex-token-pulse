@@ -102,6 +102,9 @@ if ($ExpatBinary) {
 & $Python -m PyInstaller @CommonArgs @TkRuntimeBinaryArgs @ExpatBinaryArgs `
     --windowed `
     --name TokenPulse `
+    --add-data "$(Join-Path $Root 'assets\liquid-glass.frag');assets" `
+    --add-data "$(Join-Path $Root 'assets\glass-blur.frag');assets" `
+    --collect-all glcontext `
     (Join-Path $Root "monitor.py")
 if ($LASTEXITCODE -ne 0) { throw "TokenPulse.exe build failed." }
 

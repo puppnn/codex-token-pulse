@@ -15,6 +15,14 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+except ImportError:
+    Image = ImageDraw = ImageFilter = ImageTk = None
+
+from monitor_ui import WorkspaceUI
+from monitor_window import CompositedCanvas
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -6364,6 +6372,13 @@ class FloatingMonitorApp:
     def __init__(self) -> None:
         self.WIDTH = int(type(self).WIDTH)
         self.HEIGHT = int(type(self).HEIGHT)
+        appearance_env = read_env_files(ENV_FILES)
+        for key in (
+            "TOKEN_MONITOR_UI", "TOKEN_MONITOR_DESKTOP_GLASS", "TOKEN_MONITOR_REFRACTION",
+            "TOKEN_MONITOR_CAPTURE_MODE", "TOKEN_MONITOR_REDUCE_MOTION",
+        ):
+            if key in appearance_env:
+                os.environ.setdefault(key, appearance_env[key])
         self.client = Sub2APIClient()
         self.state: MonitorState | None = None
         try:
@@ -6573,7 +6588,7 @@ class FloatingMonitorApp:
             self.root.configure(bg=Theme.bg_dark)
 
         # ── canvas ──
-        self.canvas = tk.Canvas(
+        self.canvas = CompositedCanvas(
             self.root,
             width=self.WIDTH,
             height=self.HEIGHT,
@@ -6633,6 +6648,10 @@ class FloatingMonitorApp:
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", self._on_mousewheel)
         self.canvas.bind("<Button-5>", self._on_mousewheel)
+
+        self._workspace_ui = None
+        if os.environ.get("TOKEN_MONITOR_UI", "orbit").casefold() != "classic":
+            self._workspace_ui = WorkspaceUI(self, sys.modules[__name__])
 
         # ── initial draw & data ──
         self._draw()
@@ -7197,6 +7216,9 @@ class FloatingMonitorApp:
             )
 
     def _redraw_token_flow_trace(self) -> bool:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            return workspace.update_live()
         rect = self._token_flow_trace_rect
         if self._main_tab != "accounts" or rect is None:
             return False
@@ -7378,7 +7400,8 @@ class FloatingMonitorApp:
         x = min(max(8, self._tooltip_pos[0] + 12), max(8, W - width - 8))
         y = min(max(8, self._tooltip_pos[1] + 14), max(8, H - height - 8))
         self._draw_rounded_rect(x, y, x + width, y + height, r=6,
-                                fill=Theme.bg_lift, outline=Theme.data, width=1)
+                                fill=Theme.bg_lift, outline=Theme.data, width=1,
+                                tags=("refraction_occluder",))
         for index, line in enumerate(lines):
             self.canvas.create_text(x + 9, y + 7 + index * 18, anchor="nw",
                                     text=line, font=self._fonts["font_micro"], fill=Theme.text_primary)
@@ -7491,22 +7514,27 @@ class FloatingMonitorApp:
             thumb_top += int(thumb_travel * offset / max_scroll)
         thumb_bottom = thumb_top + thumb_h
 
-        self.canvas.create_rectangle(
-            track_x,
-            track_top,
-            track_x + 2,
-            track_bottom,
-            fill=Theme.border,
-            outline="",
-        )
-        self.canvas.create_rectangle(
-            track_x,
-            thumb_top,
-            track_x + 2,
-            thumb_bottom,
-            fill=Theme.amber,
-            outline="",
-        )
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            self.canvas.create_line(track_x + 1, thumb_top, track_x + 1, thumb_bottom,
+                                    fill=workspace.MUTED, width=3, capstyle="round")
+        else:
+            self.canvas.create_rectangle(
+                track_x,
+                track_top,
+                track_x + 2,
+                track_bottom,
+                fill=Theme.border,
+                outline="",
+            )
+            self.canvas.create_rectangle(
+                track_x,
+                thumb_top,
+                track_x + 2,
+                thumb_bottom,
+                fill=Theme.amber,
+                outline="",
+            )
 
         hit_pad = 5
         self._list_scrollbar_tracks[tab] = (
@@ -9100,8 +9128,126 @@ class FloatingMonitorApp:
             max_scroll,
         )
 
+    def _account_rows_for_range(self):
+        """Keep quota-window selection shared by the Orbit and classic views."""
+        all_account_rows = self._filter_account_display_rows(
+            list(self.state.top_accounts or []) if self.state else []
+        )
+        has_cycle_account = any(account_has_cycle_quota_window(account) for account in all_account_rows)
+        if self._account_range == "cycle" and not has_cycle_account:
+            self._account_range = "today"
+            self._scroll_offsets["accounts"] = 0
+        raw_top = [
+            account
+            for account in all_account_rows
+            if account_row_available_for_range(account, self._account_range)
+        ]
+        range_key = {
+            "5h": "window_5h",
+            "7d": "window_7d",
+            "30d": "window_30d",
+            "cycle": "window_cycle",
+        }.get(self._account_range)
+        range_label = {
+            "today": "\u4eca\u65e5",
+            "5h": "5h \u989d\u5ea6\u7a97\u53e3",
+            "7d": "7d \u989d\u5ea6\u7a97\u53e3",
+            "30d": "\u8fd1 30 \u5929",
+            "cycle": "\u5f53\u524d\u5468\u671f",
+        }.get(self._account_range, "\u4eca\u65e5")
+        if self._account_range == "30d" and not self._needs_server_account_30d():
+            top = self._filter_account_display_rows(self._history_account_rows("30d"))
+            top.sort(key=lambda row: account_usage_sort_key(row, "30d"))
+        elif range_key:
+            top = []
+            for account in raw_top:
+                if self._account_range in {"5h", "7d", "cycle"} and account.get("is_pool_aggregate"):
+                    continue
+                window = account.get(range_key)
+                if not isinstance(window, dict) or not window:
+                    continue
+                window_tokens = int(window.get("tokens") or 0)
+                window_requests = int(window.get("requests") or 0)
+                window_cost = float(window.get("cost") or 0)
+                has_quota = bool(window.get("quota_available", window.get("utilization") is not None))
+                quota_unlimited = bool(window.get("quota_unlimited"))
+                if self._account_range == "5h" and not account_has_5h_quota(account):
+                    # The 5h tab is an official quota-window view. Rolling
+                    # analysis usage for an unlimited account belongs in
+                    # Usage Stats and must not create a synthetic quota row.
+                    continue
+                if (
+                    window_tokens <= 0
+                    and window_requests <= 0
+                    and window_cost <= 0
+                    and not has_quota
+                    and not quota_unlimited
+                ):
+                    continue
+                item = dict(account)
+                item["tokens"] = window_tokens
+                item["requests"] = window_requests
+                item["cost"] = window_cost
+                item["unpriced_tokens"] = int(window.get("unpriced_tokens") or 0)
+                item["utilization"] = window.get("utilization")
+                item["remaining_percent"] = window.get("remaining_percent")
+                item["resets_at"] = str(window.get("resets_at") or "")
+                item["latest_at"] = window.get("latest_at") or account.get("latest_at") or ""
+                item["latest_model"] = window.get("latest_model") or account.get("latest_model") or ""
+                item["quota_available"] = has_quota
+                item["quota_unlimited"] = quota_unlimited
+                item["quota_stale"] = bool(window.get("quota_stale"))
+                item["quota_reset_unavailable"] = bool(window.get("quota_reset_unavailable"))
+                item["quota_idle"] = bool(window.get("quota_idle")) if self._account_range == "5h" else False
+                top.append(item)
+            if self._account_range == "7d":
+                top.extend(self._history_7d_fallback_rows(top))
+            top.sort(key=lambda row: account_usage_sort_key(row, self._account_range))
+        else:
+            top = list(raw_top)
+            top.sort(key=lambda row: account_usage_sort_key(row, self._account_range))
+
+        return top, range_key, range_label
+
+    def _switch_main_tab(self, tab: str) -> bool:
+        if tab not in {"accounts", "stats"}:
+            return False
+        self._main_tab = tab
+        self._scroll_offsets[tab] = 0
+        if tab == "accounts":
+            self._scroll_offsets["active"] = 0
+        self._draw()
+        return True
+
+    def _draw_orbit(self) -> None:
+        self.canvas.delete("all")
+        self._token_flow_trace_rect = None
+        self._token_flow_meter_rect = None
+        self._token_flow_meter_fill_bounds = None
+        self._tooltip_rects = []
+        self._btn_rects.clear()
+        self._active_scroll_rect = None
+        self._list_scrollbar_tracks = {"accounts": None, "active": None, "stats": None}
+        self._list_scrollbar_thumbs = {"accounts": None, "active": None, "stats": None}
+        self._scroll_limits = {"accounts": 0, "active": 0, "stats": 0}
+        self._ui_scroll_steps = {}
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        if min(width, height) > 50 and (width, height) != (self.WIDTH, self.HEIGHT):
+            self._apply_window_size(self.WIDTH, self.HEIGHT)
+        ui = self._workspace_ui
+        ui.shell()
+        if self._main_tab == "stats":
+            ui.stats()
+        else:
+            ui.accounts()
+        ui.finish()
+        self._draw_tooltip(self.WIDTH, self.HEIGHT)
+
     def _draw(self) -> None:
         if self.closed:
+            return
+        if getattr(self, "_workspace_ui", None) is not None:
+            self._draw_orbit()
             return
         c = self.canvas
         c.delete("all")
@@ -9641,81 +9787,13 @@ class FloatingMonitorApp:
         # ════════════════════════════════════════════════════════
         #  TOP ACCOUNTS
         # ════════════════════════════════════════════════════════
-        all_account_rows = self._filter_account_display_rows(
-            list(self.state.top_accounts or []) if self.state else []
+        top, range_key, range_label = self._account_rows_for_range()
+        has_cycle_account = any(
+            account_has_cycle_quota_window(account)
+            for account in self._filter_account_display_rows(
+                list(self.state.top_accounts or []) if self.state else []
+            )
         )
-        has_cycle_account = any(account_has_cycle_quota_window(account) for account in all_account_rows)
-        if self._account_range == "cycle" and not has_cycle_account:
-            self._account_range = "today"
-            self._scroll_offsets["accounts"] = 0
-        raw_top = [
-            account
-            for account in all_account_rows
-            if account_row_available_for_range(account, self._account_range)
-        ]
-        range_key = {
-            "5h": "window_5h",
-            "7d": "window_7d",
-            "30d": "window_30d",
-            "cycle": "window_cycle",
-        }.get(self._account_range)
-        range_label = {
-            "today": "\u4eca\u65e5",
-            "5h": "5h \u989d\u5ea6\u7a97\u53e3",
-            "7d": "7d \u989d\u5ea6\u7a97\u53e3",
-            "30d": "\u8fd1 30 \u5929",
-            "cycle": "\u5f53\u524d\u5468\u671f",
-        }.get(self._account_range, "\u4eca\u65e5")
-        if self._account_range == "30d" and not self._needs_server_account_30d():
-            top = self._filter_account_display_rows(self._history_account_rows("30d"))
-            top.sort(key=lambda row: account_usage_sort_key(row, "30d"))
-        elif range_key:
-            top = []
-            for account in raw_top:
-                if self._account_range in {"5h", "7d", "cycle"} and account.get("is_pool_aggregate"):
-                    continue
-                window = account.get(range_key)
-                if not isinstance(window, dict) or not window:
-                    continue
-                window_tokens = int(window.get("tokens") or 0)
-                window_requests = int(window.get("requests") or 0)
-                window_cost = float(window.get("cost") or 0)
-                has_quota = bool(window.get("quota_available", window.get("utilization") is not None))
-                quota_unlimited = bool(window.get("quota_unlimited"))
-                if self._account_range == "5h" and not account_has_5h_quota(account):
-                    # The 5h tab is an official quota-window view. Rolling
-                    # analysis usage for an unlimited account belongs in
-                    # Usage Stats and must not create a synthetic quota row.
-                    continue
-                if (
-                    window_tokens <= 0
-                    and window_requests <= 0
-                    and window_cost <= 0
-                    and not has_quota
-                    and not quota_unlimited
-                ):
-                    continue
-                item = dict(account)
-                item["tokens"] = window_tokens
-                item["requests"] = window_requests
-                item["cost"] = window_cost
-                item["utilization"] = window.get("utilization")
-                item["remaining_percent"] = window.get("remaining_percent")
-                item["resets_at"] = str(window.get("resets_at") or "")
-                item["latest_at"] = window.get("latest_at") or account.get("latest_at") or ""
-                item["latest_model"] = window.get("latest_model") or account.get("latest_model") or ""
-                item["quota_available"] = has_quota
-                item["quota_unlimited"] = quota_unlimited
-                item["quota_stale"] = bool(window.get("quota_stale"))
-                item["quota_reset_unavailable"] = bool(window.get("quota_reset_unavailable"))
-                item["quota_idle"] = bool(window.get("quota_idle")) if self._account_range == "5h" else False
-                top.append(item)
-            if self._account_range == "7d":
-                top.extend(self._history_7d_fallback_rows(top))
-            top.sort(key=lambda row: account_usage_sort_key(row, self._account_range))
-        else:
-            top = list(raw_top)
-            top.sort(key=lambda row: account_usage_sort_key(row, self._account_range))
 
         y += 9
         c.create_text(COL_L, y + 2, anchor="nw", text="\u8d26\u53f7\u7528\u91cf",
@@ -10000,6 +10078,10 @@ class FloatingMonitorApp:
     def _fade_in(self) -> None:
         if self.closed:
             return
+        desktop = getattr(self, "_desktop_compositor", None)
+        if desktop is not None and desktop.active:
+            self._fade_alpha = self.WINDOW_ALPHA
+            return
         keep_fading = False
         try:
             if self._fade_alpha < self.WINDOW_ALPHA:
@@ -10125,6 +10207,9 @@ class FloatingMonitorApp:
         return x >= self.WIDTH - 24 and y >= self.HEIGHT - 24
 
     def _on_press(self, event: tk.Event) -> None:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None and workspace.pointer_press(event.x, event.y):
+            return
         scrollbar_tab = self._scrollbar_tab_at(event.x, event.y)
         if scrollbar_tab:
             self._resizing = False
@@ -10141,6 +10226,8 @@ class FloatingMonitorApp:
                 self._draw()
             return
         btn = self._hit_button(event.x, event.y)
+        if workspace is not None and workspace.handle_button(btn):
+            return
         if btn == "btn_close":
             self._resizing = False
             self.close_app()
@@ -10166,7 +10253,7 @@ class FloatingMonitorApp:
                 self._scroll_offsets["active"] = 0
             self._draw()
             return
-        if 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
+        if workspace is None and 56 <= event.y <= 96 and 14 <= event.x <= self.WIDTH - 14:
             self._resizing = False
             tab_width = max(1, (self.WIDTH - 28) / 2)
             tab_index = int(max(0, min(1, (event.x - 14) // tab_width)))
@@ -10220,6 +10307,9 @@ class FloatingMonitorApp:
         self._drag_data["y"] = event.y
 
     def _on_release(self, _event: tk.Event) -> None:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            workspace.pointer_release()
         self._resizing = False
         if self._list_scrollbar_drag_tab is not None:
             self._list_scrollbar_drag_tab = None
@@ -10227,6 +10317,9 @@ class FloatingMonitorApp:
         self._ensure_window_recoverable()
 
     def _on_drag(self, event: tk.Event) -> None:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None and workspace.pointer_drag(event.x, event.y):
+            return
         if self._list_scrollbar_drag_tab is not None:
             self._set_list_scroll_from_thumb(
                 self._list_scrollbar_drag_tab,
@@ -10258,9 +10351,13 @@ class FloatingMonitorApp:
         elif self._hit_resize_handle(event.x, event.y):
             self.canvas.configure(cursor="size_nw_se")
         else:
-            self.canvas.configure(cursor="")
+            self.canvas.configure(cursor="hand2" if self._hit_button(event.x, event.y) else "")
         btn = self._hit_button(event.x, event.y)
         tooltip = self._hit_tooltip(event.x, event.y)
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            workspace.pointer_motion(event.x, event.y)
+            tooltip = workspace.ring_tooltip(event.x, event.y) or tooltip
         tooltip_pos = (int(event.x), int(event.y))
         if btn != self._hover_btn or tooltip != self._tooltip_text or (tooltip and tooltip_pos != self._tooltip_pos):
             self._hover_btn = btn
@@ -10269,6 +10366,9 @@ class FloatingMonitorApp:
             self._draw()
 
     def _on_leave(self, _event: tk.Event) -> None:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            workspace.pointer_leave()
         self.canvas.configure(cursor="")
         if self._hover_btn is not None or self._tooltip_text:
             self._hover_btn = None
@@ -10309,7 +10409,7 @@ class FloatingMonitorApp:
                 active_current = int(self._scroll_offsets.get("active", 0) or 0)
                 self._scroll_offsets["active"] = max(
                     0,
-                    min(active_limit, active_current + delta * 26),
+                    min(active_limit, active_current + delta * getattr(self, "_ui_scroll_steps", {}).get("active", 26)),
                 )
                 self._draw()
                 return
@@ -10323,6 +10423,7 @@ class FloatingMonitorApp:
             step = self._account_rank_row_height()
         else:
             step = 48
+        step = getattr(self, "_ui_scroll_steps", {}).get(tab, step)
         self._scroll_offsets[tab] = max(0, min(limit, current + delta * step))
         self._draw()
 
@@ -13261,6 +13362,12 @@ class FloatingMonitorApp:
                 else []
             )
             if isinstance(target, dict)
+        )
+        # Include unattributed live tokens without counting the provider
+        # breakdown a second time.
+        unverified_tokens = max(
+            unverified_tokens,
+            max(0, int(overlay.get("tokens") or 0)) if isinstance(overlay, dict) else 0,
         )
         projected_unverified_tokens = unverified_tokens + batch_tokens
         verification_pending = bool(

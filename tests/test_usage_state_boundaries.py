@@ -7236,7 +7236,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_home_auth"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "quota-member@example.test"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / "auth.json").write_text(
                 json.dumps(
@@ -7326,7 +7326,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_c272c75c9bc64b31011c82626e40d006"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "quota-member@example.test"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / ".cockpit_codex_auth.json").write_text(
                 json.dumps(
@@ -11318,7 +11318,8 @@ class LiveUsageOverlayTests(unittest.TestCase):
         )
         self.assertEqual(app._live_usage_event_records, {})
 
-    def test_runtime_spike_guard_accumulates_several_batches_in_its_time_window(self) -> None:
+    @patch.object(monitor, "_current_codex_account_label", return_value="")
+    def test_runtime_spike_guard_accumulates_several_batches_in_its_time_window(self, _account_label) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
         app._live_usage_overlay = None
@@ -11330,16 +11331,21 @@ class LiveUsageOverlayTests(unittest.TestCase):
         app._live_usage_verification_pending_tokens = 0
         first_total = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS // 2
         final_batch = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS - first_total
+        first_events = self.events_with_total(first_total)
+        final_events = self.events_with_total(final_batch)
+        # Batch identity must not depend on the Windows wall clock resolution.
+        for event in final_events:
+            event["event_id"] = f"final-{event['event_id']}"
 
         self.assertTrue(
             app._record_live_usage_events(
-                self.events_with_total(first_total),
+                first_events,
                 animate=False,
             )
         )
         self.assertFalse(
             app._record_live_usage_events(
-                self.events_with_total(final_batch),
+                final_events,
                 animate=False,
             )
         )
