@@ -47,7 +47,7 @@ if IS_FROZEN:
     )
     APP_DIR.mkdir(parents=True, exist_ok=True)
 else:
-    APP_DIR = SOURCE_DIR
+    APP_DIR = Path(os.environ.get("TOKEN_PULSE_DATA_DIR") or SOURCE_DIR)
 
 
 def _setup_monitor_logger() -> logging.Logger:
@@ -266,7 +266,7 @@ CLIENT_USAGE_EXPORT = Path(
     or (
         INSTALL_DIR / "TokenPulseExporter.exe"
         if IS_FROZEN
-        else APP_DIR / "client_usage_export.py"
+        else SOURCE_DIR / "client_usage_export.py"
     )
 )
 if not CLIENT_USAGE_EXPORT.exists():
@@ -7007,6 +7007,9 @@ class FloatingMonitorApp:
         return f"+{exact_token_count(value)}", color, True
 
     def _redraw_token_delta_badge(self) -> bool:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            return workspace.redraw_delta_badge("token")
         if self._main_tab != "stats":
             return False
         items = self.canvas.find_withtag("token_delta_badge")
@@ -7059,6 +7062,9 @@ class FloatingMonitorApp:
         return f"+${value:,.{decimals}f}", color, True
 
     def _redraw_cost_delta_badge(self) -> bool:
+        workspace = getattr(self, "_workspace_ui", None)
+        if workspace is not None:
+            return workspace.redraw_delta_badge("cost")
         if self._main_tab != "stats":
             return False
         items = self.canvas.find_withtag("cost_delta_badge")

@@ -113,6 +113,45 @@ class OrbitStateTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == 'nt', 'Windows UI smoke test')
 class OrbitWindowTests(unittest.TestCase):
+    def test_real_event_handler_updates_orbit_flow_and_both_delta_badges(self):
+        with tempfile.TemporaryDirectory() as directory, preview_context(directory), \
+             patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '0',
+                                     'TOKEN_MONITOR_REDUCE_MOTION': '1'}), \
+             patch.object(monitor, '_current_codex_account_label', return_value='Codex local - demo@example.test'), \
+             patch.object(monitor, 'load_usage_history', return_value={'days': {}}), \
+             patch.object(monitor, 'append_attribution_diagnostic', return_value=True):
+            app = PreviewApp()
+            try:
+                app.state = preview_state()
+                app._filter_account_display_rows = lambda rows: rows
+                event = dict(event_id='orbit-live-event', session_id='orbit-live-session',
+                             when=monitor.datetime.now(monitor.timezone.utc),
+                             total_tokens=12345, input_tokens=12000, cached_tokens=10000,
+                             output_tokens=345, model='gpt-5.6-sol', cost=.25)
+                before = app.state.today_tokens
+                self.assertTrue(app._record_live_usage_events([event]))
+                self.assertEqual(app.state.today_tokens, before + 12345)
+                self.assertEqual(app.state.latest_request['provider'], 'Codex local - demo@example.test')
+                self.assertFalse(app._record_live_usage_events([event]))
+                self.assertEqual(app.state.today_tokens, before + 12345)
+                app._draw()
+                self.assertEqual(app.canvas.itemcget('orbit_recent_tokens', 'text'), monitor.compact_number(12345))
+                for tab in ('main_accounts', 'main_stats'):
+                    app._workspace_ui.handle_button(tab)
+                    self.assertTrue(app._redraw_token_delta_badge())
+                    self.assertTrue(app._redraw_cost_delta_badge())
+                    self.assertEqual(app.canvas.itemcget('token_delta_badge', 'text'), '+12,345')
+                    self.assertEqual(app.canvas.itemcget('cost_delta_badge', 'text'), '+$0.25')
+                future = time.monotonic() + monitor.TOKEN_DELTA_BADGE_DURATION_SECONDS + 1
+                with patch.object(time, 'monotonic', return_value=future):
+                    app._redraw_token_delta_badge()
+                    app._redraw_cost_delta_badge()
+                    self.assertEqual(app.canvas.itemcget('token_delta_badge', 'state'), 'hidden')
+                    self.assertEqual(app.canvas.itemcget('cost_delta_badge', 'state'), 'hidden')
+                    self.assertEqual(app._token_flow_snapshot()[1], 0)
+            finally:
+                app.close_app()
+
     @unittest.skipIf(monitor.Image is None, 'Pillow is optional')
     def test_motion_toggle_changes_preview_and_stops_all_lens_feedback(self):
         with tempfile.TemporaryDirectory() as directory, preview_context(directory), \

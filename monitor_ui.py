@@ -811,6 +811,9 @@ class WorkspaceUI:
             self.text(x, y, label, "caption", self.MUTED)
             self.text(x, y + 20, value, "value", self.TEXT, maxw=step - (15 if index else 10))
             self.a._add_tooltip(x, y, l + (index + 1) * step, y + 51, label + "\n" + value)
+            if index < 2:
+                self.draw_delta_badge("token" if index == 0 else "cost", x, y + 49,
+                                      maxw=step - 14)
 
     def visible_rows(self, tab, rows, top, bottom, row_h, right):
         a = self.a
@@ -1001,10 +1004,34 @@ class WorkspaceUI:
                   maxw=(right - x) * .60)
         self.text(right, y, "成本 · 含未定价" if summary.get('unpriced_tokens') else "预估成本", "caption", self.MUTED, "ne")
         self.text(right, y + 26, self.cost_text(summary), "value", self.VIOLET, "ne", maxw=(right - x) * .37)
-        self.text(right, y + 64, m.compact_number(summary["requests"]) + " 次请求", "caption", self.MUTED, "ne")
-        badge, color, visible = a._token_delta_badge_visual()
-        self.text(x, y + 76, badge, "data", color, state="normal" if visible else "hidden", tags=("token_delta_badge",))
+        self.text(right, y + 58, m.compact_number(summary["requests"]) + " 次请求", "micro", self.MUTED, "ne")
+        self.draw_delta_badge("token", x, y + 76, maxw=(right - x) * .60)
+        self.draw_delta_badge("cost", right, y + 76, anchor="ne", maxw=(right - x) * .37)
         a._add_tooltip(x, y, right, y + 76, f"{m.exact_token_count(summary['tokens'])} Token\n{int(summary['requests']):,} 次请求\n{self.cost_text(summary)}" + self.unpriced_note(summary))
+
+    def delta_visual(self, kind):
+        callback = self.a._token_delta_badge_visual if kind == "token" else self.a._cost_delta_badge_visual
+        text, _old_color, visible = callback()
+        started = float(getattr(self.a, f"_{kind}_delta_started_at", 0.))
+        elapsed = max(0., time.monotonic() - started)
+        progress = min(1., elapsed / self.m.TOKEN_DELTA_BADGE_DURATION_SECONDS)
+        eased = progress * progress * (3. - 2. * progress)
+        color = self.blend(self.LIVE if kind == "token" else self.WARN, self.BG, eased)
+        return text, color, visible
+
+    def draw_delta_badge(self, kind, x, y, anchor="nw", maxw=None):
+        text, color, visible = self.delta_visual(kind)
+        item = self.text(x, y, text, "micro", color, anchor, maxw=maxw,
+                         state="normal" if visible else "hidden", tags=(f"{kind}_delta_badge",))
+        self.c.itemconfigure(item, fill=color)
+
+    def redraw_delta_badge(self, kind):
+        tag = f"{kind}_delta_badge"
+        if not self.c.find_withtag(tag):
+            return False
+        text, color, visible = self.delta_visual(kind)
+        self.c.itemconfigure(tag, text=text, fill=color, state="normal" if visible else "hidden")
+        return True
 
     def time_label(self, row, fallback):
         if self.a._usage_range == "24h":

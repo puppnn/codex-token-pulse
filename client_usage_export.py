@@ -82,7 +82,7 @@ if IS_FROZEN:
     )
     APP_DIR.mkdir(parents=True, exist_ok=True)
 else:
-    APP_DIR = SOURCE_DIR
+    APP_DIR = Path(os.environ.get("TOKEN_PULSE_DATA_DIR") or SOURCE_DIR)
 LOG_PATH = APP_DIR / "tokenpulse-export.log"
 logger = logging.getLogger("tokenpulse.export")
 if not logger.handlers:
