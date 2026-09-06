@@ -1238,6 +1238,26 @@ class UsageHistoryIsolationTests(unittest.TestCase):
         self.assertNotIn(next_day, saved)
         self.assertIsNone(app._live_usage_overlay)
 
+    def test_previous_day_state_cannot_seed_new_day_history(self) -> None:
+        self.seed_history("local")
+        previous_day = (date.fromisoformat(self.day) - timedelta(days=1)).isoformat()
+        state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=10_000,
+            today_tokens=1_000_000_000,
+            today_account_cost=1_000.0,
+            client_usage={
+                "date": previous_day,
+                "providers": [],
+            },
+        )
+
+        monitor.update_usage_history(state)
+
+        saved = monitor.load_usage_history()["days"][self.day]
+        self.assertEqual(saved["tokens"], 1_000_000)
+        self.assertEqual(saved["requests"], 100)
+
     def test_claude_schema_upgrade_replaces_legacy_history_high_water(self) -> None:
         self.seed_history("local")
         state = monitor.MonitorState(
@@ -1398,6 +1418,79 @@ class UsageHistoryIsolationTests(unittest.TestCase):
         saved = monitor.load_usage_history()["days"][self.day]
         self.assertEqual(saved["tokens"], 1_000_000)
         self.assertEqual(saved["source_gap"]["tokens"], 25)
+
+    def test_canonical_live_totals_replace_same_day_history_high_water(self) -> None:
+        self.seed_history("local")
+        history = monitor.load_usage_history()
+        history["days"][self.day]["source_gap"] = {
+            "requests": 90,
+            "tokens": 900_000,
+            "cost": 9.0,
+        }
+        monitor.write_json_atomic(monitor.USAGE_HISTORY_JSON, history)
+        state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=10,
+            today_tokens=100_000,
+            today_account_cost=1.0,
+            client_usage={
+                "date": self.day,
+                "providers": [
+                    {
+                        "name": "Codex local - canonical@example.com",
+                        "requests": 10,
+                        "tokens": 100_000,
+                        "cost": 1.0,
+                        "models": {"gpt-test": 100_000},
+                    }
+                ],
+                "_live_canonical_totals_applied": True,
+            },
+        )
+
+        monitor.update_usage_history(state)
+
+        saved = monitor.load_usage_history()["days"][self.day]
+        self.assertEqual(saved["tokens"], 100_000)
+        self.assertEqual(saved["requests"], 10)
+        self.assertEqual(saved["cost"], 1.0)
+        self.assertNotIn("source_gap", saved)
+        self.assertEqual(
+            [row["name"] for row in saved["providers"]],
+            ["Codex local - canonical@example.com"],
+        )
+
+    def test_history_materializes_unattributed_local_gap(self) -> None:
+        state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=5,
+            today_tokens=500,
+            today_account_cost=2.5,
+            latest_request={"created_at": datetime.now(monitor.CN_TZ).isoformat()},
+            client_usage={
+                "date": self.day,
+                "providers": [
+                    {
+                        "name": "Codex local - known@example.com",
+                        "requests": 3,
+                        "tokens": 300,
+                        "cost": 1.5,
+                        "models": {"gpt-test": 300},
+                    }
+                ],
+            },
+        )
+
+        monitor.update_usage_history(state)
+
+        saved = monitor.load_usage_history()["days"][self.day]
+        providers = saved["providers"]
+        self.assertEqual(sum(int(row["requests"]) for row in providers), 5)
+        self.assertEqual(sum(int(row["tokens"]) for row in providers), 500)
+        self.assertAlmostEqual(sum(float(row["cost"]) for row in providers), 2.5)
+        gap = next(row for row in providers if row.get("is_unattributed_gap"))
+        self.assertEqual(gap["name"], "Codex local - api-service-local")
+        self.assertEqual(gap["tokens"], 200)
 
 
 class AccountUsageSortTests(unittest.TestCase):
@@ -2000,6 +2093,48 @@ class LocalActiveAccountTests(unittest.TestCase):
         self.assertEqual({row["name"] for row in providers}, {"pool@example.com", "Codex local - direct@example.com"})
         self.assertEqual(summary["tokens"], 1_000)
         self.assertEqual(mix["unknown"], 900)
+
+    def test_stale_account_snapshot_cannot_exceed_authoritative_daily_total(self) -> None:
+        state = monitor.MonitorState(
+            usage_source="both",
+            today_requests=10,
+            today_tokens=1_000,
+            today_account_cost=2.0,
+            client_usage={
+                "providers": [
+                    {
+                        "name": "Codex local - direct@example.com",
+                        "requests": 4,
+                        "tokens": 400,
+                        "cost": 0.8,
+                        "models": {"gpt-local": 400},
+                    }
+                ]
+            },
+            top_accounts=[
+                {
+                    "name": "pool@example.com",
+                    "requests": 10,
+                    "tokens": 1_000,
+                    "cost": 2.0,
+                },
+                {
+                    "name": "Codex local - stale-gap",
+                    "requests": 4,
+                    "tokens": 400,
+                    "cost": 0.8,
+                    "is_unattributed_gap": True,
+                },
+            ],
+        )
+
+        details = monitor.detailed_usage_from_state(state)
+
+        self.assertEqual(
+            sum(int(row["tokens"]) for row in details["providers"]),
+            400,
+        )
+        self.assertNotIn("pool@example.com", {row["name"] for row in details["providers"]})
 
     def test_usage_history_excludes_pool_aggregate_but_keeps_pool_accounts(self) -> None:
         state = monitor.MonitorState(
@@ -5302,6 +5437,85 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["providers"][0]["tokens"], 100_000)
         self.assertEqual(current["providers"][1]["name"], client_usage_export.HIGH_WATER_UNATTRIBUTED_LABEL)
         self.assertEqual(current["providers"][1]["tokens"], 113_901_494)
+
+    def test_history_restore_ignores_mismatched_source_date(self) -> None:
+        current = self.snapshot(self.day, 100_000)
+        previous_day = self.day - timedelta(days=1)
+        self.history_path.write_text(
+            json.dumps(
+                {
+                    "days": {
+                        self.day.isoformat(): {
+                            "date": self.day.isoformat(),
+                            "source_date": previous_day.isoformat(),
+                            "requests": 10_000,
+                            "tokens": 1_000_000_000,
+                            "input_tokens": 1_000_000_000,
+                            "cost": 1_000.0,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        client_usage_export.restore_today_from_usage_history(current, self.day)
+
+        self.assertEqual(current["today"]["tokens"], 100_000)
+        self.assertEqual(len(current["providers"]), 1)
+
+    def test_source_gap_is_applied_once_across_repeated_exports(self) -> None:
+        gap = {
+            "requests": 9,
+            "tokens": 900_000,
+            "input_tokens": 900_000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "cost": 9.0,
+            "unpriced_tokens": 0,
+        }
+        self.history_path.write_text(
+            json.dumps(
+                {
+                    "days": {
+                        self.day.isoformat(): {
+                            "date": self.day.isoformat(),
+                            "source_date": self.day.isoformat(),
+                            "requests": 10,
+                            "tokens": 1_000_000,
+                            "input_tokens": 1_000_000,
+                            "cost": 10.0,
+                            "source_gap": gap,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        first = self.snapshot(self.day, 100_000)
+        client_usage_export.restore_today_from_usage_history(first, self.day)
+        client_usage_export.add_unattributed_provider_gap(first)
+        self.output_path.write_text(json.dumps(first), encoding="utf-8")
+
+        second = self.snapshot(self.day, 200_000)
+        client_usage_export.same_day_output_high_water(
+            second,
+            self.output_path,
+            self.day,
+        )
+        client_usage_export.restore_today_from_usage_history(second, self.day)
+        client_usage_export.add_unattributed_provider_gap(second)
+
+        self.assertEqual(first["today"]["tokens"], 1_000_000)
+        self.assertEqual(second["today"]["tokens"], 1_100_000)
+        gaps = [
+            row
+            for row in second["providers"]
+            if row.get("is_unattributed_gap")
+        ]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["tokens"], 900_000)
 
     def test_unattributed_gap_provider_matches_today_total(self) -> None:
         current = self.snapshot(self.day, 1_000_000)
@@ -10466,6 +10680,39 @@ class ActiveSessionLifecycleTests(unittest.TestCase):
         self.assertEqual(sessions_by_label, {})
         self.assertEqual(unresolved, 1)
 
+    def test_explicit_unresolved_event_never_falls_back_to_direct_account(self) -> None:
+        now = datetime(2026, 7, 12, 14, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=now - timedelta(seconds=1),
+            model="gpt-test",
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=10,
+            session_id="session-1",
+        )
+        lifecycle = client_usage_export.SessionLifecycle(
+            session_id="session-1",
+            state="task_started",
+            when=now - timedelta(minutes=1),
+            file_activity_at=now - timedelta(seconds=1),
+        )
+
+        rows, active_by_label, sessions_by_label, unresolved = (
+            client_usage_export.build_active_session_rows(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                {"session-1": "Codex local - previous@example.com"},
+                {"session-1": lifecycle},
+                "Codex local - current@example.com",
+                now,
+                api_service_routed=False,
+            )
+        )
+
+        self.assertEqual(rows[0]["provider"], "")
+        self.assertEqual(active_by_label, {})
+        self.assertEqual(sessions_by_label, {})
+        self.assertEqual(unresolved, 1)
+
     def test_affinity_only_cockpit_evidence_disables_old_session_fallback(self) -> None:
         now = datetime(2026, 7, 12, 14, 0, 0)
         event = client_usage_export.UsageEvent(
@@ -10844,6 +11091,156 @@ class LiveUsageOverlayTests(unittest.TestCase):
             monitor.usage_sync_label(app.state.usage_sync),
             "\u5b9e\u65f6\u7edf\u8ba1\u4e2d / \u5168\u91cf\u6838\u5bf9\u6392\u961f",
         )
+
+    def test_live_overlay_removes_stale_unattributed_provider(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=100, requests=2)
+        stale = {
+            "name": "Codex local - historical gap",
+            "tokens": 900,
+            "requests": 9,
+            "cost": 9.0,
+            "is_unattributed_gap": True,
+        }
+        canonical = {
+            "name": "Codex local - account@example.com",
+            "tokens": 100,
+            "requests": 2,
+            "cost": 1.0,
+        }
+        app.state.client_usage["providers"] = [canonical, stale]
+        app.state.top_accounts = [dict(canonical), dict(stale)]
+        app._live_usage_overlay = {
+            "base_today_tokens": 100,
+            "base_today_requests": 2,
+            "base_today_cost": 1.0,
+            "tokens": 50,
+            "requests": 1,
+            "cost": 0.5,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "providers": {
+                "Codex local - account@example.com": {
+                    "replace_existing": True,
+                    "base_tokens": 100,
+                    "base_requests": 2,
+                    "base_cost": 1.0,
+                    "tokens": 50,
+                    "requests": 1,
+                    "cost": 0.5,
+                    "models": {"gpt-test": 50},
+                }
+            },
+            "quota_windows": {},
+            "base_hourly": app._live_hourly_snapshot(),
+            "hourly": {},
+        }
+
+        app._apply_live_usage_overlay(app.state)
+
+        self.assertFalse(
+            any(row.get("is_unattributed_gap") for row in app.state.client_usage["providers"])
+        )
+        self.assertFalse(
+            any(row.get("is_unattributed_gap") for row in app.state.top_accounts)
+        )
+        self.assertEqual(app.state.today_tokens, 150)
+
+    def test_canonical_live_totals_replace_stale_daily_high_water(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=1_000, requests=10)
+        app.state.today_account_cost = 9.0
+        catchup_through = datetime.now(timezone.utc)
+        app.state.client_usage.update(
+            {
+                "cost": 9.0,
+                "scan_status": {"through": catchup_through.isoformat()},
+            }
+        )
+        app._live_usage_overlay = {
+            "base_today_tokens": 1_000,
+            "base_today_requests": 10,
+            "base_today_cost": 9.0,
+            "tokens": 0,
+            "requests": 0,
+            "cost": 0.0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "providers": {},
+            "quota_windows": {},
+            "base_hourly": app._live_hourly_snapshot(),
+            "hourly": {},
+            "catchup_through": catchup_through,
+            "canonical_totals": {
+                "tokens": 100,
+                "requests": 2,
+                "cost": 1.0,
+                "input_tokens": 60,
+                "cached_input_tokens": 30,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 10,
+                "unpriced_tokens": 0,
+                "unpriced_models": {},
+                "models": {"gpt-test": 100},
+            },
+        }
+
+        app._apply_live_usage_overlay(app.state)
+
+        self.assertEqual(app.state.today_tokens, 100)
+        self.assertEqual(app.state.today_requests, 2)
+        self.assertEqual(app.state.today_account_cost, 1.0)
+        self.assertEqual(app.state.client_usage["tokens"], 100)
+        self.assertEqual(app.state.client_usage["requests"], 2)
+        self.assertEqual(app.state.client_usage["cost"], 1.0)
+        self.assertEqual(app._live_usage_overlay["base_today_tokens"], 100)
+        self.assertEqual(app._live_usage_overlay["tokens"], 0)
+        self.assertNotIn("canonical_totals", app._live_usage_overlay)
+
+    def test_stale_canonical_live_totals_cannot_lower_newer_scan(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=1_000, requests=10)
+        app.state.today_account_cost = 9.0
+        catchup_through = datetime.now(timezone.utc) - timedelta(minutes=1)
+        app.state.client_usage.update(
+            {
+                "cost": 9.0,
+                "scan_status": {
+                    "through": (catchup_through + timedelta(seconds=1)).isoformat()
+                },
+            }
+        )
+        app._live_usage_overlay = {
+            "base_today_tokens": 1_000,
+            "base_today_requests": 10,
+            "base_today_cost": 9.0,
+            "tokens": 0,
+            "requests": 0,
+            "cost": 0.0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "providers": {},
+            "quota_windows": {},
+            "base_hourly": app._live_hourly_snapshot(),
+            "hourly": {},
+            "catchup_through": catchup_through,
+            "canonical_totals": {
+                "tokens": 100,
+                "requests": 2,
+                "cost": 1.0,
+            },
+        }
+
+        app._apply_live_usage_overlay(app.state)
+
+        self.assertEqual(app.state.today_tokens, 1_000)
+        self.assertEqual(app.state.today_requests, 10)
+        self.assertEqual(app.state.today_account_cost, 9.0)
+        self.assertEqual(app.state.client_usage["tokens"], 1_000)
+        self.assertNotIn("canonical_totals", app._live_usage_overlay)
 
     def test_live_overlay_does_not_hide_timeout_before_cached_cutoff(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -16806,6 +17203,56 @@ class AttributionLedgerTests(unittest.TestCase):
 
         self.assertIn("Codex local - new-account@example.com", attributed)
         self.assertNotIn("Codex local - old-account@example.com", attributed)
+
+    def test_direct_switch_repairs_provisional_api_service_ledger_label(self) -> None:
+        before_switch = client_usage_export.UsageEvent(
+            when=datetime(2026, 9, 4, 9, 15, 0),
+            model="gpt-5.6-sol",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-api",
+        )
+        after_switch = client_usage_export.UsageEvent(
+            when=datetime(2026, 9, 4, 10, 0, 0),
+            model="gpt-5.6-sol",
+            input_tokens=100,
+            cached_tokens=200,
+            output_tokens=10,
+            session_id="session-direct",
+        )
+        aggregate = client_usage_export.API_SERVICE_AGGREGATE_LABEL
+        direct = "Codex local - direct@example.com"
+        ledger = {
+            client_usage_export.codex_event_id(before_switch): aggregate,
+            client_usage_export.codex_event_id(after_switch): aggregate,
+        }
+        markers = [
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 9, 4, 9, 0, 0),
+                label=aggregate,
+                kind="switch",
+            ),
+            client_usage_export.AccountMarker(
+                when=datetime(2026, 9, 4, 9, 30, 0),
+                label=direct,
+                kind="switch",
+            ),
+        ]
+
+        with patch.object(client_usage_export, "load_official_quota_cache", return_value={}):
+            attributed = client_usage_export.attribute_codex_events_by_account(
+                [before_switch, after_switch],
+                markers,
+                ledger,
+            )
+
+        self.assertEqual(attributed[aggregate], [before_switch])
+        self.assertEqual(attributed[direct], [after_switch])
+        self.assertEqual(
+            ledger[client_usage_export.codex_event_id(after_switch)],
+            direct,
+        )
 
     def test_legacy_event_id_is_migrated_without_losing_attribution(self) -> None:
         event = client_usage_export.UsageEvent(

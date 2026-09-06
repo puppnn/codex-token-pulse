@@ -1876,6 +1876,43 @@ def detailed_usage_from_account_rows(rows: list[dict[str, Any]] | None) -> dict[
     return {"models": model_totals, "providers": providers}
 
 
+def _usage_detail_totals(details: dict[str, Any] | None) -> tuple[int, int, float]:
+    """Return provider-detail totals for consistency checks.
+
+    Account rows can come from a different source (for example Sub2API) than
+    the local event total.  Keeping this check in one place prevents a stale
+    account snapshot from being written as today's detailed usage.
+    """
+    providers = details.get("providers") if isinstance(details, dict) else []
+    if not isinstance(providers, list):
+        return 0, 0, 0.0
+    requests = 0
+    tokens = 0
+    cost = 0.0
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        requests += max(0, int(provider.get("requests") or 0))
+        tokens += max(0, int(provider.get("tokens") or 0))
+        cost += max(0.0, float(provider.get("cost") or 0.0))
+    return requests, tokens, cost
+
+
+def _usage_details_exceed_totals(
+    details: dict[str, Any] | None,
+    *,
+    requests: int,
+    tokens: int,
+    cost: float,
+) -> bool:
+    detail_requests, detail_tokens, detail_cost = _usage_detail_totals(details)
+    return (
+        detail_requests > max(0, int(requests or 0))
+        or detail_tokens > max(0, int(tokens or 0))
+        or detail_cost > max(0.0, float(cost or 0.0)) + 0.000001
+    )
+
+
 def detailed_usage_from_state(state: Any) -> dict[str, Any]:
     client_details = detailed_usage_from_client_usage(
         state.client_usage if isinstance(getattr(state, "client_usage", None), dict) else None
@@ -1887,11 +1924,43 @@ def detailed_usage_from_state(state: Any) -> dict[str, Any]:
     if not account_rows:
         return client_details
     target_tokens = max(0, int(getattr(state, "today_tokens", 0) or 0))
-    client_tokens = sum(int(row.get("tokens") or 0) for row in client_details.get("providers") or [])
-    account_tokens = sum(int(row.get("tokens") or 0) for row in account_rows)
+    target_requests = max(0, int(getattr(state, "today_requests", 0) or 0))
+    target_cost = max(0.0, float(getattr(state, "today_account_cost", 0.0) or 0.0))
+    client_requests, client_tokens, client_cost = _usage_detail_totals(client_details)
+    account_requests, account_tokens, account_cost = _usage_detail_totals(account_details)
+    account_exceeds = _usage_details_exceed_totals(
+        account_details,
+        requests=target_requests,
+        tokens=target_tokens,
+        cost=target_cost,
+    )
+    client_exceeds = _usage_details_exceed_totals(
+        client_details,
+        requests=target_requests,
+        tokens=target_tokens,
+        cost=target_cost,
+    )
+    # A stale account snapshot must never win merely because its absolute
+    # token difference happens to be smaller.  Prefer a detail set that fits
+    # inside the authoritative daily totals; any remaining amount is shown as
+    # an explicit detail gap by the caller.
+    if not account_exceeds and client_exceeds:
+        return account_details
+    if not client_exceeds and account_exceeds:
+        return client_details
+    client_distance = (
+        abs(client_tokens - target_tokens)
+        + abs(client_requests - target_requests)
+        + abs(client_cost - target_cost)
+    )
+    account_distance = (
+        abs(account_tokens - target_tokens)
+        + abs(account_requests - target_requests)
+        + abs(account_cost - target_cost)
+    )
     return (
         account_details
-        if abs(account_tokens - target_tokens) <= abs(client_tokens - target_tokens)
+        if account_distance <= client_distance
         else client_details
     )
 
@@ -2057,6 +2126,13 @@ def _update_usage_history_unlocked(
             )
         except (TypeError, ValueError):
             usage_accounting_schema = 0
+    # A midnight rollover clears the live overlay before the asynchronous
+    # exporter has returned the new day's snapshot.  During that short gap the
+    # in-memory state still belongs to yesterday and must not seed today's
+    # history high-water, otherwise yesterday's total becomes a permanent
+    # source gap for the new day.
+    if source_date and source_date != key:
+        return summarize_usage_history(history)
     existing_source_date = str(existing.get("source_date") or "").strip()
     try:
         existing_claude_usage_schema = int(existing.get("claude_usage_schema") or 0)
@@ -2114,6 +2190,10 @@ def _update_usage_history_unlocked(
         use_local_high_water
         and not usage_schema_upgrade
         and existing_source_date in {"", source_date, key}
+        and not (
+            isinstance(state.client_usage, dict)
+            and state.client_usage.get("_live_canonical_totals_applied") is True
+        )
     ):
         if existing_tokens > new_tokens and existing_tokens >= max(1, int(new_tokens * 1.05)):
             new_tokens = existing_tokens
@@ -2126,10 +2206,76 @@ def _update_usage_history_unlocked(
             preserve_existing_details = True
 
     if preserve_existing_details:
-        if isinstance(existing.get("models"), dict):
-            details["models"] = existing["models"]
-        if isinstance(existing.get("providers"), list):
-            details["providers"] = existing["providers"]
+        existing_details = {
+            "models": existing.get("models")
+            if isinstance(existing.get("models"), dict)
+            else {},
+            "providers": existing.get("providers")
+            if isinstance(existing.get("providers"), list)
+            else [],
+        }
+        # Do not carry a stale provider list whose high-water value is larger
+        # than the total we are about to publish.  This was the source of the
+        # recurring "today total < account details" mismatch: the local live
+        # overlay had replaced the total, while an old unattributed row stayed
+        # in the detail list.  Keep the current event-derived details instead.
+        if not _usage_details_exceed_totals(
+            existing_details,
+            requests=new_requests,
+            tokens=new_tokens,
+            cost=new_cost,
+        ):
+            details = existing_details
+        else:
+            preserve_existing_details = False
+
+    # A previous runtime could count unconfirmed local events in the daily
+    # total without writing a provider row. Keep the historical row balanced
+    # by exposing that residual as an explicit API-service gap. A subsequent
+    # complete local scan replaces it with concrete account rows.
+    detail_requests, detail_tokens, detail_cost = _usage_detail_totals(details)
+    gap_requests = max(0, new_requests - detail_requests)
+    gap_tokens = max(0, new_tokens - detail_tokens)
+    gap_cost = max(0.0, new_cost - detail_cost)
+    if use_local_high_water and (gap_requests or gap_tokens or gap_cost > 0.000001):
+        gap_name = "Codex local - api-service-local"
+        gap_row = next(
+            (
+                row
+                for row in details.get("providers", [])
+                if isinstance(row, dict)
+                and account_display_key(row.get("name")) == account_display_key(gap_name)
+            ),
+            None,
+        )
+        if not isinstance(gap_row, dict):
+            gap_row = {
+                "name": gap_name,
+                "requests": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "models": {},
+                "latest_at": "",
+                "is_unattributed_gap": True,
+            }
+            details.setdefault("providers", []).append(gap_row)
+        gap_row["requests"] = int(gap_row.get("requests") or 0) + gap_requests
+        gap_row["tokens"] = int(gap_row.get("tokens") or 0) + gap_tokens
+        gap_row["cost"] = round(float(gap_row.get("cost") or 0.0) + gap_cost, 6)
+        if gap_tokens:
+            models = dict(gap_row.get("models") or {})
+            models["unknown"] = int(models.get("unknown") or 0) + gap_tokens
+            gap_row["models"] = models
+        gap_row["source"] = "local-gap"
+        latest_request = state.latest_request if isinstance(state.latest_request, dict) else {}
+        gap_row["latest_at"] = str(
+            latest_request.get("created_at") or latest_request.get("latest_at") or ""
+        )
+        details["models"] = dict(details.get("models") or {})
+        if gap_tokens:
+            details["models"]["unknown"] = (
+                int(details["models"].get("unknown") or 0) + gap_tokens
+            )
 
     updated_row = {
         "date": key,
@@ -2158,7 +2304,14 @@ def _update_usage_history_unlocked(
         )
     if usage_accounting_schema > 0:
         updated_row["usage_accounting_schema"] = usage_accounting_schema
-    if not usage_schema_upgrade and isinstance(existing.get("source_gap"), dict):
+    if (
+        not usage_schema_upgrade
+        and not (
+            isinstance(state.client_usage, dict)
+            and state.client_usage.get("_live_canonical_totals_applied") is True
+        )
+        and isinstance(existing.get("source_gap"), dict)
+    ):
         updated_row["source_gap"] = existing["source_gap"]
     days[key] = updated_row
     try:
@@ -12247,6 +12400,49 @@ class FloatingMonitorApp:
                     "latest_model": desired_latest_model,
                 }
 
+            # The catch-up provider buckets are absolute.  When they cover the
+            # complete summary, they are also the authoritative replacement
+            # for a stale exporter high-water (including its cost).  Mark the
+            # replacement so the overlay can lower an obsolete base safely;
+            # partial payloads continue to use the monotonic path below.
+            canonical_provider_tokens = sum(
+                max(0, int(provider.get("tokens") or 0))
+                for provider in provider_targets.values()
+                if isinstance(provider, dict)
+            )
+            canonical_provider_requests = sum(
+                max(0, int(provider.get("requests") or 0))
+                for provider in provider_targets.values()
+                if isinstance(provider, dict)
+            )
+            canonical_provider_cost = sum(
+                max(0.0, float(provider.get("cost") or 0.0))
+                for provider in provider_targets.values()
+                if isinstance(provider, dict)
+            )
+            if (
+                provider_targets
+                and canonical_provider_tokens == int(target.get("tokens") or 0)
+                and canonical_provider_requests == int(target.get("requests") or 0)
+                and abs(canonical_provider_cost - float(target.get("cost") or 0.0))
+                <= 0.000001
+            ):
+                overlay["canonical_totals"] = {
+                    key: target.get(key)
+                    for key in (
+                        "tokens",
+                        "requests",
+                        "cost",
+                        "input_tokens",
+                        "cached_input_tokens",
+                        "cache_creation_input_tokens",
+                        "output_tokens",
+                        "unpriced_tokens",
+                        "unpriced_models",
+                        "models",
+                    )
+                }
+
             # The catch-up provider buckets are absolute and may correct an
             # optimistic event's earlier account attribution. Rebase the
             # matching quota window as well so those old events cannot remain
@@ -13080,6 +13276,7 @@ class FloatingMonitorApp:
 
         self._live_usage_verification_pending = True
         self._live_usage_verification_pending_tokens = max(
+            projected_tokens,
             projected_unverified_tokens,
             max(
                 0,
@@ -13364,6 +13561,18 @@ class FloatingMonitorApp:
                     )
             else:
                 event.pop("attribution_pending", None)
+            if not provider:
+                # Keep unconfirmed usage visible in the aggregate instead of
+                # dropping it from provider details.  A later canonical
+                # catch-up can replace this provisional bucket with the final
+                # account; Grok events use their own local aggregate.
+                route = str(event.get("route") or "").strip().lower()
+                provider = (
+                    "Grok local"
+                    if route == "grok-local"
+                    else "Codex local - api-service-local"
+                )
+                record_provider = True
             price_resolved = event_cost > 0 or event.get("price_resolved") is True
             if event_cost <= 0:
                 estimated_cost, estimated_resolved = estimate_live_usage_cost_with_resolution(
@@ -13479,6 +13688,102 @@ class FloatingMonitorApp:
         if not isinstance(overlay, dict):
             return
         self._ensure_live_hourly_overlay(overlay)
+        client_usage = (
+            state.client_usage if isinstance(state.client_usage, dict) else {}
+        )
+        canonical_totals = overlay.pop("canonical_totals", None)
+        canonical_totals_applied = bool(overlay.get("canonical_totals_applied"))
+        if isinstance(canonical_totals, dict):
+            scan_status = (
+                client_usage.get("scan_status")
+                if isinstance(client_usage.get("scan_status"), dict)
+                else {}
+            )
+            scan_through = _parse_time(
+                str(
+                    scan_status.get("through")
+                    or client_usage.get("updated_at")
+                    or ""
+                )
+            )
+            catchup_through = overlay.get("catchup_through")
+            if not isinstance(catchup_through, datetime):
+                catchup_through = _parse_time(str(catchup_through or ""))
+            canonical_is_current = bool(
+                isinstance(catchup_through, datetime)
+                and (
+                    not isinstance(scan_through, datetime)
+                    or catchup_through >= scan_through
+                )
+            )
+            if canonical_is_current:
+                canonical_tokens = max(
+                    0,
+                    int(canonical_totals.get("tokens") or 0),
+                )
+                canonical_requests = max(
+                    0,
+                    int(canonical_totals.get("requests") or 0),
+                )
+                canonical_cost = max(
+                    0.0,
+                    float(canonical_totals.get("cost") or 0.0),
+                )
+                canonical_unpriced_tokens = max(
+                    0,
+                    int(canonical_totals.get("unpriced_tokens") or 0),
+                )
+                canonical_unpriced_models = dict(
+                    canonical_totals.get("unpriced_models") or {}
+                )
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_creation_input_tokens",
+                    "output_tokens",
+                ):
+                    client_usage[key] = max(
+                        0,
+                        int(canonical_totals.get(key) or 0),
+                    )
+                client_usage.update(
+                    {
+                        "tokens": canonical_tokens,
+                        "requests": canonical_requests,
+                        "cost": canonical_cost,
+                        "models": dict(canonical_totals.get("models") or {}),
+                        "unpriced_tokens": canonical_unpriced_tokens,
+                        "unpriced_models": canonical_unpriced_models,
+                    }
+                )
+                state.today_tokens = canonical_tokens
+                state.today_requests = canonical_requests
+                state.today_account_cost = canonical_cost
+                overlay.update(
+                    {
+                        "base_today_tokens": canonical_tokens,
+                        "base_today_requests": canonical_requests,
+                        "base_today_cost": canonical_cost,
+                        "base_authoritative_tokens": canonical_tokens,
+                        "base_unpriced_tokens": canonical_unpriced_tokens,
+                        "base_unpriced_models": canonical_unpriced_models,
+                        "tokens": 0,
+                        "requests": 0,
+                        "cost": 0.0,
+                        "unpriced_tokens": 0,
+                        "unpriced_models": {},
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                    }
+                )
+                overlay["canonical_totals_applied"] = True
+                canonical_totals_applied = True
+        if canonical_totals_applied:
+            # This is an internal runtime hint only; it is never exported.
+            # The history writer uses it to avoid restoring a stale same-day
+            # high-water after a complete canonical catch-up corrected totals.
+            client_usage["_live_canonical_totals_applied"] = True
         state.today_tokens = max(
             int(state.today_tokens or 0),
             int(overlay["base_today_tokens"]) + int(overlay["tokens"]),
@@ -13491,9 +13796,6 @@ class FloatingMonitorApp:
             float(state.today_account_cost or 0.0),
             float(overlay.get("base_today_cost") or 0.0)
             + float(overlay.get("cost") or 0.0),
-        )
-        client_usage = (
-            state.client_usage if isinstance(state.client_usage, dict) else {}
         )
         sync = state.usage_sync if isinstance(state.usage_sync, dict) else {}
         if str(sync.get("state") or "").lower() == "timeout":
@@ -13607,6 +13909,11 @@ class FloatingMonitorApp:
                     ),
                     None,
                 )
+                desired_has_usage = bool(
+                    desired.get("requests")
+                    or desired.get("tokens")
+                    or desired.get("cost")
+                )
                 if not isinstance(raw_row, dict) and replace_existing:
                     raw_row = {
                         "name": provider,
@@ -13615,7 +13922,7 @@ class FloatingMonitorApp:
                     if not isinstance(client_usage.get("providers"), list):
                         client_usage["providers"] = raw_providers
                     raw_providers.append(raw_row)
-                if not isinstance(top_row, dict) and replace_existing:
+                if not isinstance(top_row, dict) and (replace_existing or desired_has_usage):
                     top_row = {
                         "name": local_provider_display_name(provider),
                         "show_zero": False,
@@ -13663,6 +13970,25 @@ class FloatingMonitorApp:
                         row["latest_at"] = latest_at
                     if latest_model:
                         row["latest_model"] = latest_model
+            # A canonical live catch-up replaces the day's provider buckets.
+            # Remove an older high-water/unattributed row that is absent from
+            # that catch-up; otherwise account details exceed the live total
+            # even though the event overlay itself is correct.
+            canonical_replacements = {
+                account_display_key(provider)
+                for provider, target in provider_targets.items()
+                if isinstance(target, dict)
+                and bool(target.get("replace_existing"))
+                and account_display_key(provider)
+            }
+            if canonical_replacements:
+                def keep_provider_row(row: Any) -> bool:
+                    if not isinstance(row, dict) or not row.get("is_unattributed_gap"):
+                        return True
+                    return account_display_key(row.get("name")) in canonical_replacements
+
+                raw_providers[:] = [row for row in raw_providers if keep_provider_row(row)]
+                top_accounts[:] = [row for row in top_accounts if keep_provider_row(row)]
         self._apply_live_quota_window_overlay(state)
         state.cost_history = trend_with_current_totals(
             state.cost_history,

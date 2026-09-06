@@ -362,7 +362,7 @@ USAGE_ACCOUNTING_SCHEMA = 1
 CLAUDE_USAGE_DEDUPE_SCHEMA = 2
 COCKPIT_USAGE_DEDUPE_SCHEMA = 2
 GROK_USAGE_DEDUPE_SCHEMA = 1
-OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA = 1
+OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA = 2
 GROK_LOCAL_LABEL = "Grok local"
 GROK_SUBAGENT_LABEL = "Grok subagent"
 GROK_BUILD_USAGE_MODEL = "grok-4.6-build"
@@ -8301,6 +8301,7 @@ def attribute_codex_events_to_account_markers(
             None,
             verdicts,
             record_verdicts=False,
+            preserve_direct_official_usage=True,
         )
     return buckets_from_attributed_events(attributed, cost_multiplier_by_label)
 
@@ -8538,6 +8539,27 @@ def attribute_codex_events_by_account(
             ledger_assign(ledger, event_id, label)
         if not label:
             label, event_id = ledger_label_for_event(event, ledger)
+            if is_api_service_mirror_label(label):
+                # api-service-local is a provisional holding bucket, not an
+                # archive-grade account verdict. A later explicit switch to a
+                # concrete account must be allowed to repair old ledger rows;
+                # the resolver still checks nearby Cockpit evidence before it
+                # accepts the direct label.
+                timeline_label = account_label_at_time(
+                    event,
+                    switch_markers,
+                    switch_times,
+                    request_markers,
+                    request_times,
+                )
+                if (
+                    timeline_label
+                    and timeline_label != UNASSIGNED_CODEX_LABEL
+                    and not is_api_service_mirror_label(timeline_label)
+                ):
+                    label = timeline_label
+                    if ledger is not None and event_id:
+                        ledger_assign(ledger, event_id, label)
         if not label:
             label = account_label_at_time(event, switch_markers, switch_times, request_markers, request_times)
             if (
@@ -10685,11 +10707,11 @@ def resolve_api_service_event_accounts(
     evidence, so they are not allowed to write into the archive that the today
     pass just decided.
 
-    ``preserve_direct_official_usage`` is used only while reconstructing an
-    official quota window. That view may scan older than the Cockpit database
-    retention horizon, so a historical marker alone cannot erase a concrete,
-    unqualified local GPT event from the active quota period. General daily
-    attribution deliberately keeps the stricter aggregate fallback.
+    ``preserve_direct_official_usage`` keeps a concrete local GPT account when
+    the event has no nearby Cockpit request evidence. This is required for
+    mixed-route days: an old Cockpit marker must not turn every later official
+    direct request into an API-service aggregate. Nearby request or affinity
+    evidence still wins and keeps an unconfirmed Cockpit event pending.
     """
     marker_index = account_markers_by_total_tokens(account_markers)
     cockpit_mode = bool(account_markers or affinity_events)
@@ -10747,9 +10769,9 @@ def resolve_api_service_event_accounts(
             latest_by_session[session_id] = (resolved_label, confirmed, event_time)
     ordered = remaining
     records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]] = []
-    # Only the quota-window reconstruction asks for the limited direct-label
-    # escape hatch. Its scan can include old rows from a prior quota cycle;
-    # retain the normal strict fallback everywhere else.
+    # Direct labels are preserved only when the caller opts in and no Cockpit
+    # evidence exists near the event. The temporal guard keeps this safe for
+    # daily, historical, catch-up, and quota-window scans alike.
     cockpit_context_times = (
         sorted(
             [
@@ -11071,13 +11093,17 @@ def build_active_session_rows(
     ) -> None:
         nonlocal unresolved
         resolved_label = label if label and not is_api_service_mirror_label(label) else ""
-        if not resolved_label and not api_service_routed:
+        event_account_unconfirmed = bool(
+            event is not None and is_api_service_mirror_label(label)
+        )
+        if not resolved_label and not api_service_routed and not event_account_unconfirmed:
             resolved_label = labels_by_session.get(session_id, "")
             if is_api_service_mirror_label(resolved_label):
                 resolved_label = ""
         if (
             not resolved_label
             and not api_service_routed
+            and not event_account_unconfirmed
             and current_label
             and not is_api_service_mirror_label(current_label)
         ):
@@ -11322,6 +11348,7 @@ def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
         attributed,
         account_markers,
         affinity_events=affinity_events,
+        preserve_direct_official_usage=True,
     )
     speed_by_account = cockpit_codex_speed_by_label(home)
     multipliers = {
@@ -11706,6 +11733,7 @@ def build_historical_usage_rows(
         attributed,
         account_markers,
         affinity_events=affinity_events,
+        preserve_direct_official_usage=True,
     )
     speed_by_account = cockpit_codex_speed_by_label(home)
     multipliers = {
@@ -12463,6 +12491,50 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         except (TypeError, ValueError):
             return 0
 
+    def is_derived_gap_provider(row: Any) -> bool:
+        return bool(
+            isinstance(row, dict)
+            and (
+                row.get("is_unattributed_gap")
+                or str(row.get("name") or "") == HIGH_WATER_UNATTRIBUTED_LABEL
+            )
+        )
+
+    def without_derived_gap(
+        cumulative: dict[str, Any], providers: Any
+    ) -> dict[str, Any]:
+        adjusted = dict(cumulative)
+        gap_rows = [
+            row
+            for row in (providers if isinstance(providers, list) else [])
+            if is_derived_gap_provider(row)
+        ]
+        if not gap_rows:
+            return adjusted
+        for key in (
+            "requests",
+            "tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+            "unpriced_tokens",
+        ):
+            adjusted[key] = max(
+                0,
+                int(adjusted.get(key) or 0)
+                - sum(int(row.get(key) or 0) for row in gap_rows),
+            )
+        adjusted["cost"] = round(
+            max(
+                0.0,
+                float(adjusted.get("cost") or 0.0)
+                - sum(float(row.get("cost") or 0.0) for row in gap_rows),
+            ),
+            6,
+        )
+        return adjusted
+
     def merge_cumulative(current: dict[str, Any], previous: dict[str, Any]) -> None:
         if tokens_of(previous) <= tokens_of(current):
             return
@@ -12558,7 +12630,10 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         and isinstance(existing_today, dict)
         and isinstance(current_today, dict)
     ):
-        merge_cumulative(current_today, existing_today)
+        merge_cumulative(
+            current_today,
+            without_derived_gap(existing_today, existing.get("providers")),
+        )
     merge_latest_request()
     if not current_api_aggregate and not usage_schema_upgrade:
         merge_hourly_today()
@@ -12576,6 +12651,11 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     }
     for previous in existing_providers:
         if not isinstance(previous, dict):
+            continue
+        # This row is derived from the difference between the cumulative total
+        # and concrete providers.  Restoring it as a provider makes the next
+        # restore pass add the same source gap again, growing once per export.
+        if is_derived_gap_provider(previous):
             continue
         name = str(previous.get("name") or "")
         if not name:
@@ -12651,6 +12731,12 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
     if not isinstance(row, dict) or not isinstance(today, dict):
         return
     row = dict(row)
+    source_date = str(row.get("source_date") or row.get("date") or "").strip()
+    if source_date and source_date != day.isoformat():
+        # The monitor may still hold yesterday's state while the first
+        # post-midnight export is running.  Such a row is not evidence for a
+        # same-day high-water and must never be converted into today's gap.
+        return
     try:
         current_accounting_schema = int(output.get("usage_accounting_schema") or 0)
         history_accounting_schema = int(row.get("usage_accounting_schema") or 0)
@@ -12736,6 +12822,15 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         excess -= reduction
     gap["tokens"] = gap_tokens
     providers = output.get("providers")
+    existing_gap_rows = [
+        provider
+        for provider in (providers if isinstance(providers, list) else [])
+        if isinstance(provider, dict)
+        and (
+            provider.get("is_unattributed_gap")
+            or str(provider.get("name") or "") == HIGH_WATER_UNATTRIBUTED_LABEL
+        )
+    ]
     for key in (
         "requests",
         "tokens",
@@ -12744,11 +12839,27 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         "cache_creation_input_tokens",
         "output_tokens",
     ):
-        today[key] = int(today.get(key) or 0) + int(gap.get(key) or 0)
-    today["cost"] = round(float(today.get("cost") or 0) + float(gap.get("cost") or 0), 6)
+        already_applied = sum(int(row.get(key) or 0) for row in existing_gap_rows)
+        today[key] = int(today.get(key) or 0) + max(
+            0,
+            int(gap.get(key) or 0) - already_applied,
+        )
+    applied_gap_cost = sum(float(row.get("cost") or 0.0) for row in existing_gap_rows)
+    today["cost"] = round(
+        float(today.get("cost") or 0)
+        + max(0.0, float(gap.get("cost") or 0) - applied_gap_cost),
+        6,
+    )
     today["unpriced_tokens"] = (
         int(today.get("unpriced_tokens") or 0)
-        + int(gap.get("unpriced_tokens") or 0)
+        + max(
+            0,
+            int(gap.get("unpriced_tokens") or 0)
+            - sum(
+                int(row.get("unpriced_tokens") or 0)
+                for row in existing_gap_rows
+            ),
+        )
     )
     if not isinstance(providers, list):
         return
@@ -13147,6 +13258,7 @@ def build_codex_window_stats(
             None,
             attribution_verdicts,
             record_verdicts=False,
+            preserve_direct_official_usage=True,
         )
         raw_30d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_30d.items():
@@ -13470,6 +13582,7 @@ def build_live_catchup_payload(
         affinity_events,
         attribution_verdicts,
         record_verdicts=False,
+        preserve_direct_official_usage=True,
     )
     speed_by_account = cockpit_codex_speed_by_label(home)
     cost_multiplier_by_label = {
@@ -13770,17 +13883,10 @@ def main() -> int:
         current_label,
         now,
     )
-    api_service_routed = (
-        any(
-            is_api_service_mirror_label(label)
-            for label in raw_attributed_events
-        )
-        or bool(account_markers)
-        # An in-flight Cockpit request may have affinity evidence before its
-        # usage row is written. Treat that as routed so an old session label
-        # cannot leak into the active-session display during the handoff.
-        or bool(affinity_events)
-    )
+    # This flag describes the route active now, not whether Cockpit appeared
+    # anywhere earlier in the day. Historical markers are handled per event by
+    # the resolver below and must not suppress a later official-direct account.
+    api_service_routed = codex_uses_cockpit_provider(home)
     raw_attributed_events, cockpit_fallback_events = merge_missing_cockpit_account_events(
         raw_attributed_events,
         account_markers,
@@ -13793,6 +13899,7 @@ def main() -> int:
         previous_active_session_account_labels(out, day),
         affinity_events,
         attribution_verdicts,
+        preserve_direct_official_usage=True,
     )
     attributed = buckets_from_attributed_events(
         attributed_events,
