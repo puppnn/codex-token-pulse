@@ -1093,7 +1093,7 @@ class WorkspaceUI:
             items.append(("未分类", mix["unknown"], self.MUTED))
         self.text(x, y, "Token 构成", "heading")
         base = mix["input"] + mix["cached"] + mix["cache_create"]
-        rate = f"{mix['cached'] / base:.0%}" if base else "—"
+        rate = f"{mix['cached'] / base:.1%}" if base else "—"
         self.text(right, y + 4, "缓存命中 " + rate, "caption", self.MUTED, "ne")
         total = sum(value for _name, value, _color in items)
         self.box(x, y + 29, right, y + 35, self.LINE, 3)

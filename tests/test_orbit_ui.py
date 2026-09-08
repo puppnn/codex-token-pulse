@@ -77,9 +77,17 @@ def preview_state():
 
 
 def preview_context(directory):
-    """Patch external readers for both constructor and window teardown."""
+    """Isolate readers AND already-bound persistence paths from real data."""
     stack = ExitStack()
     stack.enter_context(patch.object(monitor, 'APP_DIR', Path(directory)))
+    for name in (
+        'USAGE_HISTORY_JSON', 'CLIENT_USAGE_JSON', 'LIVE_USAGE_CHECKPOINT_JSON',
+        'ACCOUNT_TYPE_HISTORY_JSON', 'AUTH_SWITCH_EVENTS_PATH',
+        'ATTRIBUTION_DIAGNOSTICS_PATH', 'MODEL_PRICE_CACHE_JSON',
+    ):
+        original = getattr(monitor, name)
+        stack.enter_context(patch.object(monitor, name, Path(directory) / original.name))
+    stack.enter_context(patch.object(monitor, '_USAGE_HISTORY_CACHE', None))
     stack.enter_context(patch.object(monitor, 'Sub2APIClient', return_value=SimpleNamespace(
         mode='preview', include_history_details=True, include_account_30d=True)))
     stack.enter_context(patch.object(monitor, 'CodexUsageFileWatcher', QuietWatcher))
@@ -89,6 +97,19 @@ def preview_context(directory):
 
 
 class OrbitStateTests(unittest.TestCase):
+    def test_preview_history_writes_are_confined_to_temporary_directory(self):
+        production_path = monitor.USAGE_HISTORY_JSON
+        with tempfile.TemporaryDirectory() as directory, preview_context(directory):
+            state = preview_state()
+            state.client_usage['date'] = monitor.today_key()
+            monitor.update_usage_history(state)
+            destination = Path(directory) / production_path.name
+            self.assertEqual(monitor.USAGE_HISTORY_JSON, destination)
+            self.assertTrue(destination.exists())
+            saved = json.loads(destination.read_text(encoding='utf-8'))
+            self.assertEqual(saved['days'][monitor.today_key()]['tokens'], state.today_tokens)
+        self.assertEqual(monitor.USAGE_HISTORY_JSON, production_path)
+
     def test_unknown_prices_are_distinct_from_zero_cost(self):
         ui = WorkspaceUI.__new__(WorkspaceUI)
         ui.m = monitor
